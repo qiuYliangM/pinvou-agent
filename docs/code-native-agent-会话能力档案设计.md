@@ -1,7 +1,7 @@
 # 会话能力档案（Session Capability Profile）设计
 
 > 关联文档：`docs/code-native-agent-安全审查问题清单.md` 问题 #4 / #5 / #9。
-> 状态：设计提案，待评审。建议独立于安全急件修复 PR 推进。
+> 状态：**已实施**（阶段一，fork 分支 `feat/full-code-mode`；fork 侧 CodeWhale `feat/session-capability-profile` 提交 `0bb4266`，app 侧 `e3bc513c` + `11452198`）。实施记录与验收矩阵见 `docs/code-native-agent-升级实施记录.md`。
 
 ## 1. 背景与问题
 

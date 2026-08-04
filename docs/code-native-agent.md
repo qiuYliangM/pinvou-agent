@@ -249,11 +249,13 @@ bridge 的 chat 状态机绑定单一 activeSession，代码页与主聊天并�
 - 远程端 `web_access_*` RPC 面未封：事件流已按 §8.4 对原生代码会话不转发，但
   远程端凭 session id 仍可读/写代码会话消息。远程正式支持代码会话前暂保留该
   通道（事件面先封是主要泄露面），是否同步封 RPC 面需审阅者确认。
-- 代码会话 skill 侧路残留（过渡方案 D）：代码会话已整体禁用 `load_skill` 工具
-  + 代码页 skill 分组只读诚实化，但 `## Skills` catalogue 仍印在提示词中（含
-  skill 磁盘路径），被注入引导的模型可经 `read_file` 读取 SKILL.md。根治方案
-  见 `docs/code-native-agent-会话能力档案设计.md`（按会话能力档案过滤
-  catalogue，落地后方案 D 两组件退役）。
+- 代码会话 skill 隔离（方案 D 已退役，能力档案已落地）：`## Skills` catalogue
+  按会话能力档案过滤（代码会话不再印出被禁 skill 的名字/路径），`load_skill`
+  按会话集判定，代码页 skill 开关恢复真实可交互。残余理论缺口：skill 磁盘
+  路径形态可预测，被注入引导的模型可**猜路径** `read_file`（攻击成本从照抄
+  变为盲猜）；封口补法是文件工具工作区围栏（能力档案设计 §5 第二阶段，独立
+  专项）。另一已知缺口：ima 连接/断开不在 `disabled_skills` 热更触发点内，
+  在跑代码会话的 Some 集等下次触发才重算（见升级实施记录）。
 - 确认卡/busy 恢复依赖进程内登记表，进程重启后挂起 input 随旧 engine 消亡（与 ACP orphaned turn 语义一致）。
 - 原生会话无模型 API key 前置 gate，未配置凭据时错误在对话流内联展示。
 - 回声去重为启发式（文本一致或 30 秒窗口），极端时序理论可能双气泡。
@@ -265,13 +267,11 @@ bridge 的 chat 状态机绑定单一 activeSession，代码页与主聊天并�
    建议逐步上提为 `code_sessions` / `CodeView`，两条链路分别做 adapter/hook。
 2. CI 增强：正式 `rust-test` 目前 skipped（Windows 只 `--no-run`），建议加
    `ci:full-rust` 让完整测试成为该 head 的正式 check。
-3. 代码会话工具/技能 profile（审阅建议②，恢复登记）：代码会话当前继承全集
-   工具，已落地的隔离仅有——连接器工具按 scope 整形（§8.3）、隐藏
-   `present_artifact`、过渡方案 D 禁用 `load_skill`（§9 残留说明）。完整的
-   「代码专用工具 profile」未兑现：skill 维度由
-   `docs/code-native-agent-会话能力档案设计.md` 承接（按会话能力档案过滤
-   catalogue + `load_skill` 按档案判定），其余工具维度的 profile 化待该设计
-   评审后一并实施。
+3. 代码会话工具/技能 profile（审阅建议②）：**skill 维度已兑现**（会话能力
+   档案：catalogue 按会话过滤 + `load_skill` 按档案判定 + 代码页开关真实
+   生效，方案 D 退役，见 §9 与升级实施记录）。剩余未兑现：其余工具维度的
+   profile 化（`tool_policy` 全局闭包 + `shape_disallowed_tools` 补丁两层
+   机制收编为声明式 profile），纳入完全体架构设计阶段二。
 
 ## 11. 过程产物
 

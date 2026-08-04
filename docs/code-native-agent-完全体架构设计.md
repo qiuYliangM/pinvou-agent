@@ -1,7 +1,7 @@
 # 完全体 Code 模式架构设计
 
 > 关联文档：`docs/code-native-agent.md`（现状归档）、`docs/code-native-agent-安全审查问题清单.md`（安全急件，已修复合入）、`docs/code-native-agent-会话能力档案设计.md`（能力档案，本设计阶段一的核心组成）、`docs/code-native-agent-安全审查修复-改动说明.md`。
-> 状态：设计提案，待评审。参考系：VSCode agent 模式（见 §2）。
+> 状态：设计提案。**阶段一已实施**（见 §5 标注），阶段二/三待实施。参考系：VSCode agent 模式（见 §2）。实施记录见 `docs/code-native-agent-升级实施记录.md`。
 
 ## 1. 现状：code 模式与 chat 模式的依赖逻辑
 
@@ -73,7 +73,7 @@ spawn 时一次性解析定型（经 `build_engine_config` 下发），之后所
 
 ## 5. 分阶段演进
 
-### 阶段一：类型与能力地基（两项互为表里，建议同 PR 或紧随其后）
+### 阶段一：类型与能力地基 ✅ 已实施（`e3bc513c` + `11452198` + CodeWhale `0bb4266`）
 
 **1. SessionKind 一等化**
 - `SessionStore` 记录增加类型化 `kind` 字段，创建时定型、类型化查询；
