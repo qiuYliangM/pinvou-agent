@@ -69,7 +69,8 @@ assert.strictEqual(state.connectedServices.length, 1);
 assert.strictEqual(state.connectedServices[0].id, 'feishu');
 assert.strictEqual(state.enabledCount, 2); // feishu + builtin visual-design
 
-// code scope: 技能行只读不可用且不计入启用数,工具行不受影响
+// code scope: 会话能力档案落地后 skill 开关真实生效——行可切换、计入启用数,
+// 与连接器行同一份 switch 语义(disabledIds 由调用方按 scope 解析传入)
 state = buildComposerToolMenuState({
   scope: 'code',
   marketplaceTools: [{ id: 'weather', name: '高德天气', installed: true }],
@@ -77,12 +78,23 @@ state = buildComposerToolMenuState({
 });
 visualizer = state.skillRows.find(row => row.id === 'skill:visualizer');
 assert.ok(visualizer);
-assert.strictEqual(visualizer.switchable, false);
-assert.strictEqual(visualizer.unavailable, true);
+assert.strictEqual(visualizer.switchable, true);
+assert.ok(!visualizer.unavailable);
 const builtinInCode = state.skillRows.find(row => row.id === 'builtin-skill:visual-design');
 assert.ok(builtinInCode);
-assert.strictEqual(builtinInCode.unavailable, true);
-assert.strictEqual(state.enabledCount, 1); // 仅 weather,技能行不计入
+assert.ok(!builtinInCode.unavailable);
+assert.strictEqual(state.enabledCount, 3); // weather + visualizer + builtin visual-design
+
+// code scope 下关闭 skill 行:计数随之减少(开关真实消费 disabledIds)
+state = buildComposerToolMenuState({
+  scope: 'code',
+  marketplaceSkills: [{ id: 'visualizer', title: '数据分析可视化', installed: true }],
+  disabledIds: ['skill:visualizer'],
+});
+visualizer = state.skillRows.find(row => row.id === 'skill:visualizer');
+assert.strictEqual(visualizer.switchable, true);
+assert.strictEqual(visualizer.enabled, false);
+assert.strictEqual(state.enabledCount, 1); // 仅 builtin visual-design
 
 // 未传 scope 时行为与 plain 一致(回归保护)
 state = buildComposerToolMenuState({
@@ -90,7 +102,7 @@ state = buildComposerToolMenuState({
 });
 visualizer = state.skillRows.find(row => row.id === 'skill:visualizer');
 assert.strictEqual(visualizer.switchable, true);
-assert.strictEqual(visualizer.unavailable, false);
+assert.ok(!visualizer.unavailable);
 assert.strictEqual(state.enabledCount, 2); // visualizer + builtin visual-design
 
 console.log('composer_tool_menu_logic: ok');

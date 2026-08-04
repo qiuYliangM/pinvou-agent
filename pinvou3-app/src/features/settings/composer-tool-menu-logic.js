@@ -22,8 +22,9 @@ function buildComposerToolMenuState({
   scope = 'plain',
 } = {}) {
   const disabled = new Set(disabledIds || []);
-  // code scope: 代码会话已整体禁用技能加载,技能行只读展示且不计入启用数。
-  const skillsUnavailable = scope === 'code';
+  // scope 入参保留:调用方按 scope 取禁用集传入,code 会话的 skill 开关
+  // 真实生效(会话能力档案),与连接器行同一份 switch 语义。
+  void scope;
   const installedTools = (marketplaceTools || []).filter(tool => tool && tool.installed);
   const companionSkillIds = new Set(installedTools.flatMap(tool => tool.companion_skills || []));
 
@@ -60,8 +61,7 @@ function buildComposerToolMenuState({
         description: skill.description || skill.subtitle || '',
         enabled: !disabled.has(rowId),
         active: activeSkill === skill.id || activeSkill === rowId,
-        switchable: !skillsUnavailable,
-        unavailable: skillsUnavailable,
+        switchable: true,
       };
     });
 
@@ -74,14 +74,13 @@ function buildComposerToolMenuState({
     enabled: true,
     active: activeSkill === skill.id,
     switchable: false,
-    unavailable: skillsUnavailable,
   }));
 
   const allSkillRows = [...skillRows, ...builtinRows];
   const enabledCount =
     connectedServices.filter(row => row.enabled).length +
     toolRows.filter(row => row.enabled).length +
-    (skillsUnavailable ? 0 : allSkillRows.filter(row => row.enabled).length);
+    allSkillRows.filter(row => row.enabled).length;
 
   return {
     connectedServices,
