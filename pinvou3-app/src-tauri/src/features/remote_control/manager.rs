@@ -21,7 +21,7 @@ use super::protocol::{
     WebAccessConfig, WebAccessInfo, WebAccessStatus, WebAccessStatusKind, PROTOCOL_VERSION,
 };
 use super::relay_client::{self, RelayInbound, RelayOutbound, RelaySender};
-use crate::features::sessions::SessionStore;
+use crate::features::sessions::{SessionKind, SessionKindResolver, SessionStore};
 use crate::platform::paths;
 
 // 正式安装包默认连接生产 Relay；本地联调由 run-dev.sh 显式覆盖到隔离的
@@ -86,11 +86,6 @@ const RUST_FORWARDED_EVENTS: &[&str] = &[
     "session:persona_changed",
 ];
 
-/// 原生代码会话判定（与 Engine bridge 共用 AcpPool 那份 SessionAgentStore 注入）。
-/// 远程端正式支持代码会话列表/授权/UI 之前，带 session_id 的原生代码会话事件
-/// 一律不转发。
-pub type CodeSessionPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-
 #[derive(Clone)]
 pub struct RemoteControlManager {
     app: AppHandle,
@@ -123,8 +118,11 @@ struct Inner {
     web_session_downloads: HashMap<String, WebSessionDownload>,
     web_session_download_order: VecDeque<String>,
     pending_revocations_in_flight: HashSet<String>,
-    /// 原生代码会话判定；None = 未注入（不过滤，启动早期行为不变）。
-    code_session_predicate: Option<CodeSessionPredicate>,
+    /// 会话类型判定（与 Engine bridge 共用 AcpPool 那份 SessionAgentStore 注入的
+    /// 同一份 `session_kind` 闭包）；None = 未注入（不过滤，启动早期行为不变）。
+    /// 远程端正式支持代码会话列表/授权/UI 之前，带 session_id 的原生代码会话
+    /// （`SessionKind::CodeNative`）事件一律不转发。
+    session_kind_resolver: Option<SessionKindResolver>,
 }
 
 impl Default for Inner {
@@ -149,7 +147,7 @@ impl Default for Inner {
             web_session_downloads: HashMap::new(),
             web_session_download_order: VecDeque::new(),
             pending_revocations_in_flight: HashSet::new(),
-            code_session_predicate: None,
+            session_kind_resolver: None,
         }
     }
 }
@@ -499,11 +497,11 @@ impl RemoteControlManager {
         }
     }
 
-    /// 注入原生代码会话判定；由 app 组合根在 AcpPool 就绪后调用一次，与 Engine
-    /// bridge 共用同一份 SessionAgentStore。存放在共享 `Inner` 里，所有 clone
-    /// （含已 manage 进 Tauri 的那份）都能读到。
-    pub fn set_code_session_predicate(&self, predicate: CodeSessionPredicate) {
-        self.inner.lock().code_session_predicate = Some(predicate);
+    /// 注入会话类型判定；由 app 组合根在 AcpPool 就绪后调用一次，与 Engine
+    /// bridge 共用同一份 `SessionAgentStore::session_kind` 闭包。存放在共享
+    /// `Inner` 里，所有 clone（含已 manage 进 Tauri 的那份）都能读到。
+    pub fn set_session_kind_resolver(&self, resolver: SessionKindResolver) {
+        self.inner.lock().session_kind_resolver = Some(resolver);
     }
 
     /// Resume the persistent endpoint after all authoritative application
@@ -2305,11 +2303,11 @@ impl RemoteControlManager {
         // 远程端正式支持代码会话列表/授权/UI 之前，先过滤原生代码会话事件：事件
         // payload 携带的会话 id（`session_id` 用于 chat:* / artifact:disk，
         // `id` 用于 session:*，`sessionId` 用于 scheduled_task:run_updated）指向
-        // 品悟原生代码会话（仅原生，不含 ACP 会话）时不转发。远程 WebUI 不会收到
-        // 它无法展示/授权的代码会话消息流；predicate 只对真实代码会话 id 返回
-        // true，普通会话不受影响。
+        // 品悟原生代码会话（SessionKind::CodeNative，仅原生，不含 ACP 会话）时不
+        // 转发。远程 WebUI 不会收到它无法展示/授权的代码会话消息流；resolver 只对
+        // 真实代码会话 id 返回 CodeNative，普通会话不受影响。
         if should_filter_code_session_event(
-            self.inner.lock().code_session_predicate.as_ref(),
+            self.inner.lock().session_kind_resolver.as_ref(),
             &payload,
         ) {
             return Ok(());
@@ -2457,16 +2455,15 @@ fn event_session_id(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// 远程端正式支持代码会话之前，过滤原生代码会话事件。predicate 为 None（未注入）
+/// 远程端正式支持代码会话之前，过滤原生代码会话事件。resolver 为 None（未注入）
 /// 时不过滤，行为与注入前一致。
 fn should_filter_code_session_event(
-    predicate: Option<&CodeSessionPredicate>,
+    resolver: Option<&SessionKindResolver>,
     payload: &Value,
 ) -> bool {
-    match predicate {
-        Some(predicate) => {
-            event_session_id(payload).is_some_and(|session_id| predicate(session_id))
-        }
+    match resolver {
+        Some(resolver) => event_session_id(payload)
+            .is_some_and(|session_id| resolver(session_id) == SessionKind::CodeNative),
         None => false,
     }
 }
@@ -3114,9 +3111,9 @@ fn web_session_scope(command: &str) -> Option<WebSessionScope> {
     Some(scope)
 }
 
-// 已知残留面（安全审查清单 #11）：事件面已按 code_session_predicate 过滤品悟原生
+// 已知残留面（安全审查清单 #11）：事件面已按 session_kind_resolver 过滤品悟原生
 // 代码会话事件（见 publish_event_inner），但 web_access_* 这组 RPC 在此只校验会话
-// id 存在，不查 code_session_predicate——远程端凭代码会话 id 仍可读/写代码会话消息
+// id 存在，不查 session_kind_resolver——远程端凭代码会话 id 仍可读/写代码会话消息
 // （如 web_access_chat 写入、web_access_load_session_chunk /
 // web_access_save_session_messages_chunk 读/写）。暂不封堵的原因：该组命令与普通
 // 会话共用同一条会话读写通道，封堵策略（显式拒绝还是远程端正式支持代码会话）待审阅
@@ -4775,23 +4772,28 @@ mod tests {
     }
 
     #[test]
-    fn code_session_event_filter_is_inert_without_predicate() {
-        // predicate 未注入（启动早期）时不过滤任何事件，行为与注入前一致。
+    fn code_session_event_filter_is_inert_without_resolver() {
+        // resolver 未注入（启动早期）时不过滤任何事件，行为与注入前一致。
         let payload = json!({ "session_id": "code-sess-1" });
         assert!(!should_filter_code_session_event(None, &payload));
     }
 
     #[test]
     fn code_session_events_are_filtered_for_each_field_name_variant() {
-        let predicate: CodeSessionPredicate =
-            Arc::new(|session_id: &str| session_id.starts_with("code-"));
+        let resolver: SessionKindResolver = Arc::new(|session_id: &str| {
+            if session_id.starts_with("code-") {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
+        });
         for payload in [
             json!({ "session_id": "code-sess-1" }),
             json!({ "id": "code-sess-1" }),
             json!({ "sessionId": "code-sess-1" }),
         ] {
             assert!(
-                should_filter_code_session_event(Some(&predicate), &payload),
+                should_filter_code_session_event(Some(&resolver), &payload),
                 "code session event must be filtered: {payload}"
             );
         }
@@ -4799,16 +4801,21 @@ mod tests {
 
     #[test]
     fn plain_session_events_survive_the_code_session_filter() {
-        // 普通会话事件必须不受影响：predicate 只对真实代码会话 id 返回 true。
-        let predicate: CodeSessionPredicate =
-            Arc::new(|session_id: &str| session_id.starts_with("code-"));
+        // 普通会话事件必须不受影响：resolver 只对真实代码会话 id 返回 CodeNative。
+        let resolver: SessionKindResolver = Arc::new(|session_id: &str| {
+            if session_id.starts_with("code-") {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
+        });
         for payload in [
             json!({ "session_id": "plain-sess-1" }),
             json!({ "id": "plain-sess-1" }),
             json!({ "sessionId": "plain-sess-1" }),
         ] {
             assert!(
-                !should_filter_code_session_event(Some(&predicate), &payload),
+                !should_filter_code_session_event(Some(&resolver), &payload),
                 "plain session event must not be filtered: {payload}"
             );
         }
@@ -4816,15 +4823,15 @@ mod tests {
 
     #[test]
     fn code_session_filter_only_fires_on_a_session_id_field() {
-        // 过滤器按 payload 中的会话 id 触发；即使 predicate 恒真，不带会话 id
-        // （或 id 非字符串）的事件也不过滤，避免误伤无会话维度的全局事件。
-        let predicate: CodeSessionPredicate = Arc::new(|_: &str| true);
+        // 过滤器按 payload 中的会话 id 触发；即使 resolver 恒判 CodeNative，不带会话
+        // id（或 id 非字符串）的事件也不过滤，避免误伤无会话维度的全局事件。
+        let resolver: SessionKindResolver = Arc::new(|_: &str| SessionKind::CodeNative);
         assert!(!should_filter_code_session_event(
-            Some(&predicate),
+            Some(&resolver),
             &json!({ "kind": "session:list_changed" })
         ));
         assert!(!should_filter_code_session_event(
-            Some(&predicate),
+            Some(&resolver),
             &json!({ "id": 42 })
         ));
     }

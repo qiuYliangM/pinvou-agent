@@ -351,6 +351,30 @@ impl EnginePool {
         tools
     }
 
+    /// 会话能力档案热更:按会话 kind 把 skill 禁用集广播给在跑引擎
+    /// (`Op::SetDisabledSkills`,下一轮 prompt 生效)。只有档案会话(原生代码
+    /// 会话,`shape_disabled_skills` 返回 `Some`)会被推送;返回 `None` 的会话
+    /// 跳过——它们由进程级全局集合管
+    /// (`skill_marketplace::refresh_disabled_skills`),语义不叠加。没起的会话
+    /// 下次 spawn 时经同一解析拿初值。
+    /// 触发点:code scope 连接器/skill 开关变更、skill 装/卸/导入、启动补刷。
+    pub async fn refresh_disabled_skills(&self) {
+        let entries = self.entries.lock().await;
+        for (sid, entry) in entries.iter() {
+            let Some(skills) = self.bridge.shape_disabled_skills(sid) else {
+                continue;
+            };
+            if let Err(e) = entry
+                .engine
+                .handle
+                .send(Op::SetDisabledSkills { skills })
+                .await
+            {
+                eprintln!("[engine_pool] refresh_disabled_skills {sid} failed: {e:?}");
+            }
+        }
+    }
+
     /// 为独立调用构造该 session 的 bridge。与 EnginePool lazy spawn 共用同一套
     /// runtime provider，保证检阅等旁路入口也不会绕过运行时凭据准备。
     pub(crate) async fn fresh_bridge_for(&self, session_id: &str) -> Result<Pinvou3Bridge> {

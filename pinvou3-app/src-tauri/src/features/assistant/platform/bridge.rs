@@ -96,7 +96,9 @@ fn official_deepseek_model_name(model: &str) -> String {
 /// 原生代码会话的执行根解析器与「两个根」类型统一由
 /// [`crate::features::sessions`] 定义(SessionStore 与 bridge 共用同一实现),
 /// 此处 re-export 保持既有调用路径不变。
-pub use crate::features::sessions::{ExecutionRootResolver, SessionRoots};
+pub use crate::features::sessions::{
+    ExecutionRootResolver, SessionKind, SessionKindResolver, SessionRoots,
+};
 
 #[derive(Clone)]
 pub struct Pinvou3Bridge {
@@ -117,10 +119,10 @@ pub struct Pinvou3Bridge {
     /// 项目绑定，所有会话都用会话私有目录。账本根（附件/审计/产物）不受其影响，
     /// 仍由 `SessionStore::session_roots` 的 `ledger` 字段统一决定。
     pub execution_root_resolver: Option<ExecutionRootResolver>,
-    /// 原生代码会话判定（code_session=true，含临时与绑项目两种）。用于
-    /// instructions 的 work/code 分支渲染与工具整形；lib.rs 与执行根解析器
-    /// 共用 AcpPool 那份 SessionAgentStore 注入。
-    pub code_session_predicate: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// 会话类型判定（创建时定型的 `SessionKind`）。用于 instructions 的
+    /// work/code 分支渲染与工具整形；lib.rs 与执行根解析器共用 AcpPool 那份
+    /// SessionAgentStore 注入的同一份 `session_kind` 闭包。
+    pub session_kind_resolver: Option<SessionKindResolver>,
 }
 
 impl std::fmt::Debug for Pinvou3Bridge {
@@ -138,8 +140,8 @@ impl std::fmt::Debug for Pinvou3Bridge {
                 &self.execution_root_resolver.as_ref().map(|_| "Some(..)"),
             )
             .field(
-                "code_session_predicate",
-                &self.code_session_predicate.as_ref().map(|_| "Some(..)"),
+                "session_kind_resolver",
+                &self.session_kind_resolver.as_ref().map(|_| "Some(..)"),
             )
             .finish()
     }
@@ -222,7 +224,7 @@ impl Pinvou3Bridge {
             runtime_model_credential: None,
             probed_context_tokens: None,
             execution_root_resolver: None,
-            code_session_predicate: None,
+            session_kind_resolver: None,
         };
         this.wire_max_output_tokens_env();
         // C 方案(P-no-disk)最终版: 清理所有 pinvou3 历史 disk 残留:
@@ -397,29 +399,31 @@ impl Pinvou3Bridge {
         self.execution_root_resolver = Some(resolver);
     }
 
-    /// 注入原生代码会话判定（与执行根解析器同一份 SessionAgentStore）。
-    pub fn set_code_session_predicate(
-        &mut self,
-        predicate: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) {
-        self.code_session_predicate = Some(predicate);
+    /// 注入会话类型判定（与执行根解析器同一份 SessionAgentStore 闭包）。
+    pub fn set_session_kind_resolver(&mut self, resolver: SessionKindResolver) {
+        self.session_kind_resolver = Some(resolver);
+    }
+
+    /// 该 session 的类型（未注入 resolver 时按普通聊天会话处理，与注入前行为一致）。
+    pub fn session_kind(&self, session_id: &str) -> SessionKind {
+        self.session_kind_resolver
+            .as_ref()
+            .map(|resolver| resolver(session_id))
+            .unwrap_or(SessionKind::Chat)
     }
 
     /// 该 session 是否为原生（品悟 Engine）代码会话（含临时与绑项目两种）。
     pub fn is_code_session(&self, session_id: &str) -> bool {
-        self.code_session_predicate
-            .as_ref()
-            .is_some_and(|predicate| predicate(session_id))
+        self.session_kind(session_id) == SessionKind::CodeNative
     }
 
     /// 会话级工具整形:原生代码会话没有产出物面板/成品卡语义(提示词也不再提及),
     /// 隐藏 present_artifact;其他会话原样返回。spawn 初值与全局热刷都经此整形。
     ///
-    /// 代码会话同时禁用 load_skill(skill 触达模型的唯一工具通道):skill 开关是
-    /// 进程级全局状态,无法按会话生效,代码页开关只落盘不生效即成"假开关";
-    /// 在底座支持按会话禁用单个 skill 之前,代码会话整体禁用 load_skill 作为
-    /// 过渡方案(catalogue 路径泄露的残留口径见
-    /// docs/code-native-agent-会话能力档案设计.md)。
+    /// skill 维度的隔离由会话能力档案(`disabled_skills`,见
+    /// [`Self::shape_disabled_skills`] 与 docs/code-native-agent-会话能力档案设计.md)
+    /// 承担——catalogue 不列出 + `load_skill` 按会话集判定,这里不再整体禁用
+    /// `load_skill`(过渡方案 D 已退役)。
     ///
     /// 传入的 `tools` 是全局(plain scope)的禁用工具名。对代码会话,连接器工具
     /// 不再沿用 plain scope 的禁用集,而是改用 code scope 的禁用集 —— 两个 scope
@@ -427,7 +431,6 @@ impl Pinvou3Bridge {
     /// (kb_search 等)仍保留。
     pub fn shape_disallowed_tools(&self, session_id: &str, mut tools: Vec<String>) -> Vec<String> {
         const PRESENT_ARTIFACT: &str = "mcp_pinvou3_present_artifact";
-        const LOAD_SKILL: &str = "load_skill";
         if self.is_code_session(session_id) {
             // 用 code scope 的连接器禁用集替换 plain scope 的连接器禁用集。
             let plain_connector = crate::features::marketplace::disabled_tool_names();
@@ -443,11 +446,32 @@ impl Pinvou3Bridge {
             if !tools.iter().any(|tool| tool == PRESENT_ARTIFACT) {
                 tools.push(PRESENT_ARTIFACT.to_string());
             }
-            if !tools.iter().any(|tool| tool == LOAD_SKILL) {
-                tools.push(LOAD_SKILL.to_string());
-            }
         }
         tools
+    }
+
+    /// 会话能力档案的 skill 维度:按会话解析 `EngineConfig.disabled_skills`
+    /// (设计文档 §2.2)。spawn 初值与热更广播(`EnginePool::refresh_disabled_skills`)
+    /// 都经此解析。
+    ///
+    /// - 原生代码会话 → `Some(set)`:set = code scope 禁用集
+    ///   ([`marketplace::load_disabled_connectors_for`] Code)中的 `skill:<id>` 条目
+    ///   (含旧版无前缀裸 id 兼容) + code 禁用连接器的 companion skills,经
+    ///   [`skill_marketplace::disabled_skill_names`] 映射为模型可见 skill 名。
+    ///   code scope 未初始化时连接器默认全禁,其 companion skills 随之全禁——
+    ///   与 [`Self::shape_disallowed_tools`] 的安全默认一致;`skill:` 条目只在
+    ///   用户显式关闭时落盘,普通 skill 初始默认启用。`Some` 对底座是**替换**
+    ///   进程级全局集(非并集):code 开关独立于 plain,「plain 关、code 开」成立。
+    /// - 其他会话(普通/ACP/定时) → `None`:无档案,回落进程级全局集合
+    ///   ([`skill_marketplace::refresh_disabled_skills`] 推送),行为逐字节不变。
+    pub fn shape_disabled_skills(&self, session_id: &str) -> Option<Vec<String>> {
+        if !self.is_code_session(session_id) {
+            return None;
+        }
+        let disabled = crate::features::marketplace::load_disabled_connectors_for(
+            crate::features::marketplace::ConnectorScope::Code,
+        );
+        Some(skill_marketplace::disabled_skill_names(&disabled))
     }
 
     /// 应用账本根：审计等应用自有文件的落盘根。绑了项目目录的原生代码会话恒为
@@ -1049,6 +1073,10 @@ impl Pinvou3Bridge {
             goal_token_budget,
             goal_status,
             disallowed_tools: _, // pinvou3 从持久列表算初值(见构造处),默认值忽略
+            // 会话能力档案(fork 侧已落地):会话级 skill 禁用集。此处默认值忽略;
+            // 无会话上下文的裸 build 置 None(回落进程级全局),spawn_for_session
+            // 按会话 kind 经 `shape_disabled_skills` 覆盖真实值(设计文档 §2.2)。
+            disabled_skills: _,
             // —— v0.8.65 上游新增字段,透传 default ——
             //   subagents_enabled: default true(三省六部走 SpawnSubAgent,必须开)。
             //   launch_concurrency/max_admitted_subagents/subagent_token_budget: subagent
@@ -1236,6 +1264,11 @@ impl Pinvou3Bridge {
                     Some(n)
                 }
             },
+            // 会话能力档案初值:无会话上下文的裸 build(含 L1 headless)置 None =
+            // 无档案会话,回落进程级全局 DISABLED_SKILLS,行为与档案机制引入前一致。
+            // spawn_for_session 用 `shape_disabled_skills` 按会话 kind 覆盖真实值
+            // (代码会话 = code scope 替换集,其余 None,设计文档 §2.2)。
+            disabled_skills: None,
             // [pinvou3-fork] 透传 default(空);kb_search 在 spawn_for_session 按 session 注入
             // —— v0.8.65 上游新增字段,透传 default ——
             //   subagents_enabled: default true(三省六部走 SpawnSubAgent,必须开)。
@@ -1717,7 +1750,7 @@ mod tests {
             runtime_model_credential: None,
             probed_context_tokens: None,
             execution_root_resolver: None,
-            code_session_predicate: None,
+            session_kind_resolver: None,
         }
     }
 
@@ -1812,10 +1845,15 @@ mod tests {
         bridge.set_execution_root_resolver(std::sync::Arc::new(move |session_id: &str| {
             (session_id == "sess-code-project").then(|| hit.clone())
         }));
-        bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-            session_id == "sess-code-project"
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            if session_id == "sess-code-project"
                 || session_id == "sess-code-temp"
                 || session_id == "sess-code-project2"
+            {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
         }));
 
         // 绑项目的代码会话：注入 project/AGENTS.md 与 base/AGENTS.md（monorepo 根）。
@@ -1939,8 +1977,12 @@ mod tests {
             bridge.set_execution_root_resolver(std::sync::Arc::new(move |session_id: &str| {
                 (session_id == "sess-code-project").then(|| hit.clone())
             }));
-            bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-                session_id == "sess-code-project"
+            bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+                if session_id == "sess-code-project" {
+                    SessionKind::CodeNative
+                } else {
+                    SessionKind::Chat
+                }
             }));
 
             // symlink 的 AGENTS.md 不得注入（项目目录下唯一的 AGENTS.md 即该 symlink）。
@@ -1955,8 +1997,8 @@ mod tests {
         }
     }
 
-    /// 双门控：resolver 命中（存在绑定的项目目录）但 predicate 判定非原生代码
-    /// 会话（如索引在、sidecar 缺失的降级会话）→ 不注入，避免项目规则泄进
+    /// 双门控：resolver 命中（存在绑定的项目目录）但 session_kind 判定非原生
+    /// 代码会话（如索引在、sidecar 缺失的降级会话）→ 不注入，避免项目规则泄进
     /// 普通会话提示词。
     #[test]
     fn code_session_project_rules_skip_when_resolver_hits_but_not_code_session() {
@@ -1972,7 +2014,9 @@ mod tests {
         bridge.set_execution_root_resolver(std::sync::Arc::new(move |session_id: &str| {
             (session_id == "sess-degraded").then(|| hit.clone())
         }));
-        bridge.set_code_session_predicate(std::sync::Arc::new(|_session_id: &str| false));
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|_session_id: &str| {
+            SessionKind::Chat
+        }));
 
         assert!(
             bridge.code_session_project_rules("sess-degraded").is_empty(),
@@ -2000,8 +2044,12 @@ mod tests {
         bridge.set_execution_root_resolver(std::sync::Arc::new(move |session_id: &str| {
             (session_id == "sess-code-project").then(|| hit.clone())
         }));
-        bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-            session_id == "sess-code-project"
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            if session_id == "sess-code-project" {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
         }));
 
         let instructions = bridge.session_instructions("sess-code-project");
@@ -2039,8 +2087,12 @@ mod tests {
         bridge.set_execution_root_resolver(std::sync::Arc::new(move |session_id: &str| {
             (session_id == "sess-code-project").then(|| hit.clone())
         }));
-        bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-            session_id == "sess-code-project"
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            if session_id == "sess-code-project" {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
         }));
 
         let instr = bridge.session_instructions("sess-code-project");
@@ -2080,26 +2132,38 @@ mod tests {
     #[test]
     fn code_session_tool_shaping_hides_present_artifact_only_for_code_sessions() {
         let mut bridge = fixture_bridge();
-        // 未注入 predicate：一律按非代码会话处理。
+        // 未注入 resolver：一律按非代码会话处理。
         let plain = vec!["kb_search".to_string()];
         assert_eq!(
             bridge.shape_disallowed_tools("sess-plain", plain.clone()),
             plain
         );
 
-        bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-            session_id == "sess-code-temp" || session_id == "sess-code-project"
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            if session_id == "sess-code-temp" || session_id == "sess-code-project" {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
         }));
+        assert_eq!(bridge.session_kind("sess-code-temp"), SessionKind::CodeNative);
+        assert_eq!(
+            bridge.session_kind("sess-code-project"),
+            SessionKind::CodeNative
+        );
+        assert_eq!(bridge.session_kind("sess-plain"), SessionKind::Chat);
         assert!(bridge.is_code_session("sess-code-temp"));
         assert!(bridge.is_code_session("sess-code-project"));
         assert!(!bridge.is_code_session("sess-plain"));
 
-        // 临时与绑项目的代码会话都隐藏成品卡工具并禁用 load_skill；普通会话不受影响。
+        // 临时与绑项目的代码会话都隐藏成品卡工具;普通会话不受影响。
+        // (load_skill 不再在此禁用——skill 隔离由会话能力档案 disabled_skills 承担,
+        // 见 code_session_skill_profile_* 测试。)
         for sid in ["sess-code-temp", "sess-code-project"] {
             let shaped = bridge.shape_disallowed_tools(sid, plain.clone());
             assert!(shaped.contains(&"mcp_pinvou3_present_artifact".to_string()));
-            assert!(shaped.contains(&"load_skill".to_string()));
             assert!(shaped.contains(&"kb_search".to_string()));
+            assert!(!shaped.contains(&"load_skill".to_string()));
             // 幂等：不重复追加。
             let twice = bridge.shape_disallowed_tools(sid, shaped);
             assert_eq!(
@@ -2107,10 +2171,6 @@ mod tests {
                     .iter()
                     .filter(|tool| *tool == "mcp_pinvou3_present_artifact")
                     .count(),
-                1
-            );
-            assert_eq!(
-                twice.iter().filter(|tool| *tool == "load_skill").count(),
                 1
             );
         }
@@ -2161,8 +2221,12 @@ mod tests {
         assert_eq!(pptx.len(), 1);
 
         let mut bridge = fixture_bridge();
-        bridge.set_code_session_predicate(std::sync::Arc::new(|session_id: &str| {
-            session_id == "sess-code"
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            if session_id == "sess-code" {
+                SessionKind::CodeNative
+            } else {
+                SessionKind::Chat
+            }
         }));
 
         use crate::features::marketplace::ConnectorScope;
@@ -2177,8 +2241,6 @@ mod tests {
         assert!(shaped.contains(&weather[0]));
         assert!(shaped.contains(&pptx[0]));
         assert!(shaped.contains(&"kb_search".to_string()));
-        // 代码会话整体禁用 load_skill(skill 开关是进程级全局,无法按会话生效的过渡方案)。
-        assert!(shaped.contains(&"load_skill".to_string()));
 
         // code 显式只禁 pptx → weather 恢复,pptx 仍禁;plain 的 weather 禁用不再影响代码会话。
         crate::features::marketplace::save_disabled_connectors_for(
@@ -2188,11 +2250,127 @@ mod tests {
         let shaped = bridge.shape_disallowed_tools("sess-code", tools.clone());
         assert!(!shaped.contains(&weather[0]));
         assert!(shaped.contains(&pptx[0]));
-        assert!(shaped.contains(&"load_skill".to_string()));
 
         // 普通会话不整形:原样返回传入的全局禁用集(全局禁用集由 EnginePool 按 plain scope 计算)。
         let shaped = bridge.shape_disallowed_tools("sess-plain", tools.clone());
         assert_eq!(shaped, tools);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话能力档案(disabled_skills)解析:
+    /// - 代码会话 → Some(code scope 集):`skill:<id>` 条目(含旧版裸 id 兼容) +
+    ///   code 禁用连接器的 companion skills,映射为模型可见 skill 名;
+    /// - code scope 未初始化 → 连接器默认全禁 → companion skills 随之全禁(安全默认);
+    /// - 替换语义:Some(空集) ≠ None,plain 的禁用条目不穿透进代码会话
+    ///   (「plain 关、code 开」成立);
+    /// - 普通/ACP/定时会话 → None(回落进程级全局,行为不变)。
+    #[test]
+    fn code_session_skill_profile_resolves_code_scope_set() {
+        let (_lock, _env) = locked_env(&["PINVOU3_HOME"]);
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou3-bridge-skill-profile-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PINVOU3_HOME", &dir);
+        // 已装 weather/pptx 两个连接器;pptx 声明 companion skill government-writing。
+        let installed = dir.join("marketplace").join("installed.json");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(
+            &installed,
+            serde_json::to_string(&["weather".to_string(), "pptx".to_string()]).unwrap(),
+        )
+        .unwrap();
+        let servers_dir = crate::platform::paths::bundle_mcp_servers_dir();
+        for (id, tool, companions) in [
+            ("weather", "get_weather", ""),
+            ("pptx", "make_pptx", r#","companion_skills":["government-writing"]"#),
+        ] {
+            let mdir = servers_dir.join(id);
+            std::fs::create_dir_all(&mdir).unwrap();
+            std::fs::write(
+                mdir.join("manifest.json"),
+                format!(
+                    r#"{{"id":"{id}","name":"{id}","description":"d","version":"1","icon":"x","category":"c","mcp_tools":["{tool}"],"command":"python","args":["server.py"]{companions}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        // 装一个独立 skill(visualizer),供 `skill:` 条目折算。
+        let skill_dir = crate::platform::paths::bundle_skills_dir().join("visualizer");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: visualizer\ndescription: t\n---\n# hi",
+        )
+        .unwrap();
+
+        let mut bridge = fixture_bridge();
+        bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
+            match session_id {
+                "sess-code" => SessionKind::CodeNative,
+                "sess-acp" => SessionKind::CodeAcp,
+                "sess-sched" => SessionKind::ScheduledRun,
+                _ => SessionKind::Chat,
+            }
+        }));
+
+        use crate::features::marketplace::ConnectorScope;
+        // code scope 未初始化 → 已装连接器默认全禁 → companion skills 随之全禁。
+        assert_eq!(
+            bridge.shape_disabled_skills("sess-code"),
+            Some(vec!["government-writing".to_string()])
+        );
+
+        // plain 关了 visualizer 与 pptx;code 显式初始化空集 → Some(空) ≠ None:
+        // 替换语义,plain 禁用不穿透进代码会话(「plain 关、code 开」)。
+        crate::features::marketplace::save_disabled_connectors_for(
+            ConnectorScope::Plain,
+            &["skill:visualizer".to_string(), "pptx".to_string()],
+        );
+        crate::features::marketplace::save_disabled_connectors_for(ConnectorScope::Code, &[]);
+        assert_eq!(bridge.shape_disabled_skills("sess-code"), Some(vec![]));
+
+        // code 显式关单个 skill:`skill:<id>` 条目折算为 skill 名(companion 不再带入,
+        // 因为 pptx 在 code scope 是开的)。
+        crate::features::marketplace::save_disabled_connectors_for(
+            ConnectorScope::Code,
+            &["skill:visualizer".to_string()],
+        );
+        assert_eq!(
+            bridge.shape_disabled_skills("sess-code"),
+            Some(vec!["visualizer".to_string()])
+        );
+
+        // 旧版无前缀裸 id 兼容:裸 skill id 同样折算(连接器 id 不会被误判为 skill)。
+        crate::features::marketplace::save_disabled_connectors_for(
+            ConnectorScope::Code,
+            &["visualizer".to_string()],
+        );
+        assert_eq!(
+            bridge.shape_disabled_skills("sess-code"),
+            Some(vec!["visualizer".to_string()])
+        );
+
+        // code 只禁连接器 pptx → 其 companion skill 进入禁用集。
+        crate::features::marketplace::save_disabled_connectors_for(
+            ConnectorScope::Code,
+            &["pptx".to_string()],
+        );
+        assert_eq!(
+            bridge.shape_disabled_skills("sess-code"),
+            Some(vec!["government-writing".to_string()])
+        );
+
+        // 非原生代码会话一律 None(回落进程级全局,行为逐字节不变)。
+        for sid in ["sess-plain", "sess-acp", "sess-sched"] {
+            assert_eq!(bridge.shape_disabled_skills(sid), None, "{sid} 应无档案");
+        }
+        // 未注入 resolver 时按普通会话处理,同样 None。
+        let bare = fixture_bridge();
+        assert_eq!(bare.shape_disabled_skills("sess-code"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

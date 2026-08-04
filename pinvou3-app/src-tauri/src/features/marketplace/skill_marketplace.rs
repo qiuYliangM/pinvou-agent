@@ -110,19 +110,22 @@ pub struct MarketplaceSkillInfo {
 // 停用开关(全局持久)----------------------------------------------------------
 //
 // 技能停用**没有独立开关**:改由连接器禁用联动驱动——被禁用连接器
-// ([`marketplace::load_disabled_connectors`])声明的 `companion_skills` 即视为停用。
+// ([`marketplace::load_disabled_connectors`])声明的 `companion_skills` 即视为停用,
+// 加上 `skill:<id>` 条目(用户在工具菜单显式关闭的单个 skill)。
 // 语义 = "公文 MCP 关掉 → government-writing 一并从 `## Skills` catalogue 隐藏;开回来
 // 即恢复"(装/卸走 companion install/uninstall,禁用/启用走这里,三态一致)。
-// skill 没有 per-session catalog,底座侧是 render 收口的进程级过滤器(见
-// deepseek_tui::skills::set_disabled_skills),故无需 Op / engine_pool 广播——一次 set
-// 全 session 下轮生效。
+//
+// 会话能力档案落地后(docs/code-native-agent-会话能力档案设计.md),折算逻辑按
+// scope 复用:plain scope 的折算结果推进程级全局集合(本文件
+// [`refresh_disabled_skills`],作为**无档案会话的默认值**);code scope 的折算结果
+// 由 bridge 按会话解析进 `EngineConfig.disabled_skills`(spawn 注入 + 热更,
+// 替换全局而非并集),普通/ACP/定时会话行为逐字节不变。
 
-/// 把当前停用集(被禁用连接器的 companion_skills → 落盘 skill 名)推给底座进程级过滤器。
-/// 启动时 + 每次 `set_disabled_connectors` 调用;空集 = 全开。下一轮 prompt 构建即生效
-/// (一次 prefix-cache miss 后稳定)。
-pub fn refresh_disabled_skills() {
+/// 禁用连接器 id 列表 → 被停用的 skill 市场 id 列表:被禁连接器的
+/// `companion_skills` + `skill:<id>` 条目(折算已装集) + 旧版无前缀裸 id 兼容。
+/// plain/code 两个 scope 共用这一份折算,只在传入的禁用集来源上不同。
+pub fn disabled_skill_ids(disabled_ids: &[String]) -> Vec<String> {
     let market = crate::features::marketplace::MarketplaceManager::new();
-    let disabled_ids = crate::features::marketplace::load_disabled_connectors();
     let mut skill_ids: Vec<String> = disabled_ids
         .iter()
         .flat_map(|cid| market.companion_skills(cid))
@@ -148,8 +151,22 @@ pub fn refresh_disabled_skills() {
                 .then(|| id.clone())
         }
     }));
-    let names = skill_market.model_skill_names(&skill_ids);
-    deepseek_tui::skills::set_disabled_skills(names);
+    skill_ids
+}
+
+/// 禁用连接器 id 列表 → 模型可见 skill 名(= SKILL.md frontmatter `name`)。
+pub fn disabled_skill_names(disabled_ids: &[String]) -> Vec<String> {
+    SkillMarketplaceManager::new().model_skill_names(&disabled_skill_ids(disabled_ids))
+}
+
+/// 把当前(plain scope)停用集推给底座进程级过滤器。该全局集合只是**无档案会话**
+/// (普通/ACP/定时等)的默认值;原生代码会话以会话能力档案(spawn 注入 +
+/// `Op::SetDisabledSkills` 热更)为准,不读这里。启动时 + 每次 plain scope
+/// `set_disabled_connectors` 调用;空集 = 全开。下一轮 prompt 构建即生效
+/// (一次 prefix-cache miss 后稳定)。
+pub fn refresh_disabled_skills() {
+    let disabled_ids = crate::features::marketplace::load_disabled_connectors();
+    deepseek_tui::skills::set_disabled_skills(disabled_skill_names(&disabled_ids));
 }
 
 // Manager ---------------------------------------------------------------------

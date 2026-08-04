@@ -881,6 +881,10 @@ impl AppEngine {
         } else {
             Some(disallowed)
         };
+        // 会话能力档案:按会话 kind 解析 skill 禁用集,覆盖 build_engine_config 的
+        // None 初值。代码会话 = code scope 替换集(catalogue 不列出 + load_skill
+        // 按会话集判定);其余会话仍 None = 回落进程级全局,行为不变。
+        engine_config.disabled_skills = bridge.shape_disabled_skills(session_id);
         let dt_config = bridge.build_dt_config();
 
         eprintln!(

@@ -31,7 +31,9 @@ fingerprints=(
   "T3|密封静态 prompt composer           |CodeWhale/crates/tui/src/prompts.rs|pub fn set_static_prompt_composer_override"
   "T3|instructions 不受 4KB fragment 截断|CodeWhale/crates/tui/src/prompts.rs|fn forkguard_permissions_fragment_preserves_instructions_beyond_default_fragment_cap"
   "T3|skill 来源收敛到 bundle            |CodeWhale/crates/tui/src/skills/mod.rs|home.join(\".pinvou3\").join(\"bundle\").join(\"skills\")"
-  "T3|停用 skill 不进入目录              |CodeWhale/crates/tui/src/skills/mod.rs|if is_skill_disabled(&skill.name)"
+  # 会话能力档案(2026-08):skill 过滤从进程级全局改为「会话档案替换」语义,锚点
+  # 同步从 is_skill_disabled(&skill.name) 换成会话感知判定 is_skill_disabled_for_session。
+  "T3|停用 skill 不进入目录(会话档案替换)|CodeWhale/crates/tui/src/skills/mod.rs|is_skill_disabled_for_session(&skill.name, disabled_skills)"
   "T3|内部提醒不污染 Working Set         |CodeWhale/crates/tui/src/working_set.rs|fn strip_leading_system_reminder(text: &str) -> &str"
 
   "T4|automation 透传模型                |CodeWhale/crates/tui/src/automation_manager.rs|model: automation.model.clone()"

@@ -55,15 +55,16 @@
 ### T3 `fork`：提示词密封与 context / skill 单一来源
 
 - **commit**：`87aef33ce feat(fork): 密封提示词并收敛上下文与技能来源`
-- **核心文件**：`prompts.rs`、`project_context.rs`、`project_context_cache.rs`、`skills/mod.rs`、`tools/skill.rs`、`working_set.rs`。
+- **核心文件**：`prompts.rs`、`project_context.rs`、`project_context_cache.rs`、`skills/mod.rs`、`tools/skill.rs`、`tools/spec.rs`、`core/engine.rs`、`core/ops.rs`、`working_set.rs`。
 - **内容**：
   - 静态 prompt composer 由 app 接管，默认层和运行时策略按 composer gate 密封。
   - 不再扫描仓库 constitution / AGENTS / CLAUDE 等外部 project context；pinvou3 只用 app 注入的 inline instructions，项目规则（`AGENTS.md`）由 app 侧受限注入（仅绑项目代码会话，root→cwd 各层；不越过用户家目录——project_root 与 home 同函数归一化后比较，Windows 上边界真实生效；symlink/非普通文件拒读；归一化失败 fail-closed；见 `docs/code-native-agent.md` §8.5）。
   - skill 来源收敛到 `~/.pinvou3/bundle/skills`，并保留市场停用过滤。
+  - 会话能力档案（`docs/code-native-agent-会话能力档案设计.md` §2.1）：skill 过滤从进程级全局 `DISABLED_SKILLS` 单点改为「会话档案替换」语义——`EngineConfig.disabled_skills: Option<Vec<String>>`，`Some` = 有档案会话，catalogue（`render_skills_block` 经 `PromptSessionContext.disabled_skills` 透传）与 `load_skill`（`ToolContext.disabled_skills`，engine 构建 ctx 时盖章）都以会话集为准**替换**全局（非并集）；`None` = 无档案会话（ACP/CLI/TUI/automation 等既有链路），回落全局，行为逐字节不变。catalogue 不列出被禁 skill（封口点），`load_skill` 按会话集拒绝（纵深防御）。热更走 `Op::SetDisabledSkills`（空集不塌缩成 None——`Some(vec![])` 是「有档案且全启用」），下一轮 prompt 生效（该会话一次 prefix-cache miss 后稳定）。全局集合退役为无档案会话的默认值，skills/mod.rs 原「全局对齐连接器 chip」注释已正式改写。
   - 内部 `<system-reminder>` 不参与 Working Set 路径提取。
   - instructions/用户记忆 fragment 沿用 100KB 指令上限，避免被 v0.9 WorldState 默认 4KB 静默截断。
 - **为什么留 fork**：这是 pinvou3 的单一知识/指令来源和 prefix-cache 稳定性约束，上游通用 CLI 不能默认采用。
-- **守护**：static composer 前后字节测试、inline context 测试、skill union/停用测试、Working Set 两条回归；sync 后仍需跑 `dump_system_prompt` 前后 diff。
+- **守护**：static composer 前后字节测试、inline context 测试、skill union/停用测试（含 `forkguard_session_profile_replaces_global_set_in_catalogue` 替换语义双向锁定、`forkguard_session_profile_none_matches_global_byte_for_byte` 无档案 golden、`forkguard_load_skill_refuses_session_disabled_skill` / `forkguard_load_skill_session_set_replaces_global_and_none_falls_back`、`forkguard_set_disabled_skills_hot_update_renders_new_catalogue` 热更回归）、Working Set 两条回归；sync 后仍需跑 `dump_system_prompt` 前后 diff。
 
 ### T4 `fork`：定时任务执行与历史生命周期
 

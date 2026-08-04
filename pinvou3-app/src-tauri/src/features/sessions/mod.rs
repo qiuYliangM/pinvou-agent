@@ -38,9 +38,24 @@ use crate::platform::paths;
 const SCHEDULED_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_SESSIONS_PER_KIND: usize = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 会话类型（创建时定型的一等概念）。
+///
+/// 两个持久化维度各管一段，合并判定在调用侧完成（见
+/// `app/commands/sessions.rs` 的 `listed_session_kind`）：
+/// - [`SessionStore::session_kind`] 只判定 scheduled 维度（自己持有的运行档案），
+///   非定时运行会话一律返回 `Chat`——它不感知代码会话（sessions 不依赖 codex_acp）；
+/// - 代码会话维度由 `codex_acp::SessionAgentStore::session_kind` 判定
+///   （`CodeNative` / `CodeAcp` / `Chat`，无记录 = `Chat`）。
+///
+/// serde 表示用于 `SessionAgentRecord.kind` 的持久化（kebab-case）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SessionKind {
     Chat,
+    /// “代码”模块原生（品悟 Engine）会话。
+    CodeNative,
+    /// 外部 Agent（Codex / Claude / Kimi）ACP 代码会话。
+    CodeAcp,
     ScheduledRun,
 }
 
@@ -201,6 +216,12 @@ pub struct SessionStore {
 /// 两个 feature 互相引用会成环,解析器由 app 组合根(lib.rs)注入并共享 AcpPool
 /// 持有的同一份 store(clone 共享 Arc,运行时读到最新绑定)。
 pub type ExecutionRootResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// 会话类型(`SessionKind`)判定解析器:`codex_acp::SessionAgentStore::session_kind`
+/// 的共享闭包形态,由 app 组合根(lib.rs)构造一份,注入 Engine bridge 与
+/// remote_control——三处判定同源,不再各自实现「是否为代码会话」。
+/// 与 [`ExecutionRootResolver`] 一样用注入避免 `sessions`/`codex_acp` 成环。
+pub type SessionKindResolver = Arc<dyn Fn(&str) -> SessionKind + Send + Sync>;
 
 /// 一个会话的两个根:
 /// - `execution`:Engine cwd / shell 执行目录。绑了项目目录的原生代码会话 = 项目
@@ -568,6 +589,9 @@ impl SessionStore {
         Ok(())
     }
 
+    /// scheduled 维度的类型判定：定时运行会话返回 `ScheduledRun`，其余一律
+    /// `Chat`（本 store 不感知代码会话；`CodeNative` / `CodeAcp` 由
+    /// `codex_acp::SessionAgentStore::session_kind` 判定）。
     pub fn session_kind(&self, id: &str) -> Result<SessionKind> {
         if self.is_scheduled_session(id)? {
             Ok(SessionKind::ScheduledRun)

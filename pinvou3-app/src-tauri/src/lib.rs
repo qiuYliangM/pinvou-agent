@@ -452,16 +452,19 @@ pub fn run() {
                     pool.bridge
                         .set_execution_root_resolver(execution_root_resolver.clone());
                     store_for_engine.set_execution_root_resolver(execution_root_resolver);
-                    pool.bridge.set_code_session_predicate(std::sync::Arc::new({
-                        let agents = code_session_agents.clone();
-                        move |session_id: &str| agents.is_code_session(session_id)
-                    }));
+                    // 会话类型判定收敛为一份共享闭包：bridge（提示词分层/工具整形）
+                    // 与远程控制（代码会话事件过滤）注入同一个
+                    // `SessionAgentStore::session_kind`，不再各自实现判定。
+                    let session_kind_resolver: crate::features::sessions::SessionKindResolver =
+                        std::sync::Arc::new({
+                            let agents = code_session_agents.clone();
+                            move |session_id: &str| agents.session_kind(session_id)
+                        });
+                    pool.bridge
+                        .set_session_kind_resolver(session_kind_resolver.clone());
                     // 远程端正式支持代码会话之前，先过滤原生代码会话事件（与 Engine
-                    // bridge 共用同一份 SessionAgentStore 判定）。
-                    remote_control_manager.set_code_session_predicate(std::sync::Arc::new({
-                        let agents = code_session_agents.clone();
-                        move |session_id: &str| agents.is_code_session(session_id)
-                    }));
+                    // bridge 共用同一份 session_kind 判定）。
+                    remote_control_manager.set_session_kind_resolver(session_kind_resolver);
                     let scheduled_state = tauri::async_runtime::block_on(
                         scheduled_tasks::ScheduledTaskState::boot_runtime(
                             &pool.bridge,
@@ -496,8 +499,15 @@ pub fn run() {
 
             // 技能停用联动:启动时按当前被禁用连接器的 companion_skills 推给底座进程级
             // 过滤器,让(如公文 MCP 关掉时的)关联技能从首轮 prompt 起就不出现在 ## Skills。
+            // 该全局集合只是无档案会话(普通/ACP/定时)的默认值;代码会话走会话能力档案。
             startup::mark("disabled_skills:start");
             crate::features::marketplace::skill_marketplace::refresh_disabled_skills();
+            // 会话能力档案:对在跑会话补一次按会话广播——启动早期(remote-control
+            // 恢复 / 定时运行时 boot)可能已 spawn 代码会话引擎,让它们立即拿到档案,
+            // 不必等下次开关变更;池为空时 no-op。
+            if let Some(pool) = app.handle().try_state::<EnginePool>() {
+                tauri::async_runtime::block_on(pool.refresh_disabled_skills());
+            }
             startup::mark("disabled_skills:done");
 
             // Monitor 按需采样：state 只持有 session_uptime，sample 由前端调

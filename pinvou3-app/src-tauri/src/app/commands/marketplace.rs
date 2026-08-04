@@ -448,10 +448,19 @@ pub fn list_marketplace_skills(
 }
 
 #[tauri::command]
-pub async fn install_marketplace_skill(skill_id: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || install_marketplace_skill_sync(&skill_id))
+pub async fn install_marketplace_skill(
+    skill_id: String,
+    pool: State<'_, EnginePool>,
+) -> Result<(), String> {
+    let result = tokio::task::spawn_blocking(move || install_marketplace_skill_sync(&skill_id))
         .await
-        .map_err(|e| format!("任务执行失败: {e}"))?
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    // 已装集变化会改变 code 会话能力档案(skill: 条目折算 + companion 映射),
+    // 对在跑代码会话补一次按会话广播(全局推送已在 sync 内完成)。
+    if result.is_ok() {
+        pool.refresh_disabled_skills().await;
+    }
+    result
 }
 
 pub(super) fn install_marketplace_skill_sync(skill_id: &str) -> Result<(), String> {
@@ -468,7 +477,10 @@ pub(super) fn install_marketplace_skill_sync(skill_id: &str) -> Result<(), Strin
 /// (单 HTML 无 bundler 引不进),所以选文件走 Rust 端 dialog。
 /// 返回 true=已导入,false=用户取消。
 #[tauri::command]
-pub fn import_skill_package(app: tauri::AppHandle) -> Result<bool, String> {
+pub fn import_skill_package(
+    app: tauri::AppHandle,
+    pool: State<'_, EnginePool>,
+) -> Result<bool, String> {
     use tauri_plugin_dialog::DialogExt;
     let Some(picked) = app
         .dialog()
@@ -484,12 +496,20 @@ pub fn import_skill_package(app: tauri::AppHandle) -> Result<bool, String> {
     crate::features::marketplace::skill_marketplace::SkillMarketplaceManager::new()
         .import_package(&path.to_string_lossy())?;
     crate::features::marketplace::skill_marketplace::refresh_disabled_skills();
+    // 已装集变化会影响 code 会话能力档案,对在跑代码会话补一次按会话广播。
+    tauri::async_runtime::block_on(pool.refresh_disabled_skills());
     Ok(true)
 }
 
 #[tauri::command]
-pub fn uninstall_marketplace_skill(skill_id: String) -> Result<(), String> {
-    uninstall_marketplace_skill_sync(&skill_id)
+pub fn uninstall_marketplace_skill(
+    skill_id: String,
+    pool: State<'_, EnginePool>,
+) -> Result<(), String> {
+    uninstall_marketplace_skill_sync(&skill_id)?;
+    // 已装集变化会影响 code 会话能力档案,对在跑代码会话补一次按会话广播。
+    tauri::async_runtime::block_on(pool.refresh_disabled_skills());
+    Ok(())
 }
 
 pub(super) fn uninstall_marketplace_skill_sync(skill_id: &str) -> Result<(), String> {

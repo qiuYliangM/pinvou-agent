@@ -30,10 +30,55 @@ pub(super) fn ensure_chat_session(
         .session_kind(id)
         .map_err(|error| format!("{action}({id}): {error:?}"))?
     {
-        SessionKind::Chat => Ok(()),
+        // 代码会话与聊天会话共用 transcript/产物通道（SessionStore::session_kind
+        // 目前只返回 Chat/ScheduledRun，代码臂为类型完备性保留）。
+        SessionKind::Chat | SessionKind::CodeNative | SessionKind::CodeAcp => Ok(()),
         SessionKind::ScheduledRun => Err(format!(
             "{action}({id}): scheduled-run sessions are managed from Scheduled"
         )),
+    }
+}
+
+/// 会话列表的会话类型唯一判定入口：`list_sessions`（取 `Chat`）与
+/// `list_codex_acp_sessions`（取 `CodeNative` / `CodeAcp`）共用它做互斥过滤的
+/// 两个方向，不再两端各自写守卫。
+///
+/// 判定顺序：scheduled 维度（SessionStore 持有运行档案）优先；其次 ACP 元数据
+/// 兜底（辅助索引缺失时凭 `* (ACP)` 模型记录仍判 `CodeAcp`，不让历史会话掉回
+/// 聊天列表）；最后以 `SessionAgentStore::session_kind` 的类型真相收尾。
+pub(crate) fn listed_session_kind(
+    store: &SessionStore,
+    acp_pool: &crate::features::codex_acp::AcpPool,
+    metadata: &SessionMetadata,
+) -> Result<SessionKind, String> {
+    let scheduled = matches!(
+        store
+            .session_kind(&metadata.id)
+            .map_err(|error| format!("解析会话 {} 类型失败: {error:?}", metadata.id))?,
+        SessionKind::ScheduledRun
+    );
+    Ok(merge_listed_session_kind(
+        scheduled,
+        acp_pool.is_acp_metadata(metadata),
+        acp_pool.agents().session_kind(&metadata.id),
+    ))
+}
+
+/// [`listed_session_kind`] 的纯判定核：scheduled 维度优先；其次 ACP 元数据兜底
+/// （辅助索引缺失时凭 `* (ACP)` 模型记录仍判 `CodeAcp`，不让历史会话掉回聊天
+/// 列表）；否则以 `SessionAgentStore::session_kind` 的类型真相为准。独立成纯
+/// 函数，让「列表互斥」的真值表可单测。
+pub(crate) fn merge_listed_session_kind(
+    scheduled: bool,
+    acp_metadata: bool,
+    agent_kind: SessionKind,
+) -> SessionKind {
+    if scheduled {
+        SessionKind::ScheduledRun
+    } else if acp_metadata {
+        SessionKind::CodeAcp
+    } else {
+        agent_kind
     }
 }
 
@@ -141,11 +186,12 @@ pub async fn list_sessions(
 ) -> Result<Vec<SessionListItem>, String> {
     let mut metas = store.list().map_err(|e| format!("list_sessions: {e:?}"))?;
     metas.retain(|m| {
-        matches!(store.session_kind(&m.id), Ok(SessionKind::Chat))
-            && !acp_pool.is_acp_metadata(m)
-            // 原生代码会话（code_session 绑定）归属代码列表，不进 chat 侧栏
-            && !acp_pool.agents().is_code_session(&m.id)
-            && !store.is_hidden(&m.id)
+        // 代码会话（ACP 与品悟原生）归属代码列表，不进 chat 侧栏——与
+        // list_codex_acp_sessions 共用 listed_session_kind 的互斥两端。
+        matches!(
+            listed_session_kind(&store, &acp_pool, m),
+            Ok(SessionKind::Chat)
+        ) && !store.is_hidden(&m.id)
             && store
                 .active_skill(&m.id)
                 .is_none_or(|b| b.project_dir.is_none())
@@ -223,6 +269,67 @@ mod session_title_attachment_tests {
         assert!(attachment_names_from_display_message("正文\n\n📎 文件.md\n尾部").is_empty());
         assert!(!title_contains_attachment_marker("正文提到 📎 符号"));
         assert!(title_contains_attachment_marker("正文\n\n📎 文件"));
+    }
+}
+
+#[cfg(test)]
+mod listed_session_kind_tests {
+    use super::merge_listed_session_kind;
+    use crate::features::sessions::SessionKind;
+
+    /// 列表互斥守卫的真值表：合并判定优先级 scheduled > ACP 元数据兜底 > 索引
+    /// 类型真相；chat 列表取 `Chat`、代码列表取 `CodeNative | CodeAcp`，两端是
+    /// 同一判定的两个方向，任何输入组合至多进一个列表。
+    #[test]
+    fn merged_kind_keeps_chat_and_code_lists_mutually_exclusive() {
+        // scheduled 恒优先（即使索引/元数据声称代码会话），两个列表都不纳入。
+        for acp_metadata in [false, true] {
+            for agent_kind in [
+                SessionKind::Chat,
+                SessionKind::CodeNative,
+                SessionKind::CodeAcp,
+            ] {
+                assert_eq!(
+                    merge_listed_session_kind(true, acp_metadata, agent_kind),
+                    SessionKind::ScheduledRun
+                );
+            }
+        }
+        // ACP 元数据兜底优先于索引真相（索引缺失/损坏时不掉回聊天列表）。
+        assert_eq!(
+            merge_listed_session_kind(false, true, SessionKind::Chat),
+            SessionKind::CodeAcp
+        );
+        // 无兜底时以索引类型真相为准。
+        for agent_kind in [
+            SessionKind::Chat,
+            SessionKind::CodeNative,
+            SessionKind::CodeAcp,
+        ] {
+            assert_eq!(
+                merge_listed_session_kind(false, false, agent_kind),
+                agent_kind
+            );
+        }
+        // 互斥性：同一合并判定下，chat 列表与代码列表的纳入条件不可能同真。
+        for scheduled in [false, true] {
+            for acp_metadata in [false, true] {
+                for agent_kind in [
+                    SessionKind::Chat,
+                    SessionKind::CodeNative,
+                    SessionKind::CodeAcp,
+                ] {
+                    let kind = merge_listed_session_kind(scheduled, acp_metadata, agent_kind);
+                    let in_chat_list = matches!(kind, SessionKind::Chat);
+                    let in_code_list =
+                        matches!(kind, SessionKind::CodeNative | SessionKind::CodeAcp);
+                    assert!(
+                        in_chat_list != in_code_list || matches!(kind, SessionKind::ScheduledRun),
+                        "会话不得同时进 chat 与代码列表: {kind:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -398,7 +505,10 @@ pub async fn delete_session(
         .session_kind(&id)
         .map_err(|e| format!("delete_session({id}): {e:?}"))?
     {
-        SessionKind::Chat => {
+        // 代码会话与聊天会话共用同一条删除链路（回收 ACP/Engine、清理 Agent
+        // 映射与 sidecar）；SessionStore::session_kind 目前只返回
+        // Chat/ScheduledRun，代码臂为类型完备性保留。
+        SessionKind::Chat | SessionKind::CodeNative | SessionKind::CodeAcp => {
             acp_pool.evict(&id).await;
             // 先回收该 session 的 engine(cancel 在跑的 turn + shutdown + abort forwarder),
             // 再删盘上数据,避免僵尸 engine 继续往已删 session 写产物。
@@ -629,7 +739,7 @@ pub async fn list_workspace_files(
 ) -> Result<Vec<String>, String> {
     // 语义守卫:代码会话(品悟原生)没有“产物面板”概念——其文件浏览与变更 diff 走
     // 代码模式的基线工作区面板,这里跳过顶层扫描,避免把工作区代码文件误当产物。
-    if acp_pool.agents().is_code_session(&session_id) {
+    if acp_pool.agents().session_kind(&session_id) == SessionKind::CodeNative {
         return Ok(Vec::new());
     }
     list_workspace_files_for_session(&session_id, &store)

@@ -13,6 +13,12 @@ pub async fn set_disabled_connectors(
     let scope = parse_connector_scope(scope.as_deref())?;
     crate::features::marketplace::apply_disabled_connectors_for(scope, connector_ids).await?;
     pool.refresh_disallowed_tools().await;
+    // 会话能力档案:code scope 变更会改变代码会话的 skill 禁用集(`skill:` 条目 +
+    // 禁用连接器的 companion skills,替换语义),按会话广播一次;plain 变更由
+    // apply 内的全局推送覆盖(无档案会话的默认值),无需此处再刷。
+    if scope == crate::features::marketplace::ConnectorScope::Code {
+        pool.refresh_disabled_skills().await;
+    }
     let payload = serde_json::json!({});
     let _ = app.emit("remote_control:tools_changed", payload.clone());
     crate::features::remote_control::forward_app_event(

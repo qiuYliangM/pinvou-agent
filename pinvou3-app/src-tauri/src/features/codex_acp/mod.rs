@@ -44,7 +44,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wait_timeout::ChildExt;
 
-use crate::features::sessions::SessionStore;
+use crate::features::sessions::{SessionKind, SessionStore};
 use attachments::{prepare_codex_prompt, CodexDisplayAttachment};
 use deepseek_tui::session_manager::SessionMetadata;
 pub use events::AcpEventEnvelope;
@@ -237,6 +237,7 @@ fn acp_recovery_record(
         workspace_kind,
         workspace_path: (workspace_kind == CodexWorkspaceKind::Project).then_some(workspace_path),
         code_session: false,
+        kind: Some(SessionKind::CodeAcp),
     })
 }
 
@@ -297,9 +298,9 @@ struct SidecarRecoverySummary {
 /// sidecar（`code-session.json`）随会话存续，是跨进程的权威真相源；辅助索引
 /// `session-agents.json` 可损坏/丢失后据此重建。扫描根与 sidecar 读取根同源
 /// （均由辅助索引路径派生，见 `store::code_session_sidecar_root`），避免两处
-/// 根定义漂移。对每个 sidecar：索引已持有 code_session 记录时跳过（不误报
-/// 恢复）；会话已被 ACP 占用时 sidecar 属历史残留，直接清理而非反复重试；
-/// 其余情况据 sidecar 恢复索引。
+/// 根定义漂移。对每个 sidecar：索引已持有 `CodeNative` 记录时跳过（不误报
+/// 恢复）；会话已被 ACP 占用（`CodeAcp`）时 sidecar 属历史残留，直接清理而非
+/// 反复重试；其余情况据 sidecar 恢复索引（恢复记录写入显式 `CodeNative` kind）。
 fn restore_code_native_sessions_from_sidecars(
     agents: &SessionAgentStore,
 ) -> SidecarRecoverySummary {
@@ -340,11 +341,11 @@ fn restore_code_native_sessions_from_sidecars(
             continue;
         };
         let record = agents.get(session_id);
-        if record.code_session {
+        if record.session_kind() == SessionKind::CodeNative {
             // 索引完好无需恢复：不计入 restored，避免每次启动误报恢复信号。
             continue;
         }
-        if record.backend.is_acp() {
+        if record.session_kind() == SessionKind::CodeAcp {
             // 会话已被 ACP 绑定：sidecar 是历史残留，恢复必然被拒，直接清理并
             // 如实记日志，而不是每次启动重复报 degraded。
             store::remove_code_session_sidecar(agents.path(), session_id);
@@ -960,6 +961,20 @@ impl AcpPool {
             || self.acp_metadata_backends.read().contains_key(session_id)
     }
 
+    /// 会话类型判定（含 ACP 元数据兜底）：以 `SessionAgentStore::session_kind`
+    /// 为唯一类型真相源；辅助索引缺失、仅凭元数据兜底识别出的 ACP 会话仍判
+    /// `CodeAcp`，与 [`Self::is_acp`] 保持一致（`is_acp()` ⟺ kind == `CodeAcp`）。
+    pub fn session_kind(&self, session_id: &str) -> SessionKind {
+        match self.agents.session_kind(session_id) {
+            SessionKind::Chat
+                if self.acp_metadata_backends.read().contains_key(session_id) =>
+            {
+                SessionKind::CodeAcp
+            }
+            kind => kind,
+        }
+    }
+
     pub fn backend(&self, session_id: &str) -> AgentBackend {
         let backend = self.agents.backend(session_id);
         if backend.is_acp() {
@@ -990,7 +1005,7 @@ impl AcpPool {
 
     pub fn workspace_info(&self, session_id: &str) -> Result<CodexAcpWorkspaceInfo> {
         let record = self.agents.get(session_id);
-        if record.code_session {
+        if record.session_kind() == SessionKind::CodeNative {
             return code_native_workspace_info(&self.session_store, session_id, &record);
         }
         if !record.backend.is_acp() {
@@ -1028,8 +1043,8 @@ impl AcpPool {
         let record = self.agents.get(session_id);
         // 防御性保留，当前不可达：两个调用方（prompt / ensure ACP runtime）都在
         // 上游通过 is_acp / acp_record 拒绝了原生代码会话；保留本分支是为了让
-        // 未来直接使用本方法的路径对 code_session 也有正确语义。
-        if record.code_session {
+        // 未来直接使用本方法的路径对原生代码会话也有正确语义。
+        if record.session_kind() == SessionKind::CodeNative {
             if record.workspace_kind == CodexWorkspaceKind::Project {
                 let path = record
                     .workspace_path
@@ -5351,7 +5366,12 @@ max_context_size = 262144
                 cleaned: 0
             }
         );
-        assert!(agents.is_code_session("code-1"));
+        assert_eq!(agents.session_kind("code-1"), SessionKind::CodeNative);
+        assert_eq!(
+            agents.get("code-1").kind,
+            Some(SessionKind::CodeNative),
+            "恢复路径必须写入显式 kind"
+        );
         assert_eq!(
             agents.get("code-1").workspace_path.as_deref(),
             Some(root.as_path())

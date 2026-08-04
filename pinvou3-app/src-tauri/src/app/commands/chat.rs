@@ -39,7 +39,9 @@ pub async fn chat(
     let sid = session_id
         .or_else(|| store.active_id())
         .ok_or_else(|| "no active session".to_string())?;
-    if acp_pool.is_acp(&sid) {
+    // ACP 代码会话走独立代码页面发送；原生代码会话（CodeNative）与聊天会话
+    // 一样放行本命令（会话类型判定统一走 AcpPool::session_kind）。
+    if acp_pool.session_kind(&sid) == SessionKind::CodeAcp {
         return Err("ACP 代码会话必须通过独立代码页面发送".to_string());
     }
     let reservation = pool

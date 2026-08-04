@@ -210,7 +210,7 @@ pub async fn codex_acp_prompt(
     if message.is_empty() && attachments.is_empty() && workspace_references.is_empty() {
         return Err("empty message".to_string());
     }
-    if !acp_pool.is_acp(&session_id) {
+    if acp_pool.session_kind(&session_id) != SessionKind::CodeAcp {
         return Err("当前会话不是 ACP 会话".to_string());
     }
     let title_source = if message.is_empty() {
@@ -246,7 +246,10 @@ fn codex_workspace_root(
 ) -> Result<std::path::PathBuf, String> {
     if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
         // 原生代码会话与 ACP 会话一样可以在会话内浏览工作区（workspace_info 已支持）。
-        if !acp_pool.is_acp(session_id) && !acp_pool.agents().is_code_session(session_id) {
+        if !matches!(
+            acp_pool.session_kind(session_id),
+            SessionKind::CodeNative | SessionKind::CodeAcp
+        ) {
             return Err("当前会话不是 ACP 会话".to_string());
         }
         let info = acp_pool
@@ -445,7 +448,7 @@ pub async fn cancel_codex_acp(
     session_id: String,
     acp_pool: State<'_, AcpPool>,
 ) -> Result<(), String> {
-    if !acp_pool.is_acp(&session_id) {
+    if acp_pool.session_kind(&session_id) != SessionKind::CodeAcp {
         return Err("当前会话不是 Codex ACP 会话".to_string());
     }
     acp_pool.cancel(&session_id).await;
@@ -467,7 +470,7 @@ pub async fn get_codex_acp_pending_permissions(
     session_id: String,
     acp_pool: State<'_, AcpPool>,
 ) -> Result<Vec<CodexAcpPendingPermission>, String> {
-    if !acp_pool.is_acp(&session_id) {
+    if acp_pool.session_kind(&session_id) != SessionKind::CodeAcp {
         return Err("当前会话不是 Codex ACP 会话".to_string());
     }
     Ok(acp_pool.pending_permissions_for(&session_id).await)
@@ -491,7 +494,7 @@ pub async fn get_codex_acp_pending_elicitations(
     session_id: String,
     acp_pool: State<'_, AcpPool>,
 ) -> Result<Vec<CodexAcpPendingElicitation>, String> {
-    if !acp_pool.is_acp(&session_id) {
+    if acp_pool.session_kind(&session_id) != SessionKind::CodeAcp {
         return Err("当前会话不是 Codex ACP 会话".to_string());
     }
     Ok(acp_pool.pending_elicitations_for(&session_id).await)
@@ -526,10 +529,12 @@ pub async fn list_codex_acp_sessions(
         .list()
         .map_err(|error| format!("list_codex_acp_sessions: {error:?}"))?;
     metas.retain(|metadata| {
-        matches!(store.session_kind(&metadata.id), Ok(SessionKind::Chat))
-            && (acp_pool.is_acp_metadata(metadata)
-                || acp_pool.agents().is_code_session(&metadata.id))
-            && !store.is_hidden(&metadata.id)
+        // 与 list_sessions 共用 listed_session_kind 的互斥两端：这里正向纳入
+        // 原生/ACP 代码会话，scheduled 与普通聊天会话不进代码列表。
+        matches!(
+            super::sessions::listed_session_kind(&store, &acp_pool, metadata),
+            Ok(SessionKind::CodeNative | SessionKind::CodeAcp)
+        ) && !store.is_hidden(&metadata.id)
     });
     metas
         .into_iter()
