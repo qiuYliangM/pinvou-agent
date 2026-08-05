@@ -13,6 +13,7 @@ import {
   projectAcpTimeline,
   resolveAcpSessionControls,
 } from './acp-state.js';
+import { buildAcpSeedEntries } from './agent-log.js';
 import {
   classifyAcpServiceFailure,
   isAcpAuthenticationFailure,
@@ -192,6 +193,7 @@ export function useAcpCodeAdapter({
   setShowScrollBottom,
   createSession,
   refreshSessions,
+  agentLog,
 }) {
   const [status, setStatus] = useState(null);
   const [events, setEvents] = useState([]);
@@ -207,6 +209,9 @@ export function useAcpCodeAdapter({
   const [draftControlsCache, setDraftControlsCache] = useState(loadDraftControlsCache);
   // 草稿态（会话未创建）下用户预选的配置：{ [agentId]: { model?, mode?, configs: { [id]: value } } }
   const [draftConfigSelections, setDraftConfigSelections] = useState({});
+  // 活跃会话的同步忙碌源（队列 drain 判定用）：acp:event 到达即翻转，
+  // 不等 React 投影重渲染；loadSession/resetConversation 时按 timeline 重建。
+  const busyRef = useRef(false);
 
   const projection = useMemo(() => projectAcpTimeline(events), [events]);
   // 草稿态（!activeId）没有会话，退回使用该 agent 缓存的配置快照来预展示选项。
@@ -346,6 +351,7 @@ export function useAcpCodeAdapter({
     setPendingElicitations([]);
     setSessionInfo(null);
     setSessionInfoSessionId(null);
+    busyRef.current = false;
   }
 
   /// 仅清 session_info（loadSession 起始处用）：timeline/pending 保留到新数据
@@ -365,6 +371,9 @@ export function useAcpCodeAdapter({
     setEvents(timeline || []);
     setPending(permissions || []);
     setPendingElicitations(elicitations || []);
+    // 同步忙碌源按持久化 timeline 重建；agent log 历史种子全量回放（幂等）。
+    busyRef.current = projectAcpTimeline(timeline || []).turns.some(turn => turn.status === 'running');
+    if (agentLog) agentLog.replaceSeeded(id, buildAcpSeedEntries(timeline || []));
     const session = sessions.find(item => item.id === id);
     const runtime = await invoke('get_acp_agent_status', {
       agentId: session?.agent_id || draftAgentId,
@@ -383,7 +392,12 @@ export function useAcpCodeAdapter({
     return null;
   }
 
-  async function send(message, readyAttachments) {
+  /// options.fromQueue = 队列 drain 自动发送：不动用户当前草稿与附件/引用草稿
+  /// （入队时已从 composer 摘除），失败不回填草稿，结果经返回值交给 drain 控制器。
+  /// options.workspaceReferences = 入队时的引用快照（缺省用当前 composer 值）。
+  async function send(message, readyAttachments, options = {}) {
+    const fromQueue = Boolean(options && options.fromQueue);
+    const references = (options && options.workspaceReferences) || workspaceReferences;
     setWorking(true); setError('');
     try {
       let targetId = activeId;
@@ -412,20 +426,24 @@ export function useAcpCodeAdapter({
       }
       autoScrollRef.current = true;
       setShowScrollBottom(false);
-      setDraft('');
+      if (!fromQueue) setDraft('');
       await invoke('codex_acp_prompt', {
         sessionId: targetId,
         message,
         attachments: readyAttachments.map(attachment => attachment.result),
-        workspaceReferences,
+        workspaceReferences: references,
       });
-      updateAttachments(targetId, current => current.filter(
-        attachment => !readyAttachments.some(ready => ready.id === attachment.id),
-      ));
-      setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
+      if (!fromQueue) {
+        updateAttachments(targetId, current => current.filter(
+          attachment => !readyAttachments.some(ready => ready.id === attachment.id),
+        ));
+        setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
+      }
+      return { ok: true };
     } catch (err) {
       showError(err);
-      setDraft(message);
+      if (!fromQueue) setDraft(message);
+      return { ok: false, error: String(err) };
     } finally {
       setWorking(false);
     }
@@ -605,10 +623,20 @@ export function useAcpCodeAdapter({
 
   // ACP 事件流：只推进当前会话的 timeline 与 pending 登记（原生会话不产生
   // acp:event，过滤语义与原实现一致）；turn 边界/权限应答顺手刷新会话列表。
+  // agent log 按会话记录所有 ACP 事件（后台会话的 turn 同样留痕）；busyRef
+  // 只跟踪活跃会话（队列 drain 的同步忙碌源）。
   useEffect(() => {
     let unlisten = null;
     listenTauri('acp:event', message => {
       const incoming = message.payload;
+      if (incoming && incoming.sessionId) {
+        if (agentLog) agentLog.recordAcpEvent(incoming.sessionId, incoming);
+        if (incoming.sessionId === activeIdRef.current) {
+          const turnType = incoming.event && incoming.event.type;
+          if (turnType === 'turn_started') busyRef.current = true;
+          else if (turnType === 'turn_completed') busyRef.current = false;
+        }
+      }
       setEvents(current => incoming && incoming.sessionId === activeIdRef.current ? appendAcpEvent(current, incoming) : current);
       if (incoming && incoming.sessionId === activeIdRef.current) {
         const type = incoming.event && incoming.event.type;
@@ -689,6 +717,9 @@ export function useAcpCodeAdapter({
       requiresAuthToSend: true,
       // turn 边界 checkpoint 入口（Rust 侧 codex_acp_prompt 在 turn 开始前打快照）。
       checkpoints: true,
+      // 运行中消息 queue/steer 与会话级 agent log（阶段二·会话控制与可观测）。
+      messageQueue: true,
+      agentLog: true,
       welcomeHints: { active: codexCopy.activeHint, draft: codexCopy.draftHint },
     },
     events,
@@ -718,6 +749,10 @@ export function useAcpCodeAdapter({
     cancel,
     respond,
     renderItem,
+    // 队列 drain 的同步判定源：busyRef 由 acp:event 到达即翻转，不等投影重渲染；
+    // ACP 车道没有 plan 审批卡挂起语义，holdback 恒 false。
+    isBusy: id => Boolean(id && id === activeIdRef.current && busyRef.current),
+    isQueueHoldback: () => false,
     install,
     login,
     switchAccount,

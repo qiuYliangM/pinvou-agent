@@ -107,7 +107,7 @@ export function useSessionCheckpoints({ sessionId, enabled, refreshKey, onRestor
     }
   }, []);
 
-  /** 回滚到指定 checkpoint；成功后刷新列表并通知调用方（刷新工作区面板）。 */
+  /** 回滚到指定 checkpoint；成功后刷新列表并通知调用方（刷新工作区面板/记日志）。 */
   const restore = useCallback(async (checkpointId) => {
     const id = sessionRef.current;
     if (!id) throw new Error('no session');
@@ -117,7 +117,7 @@ export function useSessionCheckpoints({ sessionId, enabled, refreshKey, onRestor
       // 预览缓存基于回滚前的执行根，全部作废；列表刷新后重新懒加载。
       setPreviews({});
       await refresh();
-      if (onRestored) onRestored();
+      if (onRestored) onRestored(checkpointId);
     } finally {
       setRestoring(false);
     }

@@ -1,12 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FileTypeIcon } from '../../components/files/FileTypeIcon.jsx';
 import {
-  AlertTriangle, Check, CheckCircle2, ChevronDown, FileText, FolderOpen, Paperclip, Send,
-  RefreshCw, Sparkles, StopCircle, Terminal, User, Wrench,
+  AlertTriangle, Check, CheckCircle2, ChevronDown, ClipboardList, Clock, FileText, FolderOpen, Paperclip, Send,
+  RefreshCw, Sparkles, StopCircle, Terminal, User, Wrench, X, Zap,
 } from '../../components/icons.jsx';
 import { AcpAgentLogo } from './AcpAgentLogo.jsx';
 import { CodexWorkspacePanel } from './CodexWorkspacePanel.jsx';
 import { WorkspaceTrustDialog } from './WorkspaceTrustDialog.jsx';
+import { AgentLogPanel } from './AgentLogPanel.jsx';
+import { createAgentLogStore } from './agent-log.js';
+import {
+  createMessageQueueStore,
+  createQueueDrainController,
+  queueEntryPreviewText,
+} from '../conversation/message-queue.js';
 import { createWorkspaceTrustGrants, trustDecision } from './workspace-trust.js';
 import {
   runtimeInstallInProgress,
@@ -822,6 +829,26 @@ export function CodexAcpView({
   const draftEpochRef = useRef(draftEpoch);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+
+  // ── 运行中消息队列 + 会话级 agent log（阶段二·会话控制与可观测）──────────
+  // 两个 store 都是进程内可变对象（重载即丢/仅保留种子），onChange 挂版本号驱动
+  // 重渲染，与 session-conversation store 同一风格。队列按 sessionId 作用域，
+  // 原生/ACP 车道共用；drain 控制器经 adapterRef 绑定当前车道的同步忙碌源与发送。
+  const [messageQueue] = useState(() => createMessageQueueStore());
+  const [agentLogStore] = useState(() => createAgentLogStore());
+  const [queueVersion, setQueueVersion] = useState(0);
+  const [logVersion, setLogVersion] = useState(0);
+  const [queueMenuOpen, setQueueMenuOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
+  const [queueDrain] = useState(() => createQueueDrainController({
+    queue: messageQueue,
+    onChange: () => setQueueVersion(current => current + 1),
+    schedule: (fn, ms) => window.setTimeout(fn, ms),
+  }));
+  useEffect(() => {
+    messageQueue.onChange = () => setQueueVersion(current => current + 1);
+    agentLogStore.onChange = () => setLogVersion(current => current + 1);
+  }, [messageQueue, agentLogStore]);
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeId) || null,
     [sessions, activeId],
@@ -871,10 +898,18 @@ export function CodexAcpView({
     setShowScrollBottom,
     createSession,
     refreshSessions,
+    agentLog: agentLogStore,
   };
   const native = useNativeCodeAdapter({ ...adapterCtx, active: adapterKind === 'native' });
   const acp = useAcpCodeAdapter({ ...adapterCtx, active: adapterKind === 'acp' });
   const adapter = adapterKind === 'native' ? native : acp;
+
+  // 会话删除/列表重建时清理队列与日志，避免无界增长（与 store.retainSessions 同步）。
+  useEffect(() => {
+    const ids = sessions.filter(session => session && session.id).map(session => session.id);
+    messageQueue.retainSessions(ids);
+    agentLogStore.retainSessions(ids);
+  }, [sessions, messageQueue, agentLogStore]);
 
   const visibleTurns = adapter.turns;
   const busy = adapter.busy;
@@ -885,6 +920,34 @@ export function CodexAcpView({
     .find(turn => turn.status === 'running') || null;
   const attentionPending = adapter.attentionCount > 0;
 
+  /// 队列 drain 入口：lane 绑定当前 adapter。adapter.send 以当前查看会话
+  /// （activeId 闭包）为目标，因此对非当前会话一律按“忙”上报 —— 定时器补调
+  /// （settle/重试）在切会话后触发时，不会把消息发到错误的会话；切回该会话时
+  /// 由下方 effect 补发。
+  function drainMaybe(sessionId) {
+    if (!sessionId || !adapter.capabilities.messageQueue) return;
+    queueDrain.maybeDrain(sessionId, {
+      isBusy: id => (id !== activeIdRef.current ? true : adapter.isBusy(id)),
+      isHoldback: id => adapter.isQueueHoldback(id),
+      send: (id, entry) => adapter.send(entry.message, entry.attachments, {
+        fromQueue: true,
+        workspaceReferences: entry.references,
+      }),
+    });
+  }
+
+  // turn 终态 / 切会话 / 队列变化 / 挂起解除（plan 卡收口）→ 尝试自动发送队首。
+  // 控制器内部互斥 + 停口窗口 + 重试，可安全高频触发。
+  useEffect(() => {
+    if (!activeId || !adapter.capabilities.messageQueue) return;
+    drainMaybe(activeId);
+  }, [activeId, adapter, queueVersion, busy, adapter.workspaceRefreshToken, queueDrain]);
+
+  // busy 结束/切会话时复位发送方式菜单（菜单只挂在 busy 分支上）。
+  useEffect(() => {
+    if (!busy) setQueueMenuOpen(false);
+  }, [busy, activeId]);
+
   // 完全体 code 模式·变更管理闭环：turn 边界 checkpoint 入口（capabilities 门控，
   // 两个 adapter 都声明支持；快照由 Rust 侧在 turn 开始前完成）。回滚成功后
   // 顺带刷新工作区面板（文件树/变更列表反映回滚后的执行根）。
@@ -893,8 +956,42 @@ export function CodexAcpView({
     sessionId: activeId,
     enabled: Boolean(adapter.capabilities.checkpoints && activeId),
     refreshKey: visibleTurns.length,
-    onRestored: () => setWorkspaceRefreshExtra(value => value + 1),
+    onRestored: (checkpointId) => {
+      setWorkspaceRefreshExtra(value => value + 1);
+      // agent log：checkpoint 回滚是成功的破坏性操作，必须留痕。
+      const sessionId = activeIdRef.current;
+      if (sessionId && adapter.capabilities.agentLog) {
+        agentLogStore.record(sessionId, { kind: 'checkpoint', phase: 'restored', checkpointId: checkpointId || null });
+      }
+    },
   });
+  // agent log：checkpoint 创建留痕。列表经 hook 拉取（turn 边界刷新），diff 出
+  // 新出现的 checkpoint 记一条；首次基线不回放历史（历史种子只覆盖 turn 边界）。
+  const checkpointLogSeenRef = useRef(new Map()); // sessionId -> Set<checkpointId>
+  useEffect(() => {
+    if (!activeId || !adapter.capabilities.agentLog) return;
+    const list = sessionCheckpoints.checkpoints || [];
+    let seen = checkpointLogSeenRef.current.get(activeId);
+    if (!seen) {
+      seen = new Set();
+      checkpointLogSeenRef.current.set(activeId, seen);
+      for (const checkpoint of list) {
+        if (checkpoint && checkpoint.id) seen.add(checkpoint.id);
+      }
+      return;
+    }
+    for (const checkpoint of list) {
+      if (!checkpoint || !checkpoint.id || seen.has(checkpoint.id)) continue;
+      seen.add(checkpoint.id);
+      agentLogStore.record(activeId, {
+        kind: 'checkpoint',
+        phase: 'created',
+        turn: Number.isInteger(checkpoint.turn) ? checkpoint.turn : null,
+        label: checkpoint.label || '',
+      });
+    }
+  }, [sessionCheckpoints.checkpoints, activeId, adapter.capabilities.agentLog, agentLogStore]);
+
   // turn.id → checkpoint：只给用户 turn 编号（原生投影有 preamble 系统项 turn，
   // 不占序号；ACP 投影每个 turn 都对应一次 prompt）。快照失败的 turn 没有入口，
   // 后续 turn 序号不漂移（按 turn 字段对齐，不按位置）。
@@ -1246,13 +1343,67 @@ export function CodexAcpView({
     element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
   }
 
+  // ── queue/steer（VSCode 三语义，阶段二·会话控制）─────────────────────────
+  // queue：busy 时发送 = 入队尾，turn 终态后按序自动发送；
+  // steer（插队）：入队首 + 停当前 turn（复用 adapter.cancel 链路，含后台任务
+  // 清理），终态事件到达后由 drain 发送队首 —— 即 VSCode 的 "Stop and Send"；
+  // stop：仅停 turn（下方按钮区直接调 adapter.cancel），不动队列。
+
+  /// 把当前 composer 内容入队（含就绪附件与工作区引用快照），随后清空 composer
+  /// 中已入队的部分。返回是否成功入队。
+  function enqueueDraft(position) {
+    const sessionId = activeId;
+    if (!sessionId) return false;
+    const message = draft.trim();
+    const readyAttachments = attachments.filter(attachment => (
+      attachment.status === 'ready' && attachment.result
+    ));
+    if (!message && !readyAttachments.length && !workspaceReferences.length) return false;
+    const fields = {
+      message,
+      attachments: readyAttachments,
+      attachmentNames: readyAttachments.map(attachment => attachment.basename || ''),
+      references: [...workspaceReferences],
+    };
+    if (position === 'front') messageQueue.enqueueFront(sessionId, fields);
+    else messageQueue.enqueue(sessionId, fields);
+    setDraft('');
+    updateAttachments(sessionId, current => current.filter(
+      attachment => !readyAttachments.some(ready => ready.id === attachment.id),
+    ));
+    setWorkspaceReferenceDrafts(current => ({ ...current, [sessionId]: [] }));
+    return true;
+  }
+
+  /// 插队（steer = VSCode "Stop and Send"）：入队首 → 停当前 turn → 终态后 drain
+  /// 发送队首。turn 恰已自然结束（cancel 空转）时立即补 drain，不等下一触发点。
+  async function steer() {
+    if (!busy || !activeId || !adapter.capabilities.messageQueue) return;
+    if (!enqueueDraft('front')) return;
+    await adapter.cancel();
+    drainMaybe(activeId);
+  }
+
+  /// 队列单条移除；移除 blocked 队首后队列自动恢复（补一次 drain）。
+  function removeQueued(entryId) {
+    if (!activeId) return;
+    messageQueue.remove(activeId, entryId);
+    drainMaybe(activeId);
+  }
+
   async function send() {
     const message = draft.trim();
     const readyAttachments = attachments.filter(attachment => (
       attachment.status === 'ready' && attachment.result
     ));
-    if ((!message && !readyAttachments.length && !workspaceReferences.length)
-      || busy || working || adapter.runtimeBusy) return;
+    if (!message && !readyAttachments.length && !workspaceReferences.length) return;
+    // turn 进行中且车道支持队列：默认语义 = 排队（queue），终态后自动发送。
+    // 竞态：入队瞬间 turn 已终态（渲染期 busy 是旧值）→ 立即补 drain 直接发出。
+    if (busy && adapter.capabilities.messageQueue && activeId) {
+      if (enqueueDraft('tail')) drainMaybe(activeId);
+      return;
+    }
+    if (busy || working || adapter.runtimeBusy) return;
     if (adapter.capabilities.requiresAuthToSend && !adapter.activeStatus?.authenticated) {
       setError(codexCopy.loginRequiredBeforeSend);
       return;
@@ -1265,6 +1416,23 @@ export function CodexAcpView({
     if (activeId && !sessionReady) return;
     await adapter.send(message, readyAttachments);
   }
+
+  const queuedItems = useMemo(
+    () => (activeId && adapter.capabilities.messageQueue ? messageQueue.list(activeId) : []),
+    // queueVersion 是队列内容变化的版本号（store 本体是可变对象）。
+    [activeId, adapter.capabilities.messageQueue, messageQueue, queueVersion],
+  );
+  const logEntries = useMemo(
+    () => (activeId && adapter.capabilities.agentLog ? agentLogStore.list(activeId) : []),
+    // logVersion 是日志内容变化的版本号。
+    [activeId, adapter.capabilities.agentLog, agentLogStore, logVersion],
+  );
+  // busy 时发送键变「排队」的前提：composer 里有可入队的内容。
+  const canQueueDraft = Boolean(
+    draft.trim()
+      || attachments.some(attachment => attachment.status === 'ready' && attachment.result)
+      || workspaceReferences.length,
+  );
 
   return (
     <div className={`relative h-full min-h-0 flex flex-col ${theme === 'dark' ? 'text-[#E3E3E3]' : 'text-[#1F1F1F]'}`}>
@@ -1280,9 +1448,31 @@ export function CodexAcpView({
           </div>
           {adapter.configApplying && <span className="text-[10px] text-blue-500 animate-pulse">{codexCopy.applyingConfig}</span>}
           {busy && <StatusBadge status="running" copy={t.uiConversation} />}
+          {adapter.capabilities.agentLog && (
+            <button
+              type="button"
+              data-testid="codex-agent-log-toggle"
+              onClick={() => {
+                setLogOpen(value => !value);
+                setWorkspaceOpen(false);
+              }}
+              className={`h-8 px-2.5 rounded-lg inline-flex items-center gap-1.5 text-[11px] transition-colors ${
+                logOpen
+                  ? 'bg-blue-500/10 text-blue-600 dark:text-blue-300'
+                  : 'text-gray-500 dark:text-gray-400 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+              }`}
+              title={codexCopy.agentLogTitle}
+            >
+              <ClipboardList size={14} />
+              <span>{codexCopy.agentLog}</span>
+            </button>
+          )}
           <button
             type="button"
-            onClick={() => setWorkspaceOpen(value => !value)}
+            onClick={() => {
+              setWorkspaceOpen(value => !value);
+              setLogOpen(false);
+            }}
             className={`h-8 px-2.5 rounded-lg inline-flex items-center gap-1.5 text-[11px] transition-colors ${
               workspaceOpen
                 ? 'bg-blue-500/10 text-blue-600 dark:text-blue-300'
@@ -1477,6 +1667,41 @@ export function CodexAcpView({
                 className="mb-0.5"
                 copy={t.uiConversation}
               />
+              {queuedItems.length > 0 && (
+                <div data-testid="codex-message-queue" className="mb-2 space-y-1">
+                  {queuedItems.map(item => (
+                    <div
+                      key={item.id}
+                      className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[11px] ${
+                        item.blocked
+                          ? 'bg-red-500/[0.06] text-red-600 dark:text-red-300'
+                          : 'bg-black/[0.03] dark:bg-white/[0.05] text-gray-600 dark:text-gray-300'
+                      }`}
+                    >
+                      <Clock size={12} className={`shrink-0 ${item.blocked ? 'text-red-400' : 'text-amber-500'}`} />
+                      <span className="min-w-0 flex-1 truncate" title={item.message || queueEntryPreviewText(item)}>
+                        {queueEntryPreviewText(item)}
+                      </span>
+                      {item.attachmentNames.length > 0 && (
+                        <span className="shrink-0 text-[10px] text-gray-400">📎 {item.attachmentNames.length}</span>
+                      )}
+                      {item.blocked && (
+                        <span className="shrink-0 text-[10px]">{codexCopy.queueSendFailed}</span>
+                      )}
+                      <button
+                        type="button"
+                        data-testid="codex-queue-remove"
+                        onClick={() => removeQueued(item.id)}
+                        aria-label={codexCopy.queueRemove}
+                        title={codexCopy.queueRemove}
+                        className="w-5 h-5 shrink-0 rounded-md flex items-center justify-center hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <AttachmentChips
                 attachments={attachments}
                 onRemove={removeAttachment}
@@ -1796,7 +2021,69 @@ export function CodexAcpView({
                     </div>
                   )}
                 </div>
-                {busy ? (
+                {busy && adapter.capabilities.messageQueue ? (
+                  canQueueDraft ? (
+                    // turn 进行中且有内容：主键 = 排队（默认），下拉 = 插队 / 停止。
+                    <div className="flex items-center gap-1">
+                      <div className="relative">
+                        <button
+                          type="button"
+                          data-testid="codex-send-menu"
+                          onClick={() => setQueueMenuOpen(value => !value)}
+                          aria-label={codexCopy.queueMenuTitle}
+                          title={codexCopy.queueMenuTitle}
+                          className="w-7 h-9 rounded-full flex items-center justify-center text-gray-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
+                        >
+                          <ChevronDown size={14} />
+                        </button>
+                        {queueMenuOpen && (
+                          <>
+                            <button aria-label={codexCopy.queueMenuClose} className="fixed inset-0 z-30 cursor-default" onClick={() => setQueueMenuOpen(false)} />
+                            <div className="absolute z-40 bottom-11 right-0 w-60 rounded-2xl border border-black/[0.08] dark:border-white/10 bg-white/95 dark:bg-[#202124]/95 backdrop-blur-xl shadow-xl p-1.5">
+                              <button
+                                type="button"
+                                data-testid="codex-steer-send"
+                                onClick={() => { setQueueMenuOpen(false); steer(); }}
+                                className="w-full rounded-xl px-3 py-2 flex items-center gap-3 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                              >
+                                <Zap size={15} className="shrink-0 text-amber-500" />
+                                <span>
+                                  <span className="block text-[12px] font-semibold">{codexCopy.steerSend}</span>
+                                  <span className="block mt-0.5 text-[10px] text-gray-400">{codexCopy.steerSendTitle}</span>
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                data-testid="codex-stop-turn"
+                                onClick={() => { setQueueMenuOpen(false); adapter.cancel(); }}
+                                className="w-full rounded-xl px-3 py-2 flex items-center gap-3 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                              >
+                                <StopCircle size={15} className="shrink-0 text-red-500" />
+                                <span>
+                                  <span className="block text-[12px] font-semibold">{codexCopy.stopTurn}</span>
+                                  <span className="block mt-0.5 text-[10px] text-gray-400">{codexCopy.stopTurnTitle}</span>
+                                </span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="codex-queue-send"
+                        onClick={send}
+                        title={codexCopy.queueSendTitle}
+                        aria-label={codexCopy.queueSendTitle}
+                        className="w-9 h-9 rounded-full flex items-center justify-center bg-amber-500 text-white shadow-sm hover:bg-amber-600"
+                      >
+                        <Send size={16} />
+                      </button>
+                    </div>
+                  ) : (
+                    // turn 进行中但无内容：维持停止语义。
+                    <button onClick={adapter.cancel} title={codexCopy.stopTurnTitle} aria-label={codexCopy.stopTurnTitle} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
+                  )
+                ) : busy ? (
                   <button onClick={adapter.cancel} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
                 ) : (
                   <button onClick={send} disabled={!sessionReady || (!draft.trim() && !attachments.some(attachment => attachment.status === 'ready') && !workspaceReferences.length) || working || adapter.runtimeBusy || adapter.sendDisabled}
@@ -1820,6 +2107,14 @@ export function CodexAcpView({
             refreshToken={adapter.workspaceRefreshToken + workspaceRefreshExtra}
             onChangeCount={setWorkspaceChangeCount}
             copy={t.uiCodexWorkspace}
+          />
+        )}
+        {logOpen && activeSession && adapter.capabilities.agentLog && (
+          <AgentLogPanel
+            entries={logEntries}
+            onClose={() => setLogOpen(false)}
+            copy={codexCopy}
+            conversationCopy={t.uiConversation}
           />
         )}
         {trustPrompt && (

@@ -17,6 +17,8 @@ import { invokeTauri as invoke } from '../../platform/tauri/client.js';
 import { useSessionConversation } from '../conversation/useSessionConversation.js';
 import { ConversationMarkdown } from '../conversation/ConversationTimeline.jsx';
 import { QuestionChoiceCard } from '../conversation/QuestionChoiceCard.jsx';
+import { hasPendingPlanCard } from '../conversation/session-conversation.js';
+import { nativeTimelineSeedEntries } from './agent-log.js';
 import { visibleUserModels } from '../../shared/model-options.js';
 
 // 草稿附件键：与 CodexAcpView 的 DRAFT_ATTACHMENT_KEY 一致（草稿 → 新会话的附件移交）。
@@ -176,12 +178,15 @@ export function useNativeCodeAdapter({
   setShowScrollBottom,
   createSession,
   refreshSessions,
+  agentLog,
 }) {
   // 会话作用域对话状态机：chat:* 事件按受管理 sessionId 过滤推进，后台会话的
   // turn 也能继续推进，切回不丢流式内容；version 驱动重渲染。
   const { store, version, bumpVersion } = useSessionConversation({
     onChatEvent: (name, _payload, result) => {
       if (!result.accepted) return;
+      // 会话级 agent log：与对话状态机同一事件入口记录关键事件（turn/工具/plan/错误）。
+      if (agentLog) agentLog.recordNativeEvent(result.sessionId, name, _payload);
       // turn 边界顺手刷新会话列表（标题/时间戳），与 acp:event 的 turn_completed 处理对齐。
       if (name === 'chat:turn_started' || name === 'chat:done') {
         refreshSessions().catch(() => {});
@@ -337,6 +342,8 @@ export function useNativeCodeAdapter({
     ]);
     if (isStale()) return null;
     store.hydrate(id, saved, sessionTimeline || []);
+    // agent log 历史种子：timing_events 的 turn 边界回填（幂等重建，实时事件保留）。
+    if (agentLog) agentLog.replaceSeeded(id, nativeTimelineSeedEntries(sessionTimeline || []));
     // 会话状态随组件卸载销毁，chat:user_input_required 不重发：经后端 pending
     // 登记还原挂起的确认卡（store 按 toolCallId 幂等去重），
     // 并顺带恢复 turn 进行中的 busy 展示。
@@ -370,7 +377,13 @@ export function useNativeCodeAdapter({
 
   /// 原生（品悟 Engine）发送：草稿态先建会话（强制临时工作区），随后走 chat 命令；
   /// 用户气泡乐观插入会话状态，chat 命令同步失败（空消息 / turn 占用等）时回滚。
-  async function send(message, readyAttachments) {
+  /// options.fromQueue = 队列 drain 自动发送：不动用户当前草稿与附件/引用草稿
+  /// （入队时已从 composer 摘除），失败不回填草稿，结果经返回值交给 drain 控制器。
+  /// options.workspaceReferences = 入队时的引用快照（缺省用当前 composer 值）。
+  /// 返回 { ok, error? }：drain 据此决定出队 / 重试 / 阻塞。
+  async function send(message, readyAttachments, options = {}) {
+    const fromQueue = Boolean(options && options.fromQueue);
+    const references = (options && options.workspaceReferences) || workspaceReferences;
     setWorking(true); setError('');
     try {
       let targetId = activeId;
@@ -392,8 +405,8 @@ export function useNativeCodeAdapter({
           return next;
         });
       }
-      const referencePrefix = workspaceReferences.length
-        ? `${workspaceReferences.map(path => `@${path}`).join(' ')}\n\n`
+      const referencePrefix = references.length
+        ? `${references.map(path => `@${path}`).join(' ')}\n\n`
         : '';
       const displayText = message + (readyAttachments.length
         ? `${message ? '\n' : ''}📎 ${readyAttachments.map(attachment => attachment.basename).join(', ')}`
@@ -402,7 +415,7 @@ export function useNativeCodeAdapter({
       bumpVersion();
       autoScrollRef.current = true;
       setShowScrollBottom(false);
-      setDraft('');
+      if (!fromQueue) setDraft('');
       try {
         await invoke('chat', {
           message: referencePrefix + message,
@@ -415,13 +428,17 @@ export function useNativeCodeAdapter({
         bumpVersion();
         throw sendError;
       }
-      updateAttachments(targetId, current => current.filter(
-        attachment => !readyAttachments.some(ready => ready.id === attachment.id),
-      ));
-      setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
+      if (!fromQueue) {
+        updateAttachments(targetId, current => current.filter(
+          attachment => !readyAttachments.some(ready => ready.id === attachment.id),
+        ));
+        setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
+      }
+      return { ok: true };
     } catch (err) {
       showError(err);
-      setDraft(message);
+      if (!fromQueue) setDraft(message);
+      return { ok: false, error: String(err) };
     } finally {
       setWorking(false);
     }
@@ -631,6 +648,9 @@ export function useNativeCodeAdapter({
       requiresAuthToSend: false,
       // turn 边界 checkpoint 入口（Rust 侧 chat 命令在 turn 开始前打快照）。
       checkpoints: true,
+      // 运行中消息 queue/steer 与会话级 agent log（阶段二·会话控制与可观测）。
+      messageQueue: true,
+      agentLog: true,
       welcomeHints: { active: codexCopy.nativeActiveHint, draft: codexCopy.nativeDraftHint },
     },
     turns,
@@ -652,6 +672,13 @@ export function useNativeCodeAdapter({
     send,
     cancel,
     renderItem,
+    // 队列 drain 的同步判定源：busy 直接读会话作用域 store（事件入口同步推进，
+    // 不受渲染帧延迟影响）；holdback = plan 审批卡未收口（审批周期不自动发送）。
+    isBusy: id => {
+      const state = store.peekState(id);
+      return Boolean(state && state.busy);
+    },
+    isQueueHoldback: id => hasPendingPlanCard(store.peekState(id)),
     composer: {
       modeValue,
       modelValue,

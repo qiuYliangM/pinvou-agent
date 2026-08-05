@@ -547,6 +547,14 @@ export function markUserInputResolved(state, toolCallId, cardState) {
   return true;
 }
 
+/// 会话是否有未收口的方案审批卡（plan 审批周期 = 未完成的交互周期，
+/// 运行中消息队列的 drain 挂起判定用：审批期间不自动发送排队消息）。
+export function hasPendingPlanCard(state) {
+  return Boolean(state && state.items.some(item => (
+    item && item.type === 'plan_card' && !item.resolved
+  )));
+}
+
 /// 方案卡本地收口：accept/discard 调用前后把卡片置为终态（resolution ∈
 /// 'accepted' | 'discarded' | 'historical'）。按 planId 定位（不限未收口卡），
 /// 乐观标记后 plan_not_active 再改判历史卡也走这里。
