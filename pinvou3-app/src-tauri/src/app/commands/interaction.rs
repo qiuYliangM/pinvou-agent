@@ -77,6 +77,7 @@ pub async fn accept_plan(
     display_message: Option<String>,
     store: State<'_, SessionStore>,
     pool: State<'_, EnginePool>,
+    acp_pool: State<'_, crate::features::codex_acp::AcpPool>,
 ) -> Result<SessionModeState, String> {
     let mut reservation = pool
         .reserve_turn(&session_id)
@@ -96,6 +97,52 @@ pub async fn accept_plan(
         .map(|message| message.trim().to_string())
         .filter(|message| !message.is_empty())
         .unwrap_or_else(|| "✅ 就这么干".to_string());
+    // 完全体 code 模式·变更管理闭环：原生代码会话由 accept_plan 触发的执行 turn
+    // 同样先打 checkpoint（对齐 chat 命令的 turn 前快照——chat_with_reservation
+    // 不经由本命令，accept_plan 直走 send_reserved_user_message，需在此补拍）。
+    // 快照必须先于引擎写文件完成，因此在 send 前同步等待；失败不阻断 turn。
+    if acp_pool.session_kind(&session_id) == SessionKind::CodeNative {
+        match store.session_roots(&session_id) {
+            Ok(roots) => {
+                let turn_number = store
+                    .load(&session_id)
+                    .map(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == "user")
+                            .count() as u32
+                            + 1
+                    })
+                    .ok();
+                let ledger_root = roots.ledger.clone();
+                let execution_root = roots.execution.clone();
+                let label = display_content.clone();
+                let snapshot = tauri::async_runtime::spawn_blocking(move || {
+                    crate::features::code_sessions::checkpoints::create_checkpoint(
+                        &ledger_root,
+                        &execution_root,
+                        turn_number,
+                        crate::features::code_sessions::checkpoints::CheckpointKind::Turn,
+                        &label,
+                    )
+                })
+                .await;
+                match snapshot {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        log::warn!("[pinvou3][accept_plan] checkpoint failed sid={session_id}: {error:#}")
+                    }
+                    Err(error) => {
+                        log::warn!("[pinvou3][accept_plan] checkpoint task failed sid={session_id}: {error}")
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("[pinvou3][accept_plan] resolve session roots failed sid={session_id}: {error:#}")
+            }
+        }
+    }
     if let Err(error) = pool
         .send_reserved_user_message(
             &session_id,

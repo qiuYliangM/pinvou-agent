@@ -10,7 +10,8 @@
 //!   工作区基线解析）；
 //! - [`CodeSessionCatalog`]：辅助索引 + ACP 元数据兜底的统一查询面，会话类型
 //!   （`SessionKind`）解析的使用方全部收口于此；
-//! - [`checkpoints`]：turn 级执行根快照与回滚（影子 git 仓库，数据落账本根）。
+//! - [`checkpoints`]：turn 级执行根快照与回滚（影子 git 仓库，数据落账本根）；
+//! - [`workspace_trust`]：项目目录信任清单（绑定即授权的显式确认与持久化）。
 //!
 //! 运行时能力（子进程托管、事件桥、Engine 会话）分别留在 `codex_acp` 与
 //! `assistant`；本模块不感知任何运行时。
@@ -19,6 +20,7 @@ mod acp_record;
 mod catalog;
 pub mod checkpoints;
 mod store;
+mod workspace_trust;
 
 pub use acp_record::CODEX_ACP_SESSION_MODEL;
 pub(crate) use acp_record::{saved_config_values, CLAUDE_ACP_PACKAGE, CODEX_ACP_PACKAGE};
@@ -27,6 +29,7 @@ pub use store::{
     validate_codex_project_workspace, AcpConfigDefaultsStore, AgentBackend, CodexWorkspaceKind,
     SessionAgentRecord, SessionAgentStore,
 };
+pub use workspace_trust::{trust_warning_for, TrustedWorkspaceStore};
 
 use crate::features::sessions::SessionKind;
 

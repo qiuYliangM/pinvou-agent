@@ -500,6 +500,22 @@ impl SessionAgentStore {
         }
     }
 
+    /// 全部已绑定的项目目录（原生 + ACP 代码会话，去重）。
+    /// 用途：启动时把存量绑定回填进 workspace trust 清单——已绑定会话的执行根
+    /// 视为已信任，功能上线前的存量绑定不要求重新授权。
+    pub fn project_workspaces(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .records
+            .read()
+            .values()
+            .filter(|record| record.workspace_kind == CodexWorkspaceKind::Project)
+            .filter_map(|record| record.workspace_path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     pub fn set_acp_session(
         &self,
         session_id: &str,

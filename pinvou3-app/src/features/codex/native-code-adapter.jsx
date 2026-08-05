@@ -7,8 +7,10 @@
 // 视图主体只消费本 adapter 与 acp-code-adapter 的统一接口；确属 UI 差异的分歧
 // 集中在 capabilities 声明，不再散落三元。
 //
-// Plan 降级说明：本期不接 plan_snapshot/accept_plan，切 Plan 后方案以文本/普通
-// 工具卡呈现。
+// Plan 审批卡：chat:plan_ready → 方案卡（NativePlanCard，步骤列表 + 三键）；
+// [就这么干] = accept_plan（切 Yolo + 注入执行指令，Rust 侧补 turn 前
+// checkpoint）、[改改] = 预填「修订方案:」继续讨论、[算了] = discard_plan
+// （不切模式）。全部显式 sessionId 直调命令，不经 bridge 全局 active 绑定。
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invokeTauri as invoke } from '../../platform/tauri/client.js';
@@ -74,6 +76,79 @@ function NativeUserInputCard({ item, responding, onSubmitAnswers, onCancelInput,
       onSubmit={submit}
       onCancel={actionable ? () => onCancelInput(item.toolCallId) : undefined}
     />
+  );
+}
+
+// 原生车道的方案审批卡：chat:plan_ready → 步骤列表 + [就这么干/改改/算了]。
+// 视觉对齐聊天页 PlanCard（tool-renderers.jsx，那里锁在闭包里不可 import），
+// 按钮回调走显式 sessionId 的 accept_plan/discard_plan，不经 bridge.interaction。
+function planStatusSymbol(status) {
+  return status === 'completed' ? '●' : status === 'in_progress' ? '◎' : '○';
+}
+
+function NativePlanCard({ item, responding, onAccept, onRevise, onDiscard, t, copy }) {
+  const active = item.cardState === 'active' && !item.resolved && Boolean(item.planId);
+  const statusLabel = {
+    accepted: copy.planAccepted,
+    discarded: copy.planDiscarded,
+    superseded: copy.planSuperseded,
+    historical: copy.planHistorical,
+  }[item.resolution] || copy.planHistorical;
+  const planItems = (item.plan && Array.isArray(item.plan.items) && item.plan.items) || [];
+  const todoItems = (item.todos && Array.isArray(item.todos.items) && item.todos.items) || [];
+  return (
+    <div data-testid="native-plan-card"
+      className="rounded-xl border border-[#0B57D0]/20 bg-white px-3.5 py-3 dark:border-[#A8C7FA]/30 dark:bg-white/[0.04]">
+      <div className="mb-2 text-[13px] font-semibold text-[#1F1F1F] dark:text-[#E3E3E3]">{t.planReady}</div>
+      {planItems.length === 0 && todoItems.length === 0 ? (
+        <div className="text-[12px] text-gray-500 dark:text-gray-400">{t.planEmpty}</div>
+      ) : (
+        <>
+          {item.plan && item.plan.explanation && (
+            <div className="mb-1.5 text-[12px] text-gray-600 dark:text-gray-300">
+              {t.planLabel} · {item.plan.explanation}
+            </div>
+          )}
+          {planItems.length > 0 && (
+            <ol className="space-y-0.5 text-[12px] text-gray-600 dark:text-gray-300">
+              {planItems.map((step, index) => (
+                <li key={index}>{index + 1}. {planStatusSymbol(step.status)} {step.step}</li>
+              ))}
+            </ol>
+          )}
+          {todoItems.length > 0 && (
+            <>
+              <div className="mb-0.5 mt-1.5 text-[11px] font-medium text-gray-400">{t.planTodos}</div>
+              <ol className="space-y-0.5 text-[12px] text-gray-600 dark:text-gray-300">
+                {todoItems.map((todo, index) => (
+                  <li key={index}>{index + 1}. {planStatusSymbol(todo.status)} {todo.content}</li>
+                ))}
+              </ol>
+            </>
+          )}
+        </>
+      )}
+      <div className="my-2.5 h-px bg-black/10 dark:bg-white/10" />
+      {active ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="mr-1 text-[12px] text-gray-500 dark:text-gray-400">{t.planNext}</span>
+          <button type="button" data-testid="native-plan-accept" disabled={responding} onClick={onAccept}
+            className="h-7 rounded-lg bg-[#007AFF] px-2.5 text-[12px] font-semibold text-white shadow-sm hover:bg-[#006EE6] disabled:opacity-50">
+            {t.planGo}
+          </button>
+          <button type="button" disabled={responding} onClick={onRevise}
+            className="h-7 rounded-lg border border-black/[0.08] px-2.5 text-[12px] text-gray-600 hover:bg-black/[0.04] disabled:opacity-50 dark:border-white/10 dark:text-gray-300 dark:hover:bg-white/[0.06]">
+            {t.planEdit}
+          </button>
+          <button type="button" data-testid="native-plan-discard" disabled={responding} onClick={onDiscard}
+            className="h-7 rounded-lg border border-black/[0.08] px-2.5 text-[12px] text-gray-600 hover:bg-black/[0.04] disabled:opacity-50 dark:border-white/10 dark:text-gray-300 dark:hover:bg-white/[0.06]">
+            {t.planDrop}
+          </button>
+        </div>
+      ) : (
+        <div className="text-[12px] font-medium text-[#137333] dark:text-[#93D5A6]">{statusLabel}</div>
+      )}
+    </div>
   );
 }
 
@@ -160,6 +235,7 @@ export function useNativeCodeAdapter({
   const sessionReady = !activeId || Boolean(conversationState && conversationState.hydrated);
 
   /// 拉取原生会话的模型/知识库/模式状态（全部 per-session 命令，显式 sessionId）。
+  /// 返回 modeState（loadSession 还原挂起方案卡要用 pending_plan_id）。
   async function refreshNativeControls(sessionId) {
     const [modelId, mountedId, modeState] = await Promise.all([
       invoke('get_session_model_id', { sessionId }).catch(() => null),
@@ -172,6 +248,7 @@ export function useNativeCodeAdapter({
       mode: (modeState && modeState.mode) || 'yolo',
     });
     nativeControlsSessionRef.current = sessionId;
+    return modeState || null;
   }
 
   /// 草稿态暂存的控件选择在新会话上应用；失败报错不静默（逐个应用，mode 最后）。
@@ -280,7 +357,12 @@ export function useNativeCodeAdapter({
         state.thinking = { active: true, startedAt: Date.now(), phase: 'thinking', toolName: null };
       }
     }
-    await refreshNativeControls(id);
+    const modeState = await refreshNativeControls(id);
+    // 还原挂起的方案审批卡：chat:plan_ready 不重发；ticket（pending_plan_id）仍在
+    // 时按消息流里最后一次 update_plan 的参数重建可操作卡（store 幂等去重）。
+    if (!isStale() && modeState && modeState.pending_plan_id) {
+      store.restorePendingPlan(id, modeState.pending_plan_id);
+    }
     if (isStale()) return null;
     bumpVersion();
     return null;
@@ -374,9 +456,81 @@ export function useNativeCodeAdapter({
     finally { setResponding(false); }
   }
 
+  // ── Plan 审批卡（accept_plan / discard_plan，显式 sessionId）────────────
+  // 语义对齐聊天页 bridge 的 interaction acceptPlan/discardPlan，但全部直调命令：
+  // 乐观收口卡片 → 调用失败时按错误码分流（plan_not_active = ticket 已被别处
+  // 消费 → 冻结为历史卡；其余错误 → 卡片恢复可操作并显式报错）。
+
+  /// [✅ 就这么干]：accept_plan = 切 Yolo + 注入「立即执行 + 方案全文」指令；
+  /// 用户气泡乐观插入（chat:user_message 回声按 localEchoTs 去重）。
+  async function acceptPlan(item) {
+    const sessionId = activeId;
+    const planId = String((item && item.planId) || '').trim();
+    if (!sessionId || !planId) return;
+    const echo = t.planGo || '✅ 就这么干';
+    setResponding(true); setError('');
+    store.markPlanResolved(sessionId, planId, 'accepted');
+    const optimisticId = store.appendLocalUserMessage(sessionId, echo);
+    autoScrollRef.current = true;
+    setShowScrollBottom(false);
+    bumpVersion();
+    try {
+      await invoke('accept_plan', {
+        sessionId,
+        planId,
+        planMarkdown: item.planMarkdown || '',
+        displayMessage: echo,
+      });
+      // accept 后 mode 已切 Yolo：刷新底栏模式控件。
+      await refreshNativeControls(sessionId);
+    } catch (err) {
+      store.removeLocalUserMessage(sessionId, optimisticId);
+      if (String(err || '').includes('plan_not_active')) {
+        store.markPlanResolved(sessionId, planId, 'historical');
+      } else {
+        store.reopenPlanCard(sessionId, planId);
+        showError(err);
+      }
+      bumpVersion();
+    } finally {
+      setResponding(false);
+    }
+  }
+
+  /// [🚪 算了]：discard_plan 只关卡片不切模式（继续讨论）；后端同时广播
+  /// chat:plan_resolved，多端（如远程控制）的同名卡同步冻结。
+  async function discardPlan(item) {
+    const sessionId = activeId;
+    const planId = String((item && item.planId) || '').trim();
+    if (!sessionId || !planId) return;
+    setResponding(true); setError('');
+    store.markPlanResolved(sessionId, planId, 'discarded');
+    bumpVersion();
+    try {
+      await invoke('discard_plan', { sessionId, planId });
+    } catch (err) {
+      if (String(err || '').includes('plan_not_active')) {
+        store.markPlanResolved(sessionId, planId, 'historical');
+      } else {
+        store.reopenPlanCard(sessionId, planId);
+        showError(err);
+      }
+      bumpVersion();
+    } finally {
+      setResponding(false);
+    }
+  }
+
+  /// [✏️ 改改]：不切 phase，仅预填「修订方案:」前缀（对齐底座做法：plan 模式
+  /// 下发的新消息自带隐式修订语义）。
+  function revisePlan() {
+    setDraft(t.planRevisePrefill || '修订方案:');
+  }
+
   // 原生车道 deepseek 投影项渲染：agent_message 用会话状态保存的原始 markdown；
-  // user_input 走选择确认卡；careful_blocked 是拦截提示（无需交互）；system 是引擎
-  // 透传提示。reasoning / tool_group 由 ConversationTimeline 默认渲染。
+  // user_input 走选择确认卡；plan_card 走方案审批卡；careful_blocked 是拦截提示
+  // （无需交互）；system 是引擎透传提示。reasoning / tool_group 由
+  // ConversationTimeline 默认渲染。
   function renderItem(item) {
     if (item.type === 'agent_message' && item.legacyItem) {
       return (
@@ -395,6 +549,19 @@ export function useNativeCodeAdapter({
           onCancelInput={cancelInput}
           copy={codexCopy}
           conversationCopy={t.uiConversation}
+        />
+      );
+    }
+    if (item.type === 'plan' && item.extensionType === 'plan_card' && item.legacyItem) {
+      return (
+        <NativePlanCard
+          item={item.legacyItem}
+          responding={responding}
+          onAccept={() => acceptPlan(item.legacyItem)}
+          onRevise={revisePlan}
+          onDiscard={() => discardPlan(item.legacyItem)}
+          t={t}
+          copy={codexCopy}
         />
       );
     }

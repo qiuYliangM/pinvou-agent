@@ -9,6 +9,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::features::assistant::engine_pool::EnginePool;
+use crate::features::code_sessions::{trust_warning_for, TrustedWorkspaceStore};
 use crate::features::codex_acp::reader_window::{self, ReaderOpenRequest};
 use crate::features::codex_acp::workspace::{
     self, WorkspaceChanges, WorkspaceDiff, WorkspaceEntry, WorkspaceListing, WorkspacePreview,
@@ -599,24 +600,103 @@ pub async fn list_codex_acp_sessions(
         .collect()
 }
 
+/// Workspace trust 防绕过校验：绑定项目目录要求「路径已在信任清单」或「调用方
+/// 显式带 `confirmed=true`」（前端仅在用户确认弹窗后才传）。`confirmed=true`
+/// 通过校验的同时把路径记入清单，后续绑定同目录免确认。
+fn enforce_workspace_trust(
+    trust: &TrustedWorkspaceStore,
+    project_workspace: &Option<std::path::PathBuf>,
+    confirmed: bool,
+) -> Result<(), String> {
+    let Some(path) = project_workspace else {
+        return Ok(());
+    };
+    if trust.is_trusted(path) {
+        return Ok(());
+    }
+    if confirmed {
+        return trust
+            .trust(path.clone())
+            .map_err(|error| format!("记录项目目录信任失败: {error:#}"));
+    }
+    Err(format!(
+        "项目目录 {} 尚未信任：绑定项目目录需要用户显式授权",
+        path.display()
+    ))
+}
+
+/// 前端绑定前的信任预检：返回归一化路径、是否已信任、危险目录警示
+/// （家目录本身 / 盘符根，即使确认也要额外警示文案）。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTrustStatus {
+    pub path: String,
+    pub trusted: bool,
+    pub warning: Option<String>,
+}
+
+#[tauri::command]
+pub fn check_workspace_trust(
+    path: String,
+    trust: State<'_, TrustedWorkspaceStore>,
+) -> Result<WorkspaceTrustStatus, String> {
+    // 归一化与绑定校验同源（canonicalize + platform_compat_path），
+    // 判定结果与绑定命令的信任比对不可能分叉。
+    let normalized = validate_codex_project_workspace(std::path::Path::new(&path))
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(WorkspaceTrustStatus {
+        path: normalized.to_string_lossy().to_string(),
+        trusted: trust.is_trusted(&normalized),
+        warning: trust_warning_for(&normalized).map(|warning| warning.as_str().to_string()),
+    })
+}
+
+#[tauri::command]
+pub fn list_trusted_workspaces(trust: State<'_, TrustedWorkspaceStore>) -> Vec<String> {
+    trust
+        .list()
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
+/// 「不再信任」入口：从清单移除目录。目录已被删除时退回 compat 归一化比对，
+/// 保证清单条目总能被清除。返回移除后的清单。
+#[tauri::command]
+pub fn untrust_workspace(
+    path: String,
+    trust: State<'_, TrustedWorkspaceStore>,
+) -> Result<Vec<String>, String> {
+    let raw = std::path::Path::new(&path);
+    let normalized = validate_codex_project_workspace(raw)
+        .unwrap_or_else(|_| crate::platform::os::platform_compat_path(&path));
+    trust
+        .untrust(&normalized)
+        .map_err(|error| format!("更新信任清单失败: {error:#}"))?;
+    Ok(list_trusted_workspaces(trust))
+}
+
 #[tauri::command]
 pub async fn create_codex_acp_session(
     workspace_path: Option<String>,
     agent_id: Option<String>,
+    confirmed: Option<bool>,
     store: State<'_, SessionStore>,
     pool: State<'_, EnginePool>,
     acp_pool: State<'_, AcpPool>,
+    trust: State<'_, TrustedWorkspaceStore>,
 ) -> Result<SessionMetadata, String> {
     let backend = AgentBackend::parse(agent_id.as_deref().or(Some("codex")))
         .map_err(|error| format!("{error:#}"))?;
     if !backend.is_acp() {
-        return create_code_native_session(workspace_path, &pool, &store, &acp_pool).await;
+        return create_code_native_session(workspace_path, confirmed, &pool, &store, &acp_pool, &trust)
+            .await;
     }
     let project_workspace = workspace_path
         .as_deref()
         .map(|path| validate_codex_project_workspace(std::path::Path::new(path)))
         .transpose()
         .map_err(|error| format!("{error:#}"))?;
+    enforce_workspace_trust(&trust, &project_workspace, confirmed.unwrap_or(false))?;
     let metadata_workspace = project_workspace
         .clone()
         .unwrap_or_else(|| pool.bridge.workspace.clone());
@@ -673,19 +753,22 @@ pub async fn create_codex_acp_session(
 ///
 /// 临时会话执行目录与 ACP 临时会话共用 `SessionStore::session_roots` 推导
 /// （两根一致，均为会话私有目录）；项目会话绑定调用方选定的目录（经
-/// `validate_codex_project_workspace` 校验），执行根由 resolver 在
-/// engine/shell 启动时解析，发消息走现有 `chat` 命令。
+/// `validate_codex_project_workspace` 校验 + workspace trust 授权），执行根由
+/// resolver 在 engine/shell 启动时解析，发消息走现有 `chat` 命令。
 async fn create_code_native_session(
     workspace_path: Option<String>,
+    confirmed: Option<bool>,
     pool: &EnginePool,
     store: &SessionStore,
     acp_pool: &AcpPool,
+    trust: &TrustedWorkspaceStore,
 ) -> Result<SessionMetadata, String> {
     let project_workspace = workspace_path
         .as_deref()
         .map(|path| validate_codex_project_workspace(std::path::Path::new(path)))
         .transpose()
         .map_err(|error| format!("{error:#}"))?;
+    enforce_workspace_trust(trust, &project_workspace, confirmed.unwrap_or(false))?;
     let kind = if project_workspace.is_some() {
         CodexWorkspaceKind::Project
     } else {
@@ -787,5 +870,30 @@ mod tests {
         ensure_codex_workspace_root(CodexWorkspaceKind::Project, &workspace)
             .expect("project workspace is caller-validated");
         assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn workspace_trust_gate_requires_trust_or_explicit_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-codex-trust-gate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let trust = TrustedWorkspaceStore::for_test(root.join("trusted_workspaces.json"));
+        let dir = crate::platform::os::platform_compat_path("/tmp/pinvou3-trust-gate");
+        let project = Some(dir.clone());
+        // 临时会话（无项目目录）不校验。
+        assert!(enforce_workspace_trust(&trust, &None, false).is_ok());
+        // 未信任且未确认：拒绝（防绕过——前端未确认直接调命令会被拒）。
+        let rejected = enforce_workspace_trust(&trust, &project, false).unwrap_err();
+        assert!(rejected.contains("尚未信任"), "unexpected error: {rejected}");
+        assert!(!trust.is_trusted(&dir));
+        // 显式确认：放行并记入清单（再次绑定免确认）。
+        assert!(enforce_workspace_trust(&trust, &project, true).is_ok());
+        assert!(trust.is_trusted(&dir));
+        // 已信任：无需确认也放行。
+        assert!(enforce_workspace_trust(&trust, &project, false).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -6,6 +6,8 @@ import {
 } from '../../components/icons.jsx';
 import { AcpAgentLogo } from './AcpAgentLogo.jsx';
 import { CodexWorkspacePanel } from './CodexWorkspacePanel.jsx';
+import { WorkspaceTrustDialog } from './WorkspaceTrustDialog.jsx';
+import { createWorkspaceTrustGrants, trustDecision } from './workspace-trust.js';
 import {
   runtimeInstallInProgress,
   runtimeLoginInProgress,
@@ -802,6 +804,13 @@ export function CodexAcpView({
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [draftWorkspacePath, setDraftWorkspacePath] = useState(null);
   const [recentWorkspaces, setRecentWorkspaces] = useState(loadRecentWorkspaces);
+  // Workspace trust（权限分级）：绑定项目目录前的显式授权。trustPrompt 非空 =
+  // 授权弹窗打开中（Promise 挂起等用户选择）；trustGrantsRef 记账本次已确认的
+  // 目录，createSession 命中才带 confirmed=true；trustedDirs 是菜单里展示的
+  // 信任清单（权威在 Rust，打开菜单时拉取）。
+  const [trustPrompt, setTrustPrompt] = useState(null);
+  const [trustedDirs, setTrustedDirs] = useState([]);
+  const trustGrantsRef = useRef(createWorkspaceTrustGrants());
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const scroller = useRef(null);
   const autoScrollRef = useRef(true);
@@ -947,6 +956,9 @@ export function CodexAcpView({
     const metadata = await invoke('create_codex_acp_session', {
       workspacePath,
       agentId: draftAgentId,
+      // confirmed 仅前端确认弹窗后才为 true（trustGrantsRef 记账）；Rust 侧
+      // 另有「已信任 或 confirmed=true」校验兜底，绕过前端直接调命令会被拒。
+      confirmed: Boolean(workspacePath && trustGrantsRef.current.isGranted(workspacePath)),
     });
     // loadSession 用会话作用域 store 判定分流；新会话先登记，避免它读到旧 prop。
     if (draftAgentId === 'pinvou') native.registerSession(metadata.id);
@@ -1001,6 +1013,36 @@ export function CodexAcpView({
     setWorkspaceMenuOpen(true);
   }
 
+  /// 绑定项目目录前的信任闸门：已信任直接放行；否则弹显式授权确认，
+  /// 用户确认后才继续（返回值 = 是否放行）。归一化/判定以 Rust 为准。
+  async function ensureWorkspaceTrusted(path) {
+    const status = await invoke('check_workspace_trust', { path });
+    const decision = trustDecision(status);
+    if (decision.action === 'proceed') return true;
+    return await new Promise(resolve => {
+      setTrustPrompt({
+        originalPath: path,
+        path: decision.path || path,
+        warning: decision.warning,
+        resolve,
+      });
+    });
+  }
+
+  function settleTrustPrompt(confirmed) {
+    if (!trustPrompt) return;
+    if (confirmed) trustGrantsRef.current.grant(trustPrompt.originalPath);
+    setTrustPrompt(null);
+    trustPrompt.resolve(confirmed);
+  }
+
+  async function untrustWorkspace(path) {
+    try {
+      const list = await invoke('untrust_workspace', { path });
+      setTrustedDirs(Array.isArray(list) ? list : []);
+    } catch (err) { showError(err); }
+  }
+
   async function chooseProjectDraft() {
     const selected = await openTauriDialog({
       directory: true,
@@ -1008,10 +1050,16 @@ export function CodexAcpView({
       title: codexCopy.chooseProjectDialog,
     });
     const path = Array.isArray(selected) ? selected[0] : selected;
-    if (path) {
-      setRecentWorkspaces(rememberWorkspace(path));
-      beginDraft(path);
-    }
+    if (!path) return;
+    if (!(await ensureWorkspaceTrusted(path))) return;
+    setRecentWorkspaces(rememberWorkspace(path));
+    beginDraft(path);
+  }
+
+  /// 最近项目直选同样过信任闸门（绕过系统 dialog 不绕过授权）。
+  async function selectRecentWorkspace(path) {
+    if (!(await ensureWorkspaceTrusted(path))) return;
+    beginDraft(path);
   }
 
   function updateAttachments(sessionId, update) {
@@ -1136,6 +1184,15 @@ export function CodexAcpView({
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [busy]);
+
+  // 工作区菜单打开时拉取信任清单（「不再信任」入口；权威在 Rust 侧
+  // trusted_workspaces.json，打开即取保证看到最新状态）。
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    invoke('list_trusted_workspaces')
+      .then(list => setTrustedDirs(Array.isArray(list) ? list : []))
+      .catch(() => {});
+  }, [workspaceMenuOpen]);
 
   useEffect(() => {
     const element = scroller.current;
@@ -1517,7 +1574,7 @@ export function CodexAcpView({
                                 <div className="px-3 pb-1 text-[10px] uppercase tracking-wider text-gray-400">{codexCopy.recentProjects}</div>
                                 {recentWorkspaces.map(path => (
                                   <button key={path} type="button" title={path}
-                                    onClick={() => beginDraft(path)}
+                                    onClick={() => selectRecentWorkspace(path).catch(showError)}
                                     className="w-full rounded-lg px-3 py-1.5 flex items-center gap-2 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
                                     <FolderOpen size={13} className="shrink-0 text-gray-400" />
                                     <span className="truncate text-[11px]">{workspaceName(path, codexCopy.unknownDirectory)}</span>
@@ -1525,6 +1582,24 @@ export function CodexAcpView({
                                 ))}
                               </div>
                             )}
+                            <div className="mt-1 pt-2 border-t border-black/[0.05] dark:border-white/[0.06]">
+                              <div className="px-3 pb-0.5 text-[10px] uppercase tracking-wider text-gray-400">{codexCopy.trustedDirs}</div>
+                              <div className="px-3 pb-1 text-[10px] text-gray-400">{codexCopy.trustedDirsDesc}</div>
+                              {trustedDirs.length === 0 ? (
+                                <div className="px-3 py-1.5 text-[11px] text-gray-400">{codexCopy.trustedDirsEmpty}</div>
+                              ) : trustedDirs.map(path => (
+                                <div key={path} title={path} data-testid="trusted-workspace-item"
+                                  className="w-full rounded-lg px-3 py-1.5 flex items-center gap-2">
+                                  <FolderOpen size={13} className="shrink-0 text-gray-400" />
+                                  <span className="min-w-0 flex-1 truncate text-[11px]">{workspaceName(path, codexCopy.unknownDirectory)}</span>
+                                  <button type="button" onClick={() => untrustWorkspace(path)}
+                                    title={codexCopy.untrustTitle(path)}
+                                    className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] text-gray-400 hover:bg-red-500/10 hover:text-red-500">
+                                    {codexCopy.untrust}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         </>
                       )}
@@ -1745,6 +1820,15 @@ export function CodexAcpView({
             refreshToken={adapter.workspaceRefreshToken + workspaceRefreshExtra}
             onChangeCount={setWorkspaceChangeCount}
             copy={t.uiCodexWorkspace}
+          />
+        )}
+        {trustPrompt && (
+          <WorkspaceTrustDialog
+            path={trustPrompt.path}
+            warning={trustPrompt.warning}
+            copy={codexCopy}
+            onConfirm={() => settleTrustPrompt(true)}
+            onCancel={() => settleTrustPrompt(false)}
           />
         )}
         </div>

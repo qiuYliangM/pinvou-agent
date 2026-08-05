@@ -13,7 +13,7 @@ const root = path.join(here, '..');
 const temp = mkdtempSync(path.join(tmpdir(), 'pinvou3-session-conversation-'));
 writeFileSync(path.join(temp, 'package.json'), '{"type":"module"}\n');
 mkdirSync(path.join(temp, 'conversation'), { recursive: true });
-for (const file of ['conversation-model.js', 'deepseek-conversation.js', 'session-conversation.js']) {
+for (const file of ['conversation-model.js', 'deepseek-conversation.js', 'plan-card.js', 'session-conversation.js']) {
   copyFileSync(path.join(root, 'src', 'features', 'conversation', file), path.join(temp, 'conversation', file));
 }
 
@@ -23,8 +23,9 @@ try {
     createSessionConversationStore,
   } = await import(`${pathToFileURL(path.join(temp, 'conversation', 'session-conversation.js')).href}?t=${Date.now()}`);
 
-  assert.equal(SESSION_CHAT_EVENTS.length, 15, 'store 消费的 chat 事件全集与车道一致');
+  assert.equal(SESSION_CHAT_EVENTS.length, 17, 'store 消费的 chat 事件全集与车道一致');
   assert.ok(SESSION_CHAT_EVENTS.includes('chat:user_message') && SESSION_CHAT_EVENTS.includes('chat:done'));
+  assert.ok(SESSION_CHAT_EVENTS.includes('chat:plan_ready') && SESSION_CHAT_EVENTS.includes('chat:plan_resolved'));
 
   // ── 事件按 sessionId 过滤：未注册会话的事件被丢弃 ────────────────
   const store = createSessionConversationStore();

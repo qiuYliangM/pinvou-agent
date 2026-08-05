@@ -8,10 +8,11 @@
 // projectConversation → projectDeepSeekConversation → ConversationTimeline。
 //
 // state.items 是 bridge chatItems 的兼容子集：user / assistant(text) / reasoning /
-// tool / user_input / careful_blocked / system。与 bridge 的差异：assistant 保留
+// tool / user_input / plan_card / careful_blocked / system。与 bridge 的差异：assistant 保留
 // 原始 markdown 文本（bridge 存预渲染 html），渲染层用 ConversationMarkdown。
 
 import { projectDeepSeekConversation } from './deepseek-conversation.js';
+import { composePlanMarkdown, lastPlanSnapshotFromItems } from './plan-card.js';
 
 /// store 消费的 engine chat 事件全集；payload 一律带 session_id（后端 forwarder 打 tag）。
 export const SESSION_CHAT_EVENTS = [
@@ -28,6 +29,8 @@ export const SESSION_CHAT_EVENTS = [
   'chat:compaction',
   'chat:usage',
   'chat:user_input_required',
+  'chat:plan_ready',
+  'chat:plan_resolved',
   'chat:transient_error',
   'chat:done',
 ];
@@ -301,6 +304,51 @@ export function applyChatEvent(state, name, payload) {
       });
       return true;
     }
+    case 'chat:plan_ready': {
+      // Plan 模式 turn 收口：方案审批卡（语义对齐聊天页 bridge 的 plan_card，
+      // resolution 是代码，本地化文案在渲染层按 codexCopy 映射）。
+      const planId = String(p.plan_id || '').trim();
+      if (planId && state.items.some(item => (
+        item && item.type === 'plan_card' && String(item.planId || '') === planId
+      ))) return false;
+      // 新方案出现 → 旧的 active 方案卡冻结为「已被新方案覆盖」。
+      for (const item of state.items) {
+        if (item && item.type === 'plan_card' && item.cardState === 'active') {
+          item.cardState = 'resolved';
+          item.resolution = 'superseded';
+          item.resolved = true;
+        }
+      }
+      const snapshots = { plan: p.plan_snapshot || null, todos: p.todos_snapshot || null };
+      state.items.push({
+        id: nextId(state),
+        type: 'plan_card',
+        planId: planId || null,
+        plan: snapshots.plan,
+        todos: snapshots.todos,
+        planMarkdown: composePlanMarkdown(snapshots),
+        cardState: planId ? 'active' : 'resolved',
+        resolution: planId ? null : 'historical',
+        resolved: !planId,
+        time: timeStr(),
+      });
+      return true;
+    }
+    case 'chat:plan_resolved': {
+      // 方案在别处被收口（如远程控制 discard）：本地未收口的同 ticket 卡同步冻结。
+      const planId = String(p.plan_id || '').trim();
+      if (!planId) return false;
+      let changed = false;
+      for (const item of state.items) {
+        if (item && item.type === 'plan_card' && String(item.planId || '') === planId && !item.resolved) {
+          item.cardState = 'resolved';
+          item.resolution = 'discarded';
+          item.resolved = true;
+          changed = true;
+        }
+      }
+      return changed;
+    }
     case 'chat:transient_error': {
       if (!p.error) return false;
       const notice = `⚠️ ${p.error}`;
@@ -364,7 +412,9 @@ function messageText(blocks) {
 
 /// SavedSession messages → state.items（hydration 是 rerenderFromMessages 的精简版：
 /// 覆盖 user / assistant text / thinking / tool_use+tool_result / request_user_input；
-/// persona、成品卡、plan 卡等主聊天专属形态不在代码会话出现，不做还原）。
+/// persona、成品卡等主聊天专属形态不在代码会话出现，不做还原。历史方案卡不还原
+/// （update_plan 本身已作为工具卡呈现）；仍挂起的方案 ticket 由
+/// `restorePendingPlan` 按消息流里最后一次 update_plan 参数单独重建）。
 export function hydrateConversation(state, saved, timelineEvents = []) {
   // 同窗口切回正在跑的会话时，state 已被 chat:* 事件推进过：磁盘快照（只落已提交
   // 内容）会滞后于实时状态，hydration 后保留 busy，由后续事件继续推进；冷启动
@@ -497,6 +547,58 @@ export function markUserInputResolved(state, toolCallId, cardState) {
   return true;
 }
 
+/// 方案卡本地收口：accept/discard 调用前后把卡片置为终态（resolution ∈
+/// 'accepted' | 'discarded' | 'historical'）。按 planId 定位（不限未收口卡），
+/// 乐观标记后 plan_not_active 再改判历史卡也走这里。
+export function markPlanResolved(state, planId, resolution) {
+  const card = state && [...state.items].reverse().find(item => (
+    item && item.type === 'plan_card' && String(item.planId || '') === String(planId || '')
+  ));
+  if (!card) return false;
+  card.cardState = 'resolved';
+  card.resolution = resolution;
+  card.resolved = true;
+  return true;
+}
+
+/// accept/discard 失败（非 plan_not_active）时把卡片恢复为可操作态。
+export function reopenPlanCard(state, planId) {
+  const card = state && [...state.items].reverse().find(item => (
+    item && item.type === 'plan_card' && String(item.planId || '') === String(planId || '')
+  ));
+  if (!card) return false;
+  card.cardState = 'active';
+  card.resolution = null;
+  card.resolved = false;
+  return true;
+}
+
+/// 重载还原挂起的方案卡：chat:plan_ready 不重发，ticket（pending_plan_id）仍在
+/// 时按消息流里最后一次 update_plan 的参数重建可操作卡。快照本体不落盘——
+/// 若消息流里找不到 update_plan 参数（极端：历史被压缩），卡片退化为空方案卡，
+/// 仍可 accept/discard 收口 ticket。
+export function restorePendingPlan(state, planId) {
+  const ticket = String(planId || '').trim();
+  if (!ticket) return false;
+  if (state.items.some(item => (
+    item && item.type === 'plan_card' && String(item.planId || '') === ticket
+  ))) return false;
+  const snapshots = { plan: lastPlanSnapshotFromItems(state.items), todos: null };
+  state.items.push({
+    id: nextId(state),
+    type: 'plan_card',
+    planId: ticket,
+    plan: snapshots.plan,
+    todos: null,
+    planMarkdown: composePlanMarkdown(snapshots),
+    cardState: 'active',
+    resolution: null,
+    resolved: false,
+    time: '',
+  });
+  return true;
+}
+
 // ── 会话作用域 store ─────────────────────────────────────────────────────
 //
 // 以 sessionId 为作用域管理一组会话的对话状态：
@@ -572,6 +674,15 @@ export function createSessionConversationStore() {
     },
     markUserInputResolved(sessionId, toolCallId, cardState) {
       return markUserInputResolved(getState(sessionId), toolCallId, cardState);
+    },
+    markPlanResolved(sessionId, planId, resolution) {
+      return markPlanResolved(getState(sessionId), planId, resolution);
+    },
+    reopenPlanCard(sessionId, planId) {
+      return reopenPlanCard(getState(sessionId), planId);
+    },
+    restorePendingPlan(sessionId, planId) {
+      return restorePendingPlan(getState(sessionId), planId);
     },
     project(sessionId) {
       return projectConversation(peekState(sessionId), sessionId);

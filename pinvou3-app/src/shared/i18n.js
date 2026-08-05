@@ -120,6 +120,14 @@ const codexZh = {
   serviceRecoveryHint:'请重新检测服务状态；如果问题持续，可以稍后重试或切换账号。',
   errorDetails:'查看错误详情', dismissNotice:'关闭提示',
   runtimeSources:{ system:'系统 CLI', override:'自定义 CLI', bundled:'内置 Bridge', legacy_bundled:'内置 Codex' },
+  trustDialogTitle:'信任此项目目录？',
+  trustDialogBody:'绑定后，该目录将成为代码会话的执行根：AI 可以在其中读写文件、执行 shell 命令。敏感目录仍受安全防火墙约束，危险命令仍会被拦截。',
+  trustDialogWarnHome:'⚠️ 该目录是你的家目录：AI 将能读写其中的全部文件，爆炸半径很大。请确认只在家目录下做可信操作。',
+  trustDialogWarnRoot:'⚠️ 该目录是磁盘根目录：AI 将能读写整块磁盘。强烈建议改选具体的项目子目录。',
+  trustDialogConfirm:'信任并继续',
+  trustedDirs:'已信任的目录', trustedDirsDesc:'绑定这些目录为项目工作区时不再重复询问', trustedDirsEmpty:'暂无已信任的目录',
+  untrust:'不再信任', untrustTitle:path=>`不再信任 ${path}；之后绑定该目录为新会话工作区时需要重新授权`,
+  planAccepted:'✅ 已批准，正在执行', planDiscarded:'🚪 已放弃此方案', planSuperseded:'📜 已被新方案覆盖', planHistorical:'📜 历史方案',
 };
 const codexEn = {
   unknownDirectory:'Unknown directory', temporaryWorkspace:'Temporary workspace', projectMissing:'Original project directory no longer exists',
@@ -182,6 +190,14 @@ const codexEn = {
   serviceRecoveryHint:'Check the service again. If the issue continues, retry later or switch accounts.',
   errorDetails:'View error details', dismissNotice:'Dismiss',
   runtimeSources:{ system:'System CLI', override:'Custom CLI', bundled:'Bundled bridge', legacy_bundled:'Bundled Codex' },
+  trustDialogTitle:'Trust this project folder?',
+  trustDialogBody:'Once bound, this folder becomes the execution root of the code session: the AI can read and write files in it and run shell commands. Sensitive directories remain protected by the security firewall, and dangerous commands are still blocked.',
+  trustDialogWarnHome:'⚠️ This is your home folder: the AI will be able to read and write everything in it — a very large blast radius. Continue only if you trust this workload.',
+  trustDialogWarnRoot:'⚠️ This is a drive root: the AI will be able to read and write the entire disk. Choosing a specific project subfolder is strongly recommended.',
+  trustDialogConfirm:'Trust and continue',
+  trustedDirs:'Trusted folders', trustedDirsDesc:'You will not be asked again when binding these folders as project workspaces', trustedDirsEmpty:'No trusted folders yet',
+  untrust:'Remove trust', untrustTitle:path=>`Remove trust for ${path}; binding it as a session workspace later will require authorization again`,
+  planAccepted:'✅ Approved, executing', planDiscarded:'🚪 Plan discarded', planSuperseded:'📜 Superseded by a newer plan', planHistorical:'📜 Past plan',
 };
 const codexJa = {
   unknownDirectory:'不明なディレクトリ', temporaryWorkspace:'一時ワークスペース', projectMissing:'元のプロジェクトディレクトリが存在しません',
@@ -244,6 +260,14 @@ const codexJa = {
   serviceRecoveryHint:'サービス状態を再確認してください。問題が続く場合は、後でもう一度試すかアカウントを切り替えてください。',
   errorDetails:'エラー詳細を表示', dismissNotice:'閉じる',
   runtimeSources:{ system:'システム CLI', override:'カスタム CLI', bundled:'内蔵 Bridge', legacy_bundled:'内蔵 Codex' },
+  trustDialogTitle:'このプロジェクトフォルダを信頼しますか？',
+  trustDialogBody:'バインドすると、このフォルダがコードセッションの実行ルートになります。AI はこの中でファイルの読み書きと shell コマンドの実行ができます。機密ディレクトリは引き続きセキュリティファイアウォールで保護され、危険なコマンドもブロックされます。',
+  trustDialogWarnHome:'⚠️ これはホームディレクトリです。AI が中のすべてのファイルを読み書きできるようになり、影響範囲が非常に大きくなります。信頼できる作業に限り続行してください。',
+  trustDialogWarnRoot:'⚠️ これはディスクのルートです。AI がディスク全体を読み書きできるようになります。具体的なプロジェクトのサブフォルダを選ぶことを強くお勧めします。',
+  trustDialogConfirm:'信頼して続行',
+  trustedDirs:'信頼済みフォルダ', trustedDirsDesc:'これらのフォルダをプロジェクトワークスペースとしてバインドする際は再確認されません', trustedDirsEmpty:'信頼済みフォルダはありません',
+  untrust:'信頼を解除', untrustTitle:path=>`${path} の信頼を解除します。今後このフォルダをセッションのワークスペースとしてバインドするには再度許可が必要です`,
+  planAccepted:'✅ 承認しました。実行中', planDiscarded:'🚪 プランを破棄しました', planSuperseded:'📜 新しいプランで上書きされました', planHistorical:'📜 過去のプラン',
 };
 
 const dict = {

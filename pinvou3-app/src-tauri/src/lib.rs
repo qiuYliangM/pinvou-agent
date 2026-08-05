@@ -406,6 +406,18 @@ pub fn run() {
                         panic!("failed to init Codex ACP pool: {error:#}");
                     }
                 };
+            // Workspace trust（权限分级）：信任清单进 Tauri state 供绑定命令校验；
+            // 启动时把存量绑定（session-agents.json 里的项目目录）回填进清单——
+            // 已绑定会话的执行根视为已信任，功能上线前的存量绑定不重新授权。
+            let workspace_trust =
+                crate::features::code_sessions::TrustedWorkspaceStore::load_or_empty();
+            let trust_backfilled = workspace_trust.backfill(code_session_agents.project_workspaces());
+            if trust_backfilled > 0 {
+                eprintln!(
+                    "[pinvou3-app] backfilled {trust_backfilled} trusted workspace(s) from existing bindings"
+                );
+            }
+            handle.manage(workspace_trust);
             startup::mark("engine_pool:start");
             let tool_factory: crate::features::assistant::engine_pool::EngineToolFactory =
                 std::sync::Arc::new(|app, session_id| {
@@ -688,6 +700,9 @@ pub fn run() {
             commands::codex::respond_codex_acp_elicitation,
             commands::codex::list_codex_acp_sessions,
             commands::codex::create_codex_acp_session,
+            commands::codex::check_workspace_trust,
+            commands::codex::list_trusted_workspaces,
+            commands::codex::untrust_workspace,
             commands::codex::list_codex_workspace,
             commands::codex::search_codex_workspace,
             commands::codex::preview_codex_workspace_file,
