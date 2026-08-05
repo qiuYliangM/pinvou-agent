@@ -47,12 +47,14 @@ pub async fn chat(
     let reservation = pool
         .reserve_turn(&sid)
         .map_err(|error| format!("reserve chat turn: {error:#}"))?;
+    let code_native = acp_pool.session_kind(&sid) == SessionKind::CodeNative;
     chat_with_reservation(
         message,
         attachments,
         sid,
         restrict_tools,
         reservation,
+        code_native,
         &pool,
         &store,
         &app,
@@ -62,12 +64,15 @@ pub async fn chat(
 
 /// Complete a turn after its session was atomically reserved. Web access uses
 /// this seam so attachment-handle resolution cannot race another submission.
+/// `code_native` marks native code sessions: each of their turns snapshots the
+/// execution root (checkpoint) before the engine may write files.
 pub(crate) async fn chat_with_reservation(
     message: String,
     attachments: Option<Vec<crate::features::files::file_ingest::IngestResult>>,
     sid: String,
     restrict_tools: Option<bool>,
     reservation: TurnReservation,
+    code_native: bool,
     pool: &EnginePool,
     store: &SessionStore,
     app: &AppHandle,
@@ -208,6 +213,45 @@ pub(crate) async fn chat_with_reservation(
     }
     // 取该 session 的 mode。
     let mode = store.mode_state(&sid).mode;
+    // 完全体 code 模式·变更管理闭环：原生代码会话每个 turn 开始前对执行根打
+    // checkpoint（影子 git，数据落账本根）。快照必须先于引擎写文件完成，因此在
+    // send 前同步等待；失败不阻断 turn——如实记日志，该轮在 UI 上只是没有
+    // 检查点入口，与 VSCode checkpoints 的降级语义一致。
+    if code_native {
+        let turn_number = store
+            .load(&sid)
+            .map(|session| {
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count() as u32
+                    + 1
+            })
+            .ok();
+        let ledger_root = roots.ledger.clone();
+        let execution_root = roots.execution.clone();
+        let label = display_content.clone();
+        let snapshot = tauri::async_runtime::spawn_blocking(move || {
+            crate::features::code_sessions::checkpoints::create_checkpoint(
+                &ledger_root,
+                &execution_root,
+                turn_number,
+                crate::features::code_sessions::checkpoints::CheckpointKind::Turn,
+                &label,
+            )
+        })
+        .await;
+        match snapshot {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                log::warn!("[pinvou3][chat] checkpoint failed sid={sid}: {error:#}")
+            }
+            Err(error) => {
+                log::warn!("[pinvou3][chat] checkpoint task failed sid={sid}: {error}")
+            }
+        }
+    }
     let send_started_at = std::time::Instant::now();
     crate::features::assistant::timing::start_turn(&sid);
     log::info!(

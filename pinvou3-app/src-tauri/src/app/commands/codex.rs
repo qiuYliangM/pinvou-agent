@@ -223,6 +223,50 @@ pub async fn codex_acp_prompt(
         message.as_str()
     };
     super::sessions::apply_default_session_title(&store, &session_id, title_source)?;
+    // 完全体 code 模式·变更管理闭环：ACP 代码会话每个 turn 开始前对执行根打
+    // checkpoint（与原生代码会话同一影子 git 服务）。快照必须先于 ACP prompt
+    // 执行完成；失败不阻断发送——如实记日志，该轮在 UI 上只是没有检查点入口。
+    match codex_workspace_root(Some(&session_id), None, &acp_pool) {
+        Ok(execution_root) => {
+            let turn_number = acp_pool
+                .timeline(&session_id)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|envelope| envelope.event.event_type == "user_message")
+                        .count() as u32
+                        + 1
+                })
+                .ok();
+            let label = title_source.to_string();
+            let ledger_root = store
+                .session_roots(&session_id)
+                .map(|roots| roots.ledger)
+                .map_err(|error| format!("解析会话根失败: {error:#}"))?;
+            let snapshot = tauri::async_runtime::spawn_blocking(move || {
+                crate::features::code_sessions::checkpoints::create_checkpoint(
+                    &ledger_root,
+                    &execution_root,
+                    turn_number,
+                    crate::features::code_sessions::checkpoints::CheckpointKind::Turn,
+                    &label,
+                )
+            })
+            .await;
+            match snapshot {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => log::warn!(
+                    "[pinvou3][codex-acp] checkpoint failed sid={session_id}: {error:#}"
+                ),
+                Err(error) => log::warn!(
+                    "[pinvou3][codex-acp] checkpoint task failed sid={session_id}: {error}"
+                ),
+            }
+        }
+        Err(error) => log::warn!(
+            "[pinvou3][codex-acp] checkpoint skipped sid={session_id}: {error}"
+        ),
+    }
     crate::features::assistant::timing::start_turn(&session_id);
     acp_pool
         .send_message(&session_id, message, attachments, workspace_references)

@@ -687,6 +687,8 @@ export function useAcpCodeAdapter({
       nativeComposerControls: false,
       forceUnifiedTurns: false,
       requiresAuthToSend: true,
+      // turn 边界 checkpoint 入口（Rust 侧 codex_acp_prompt 在 turn 开始前打快照）。
+      checkpoints: true,
       welcomeHints: { active: codexCopy.activeHint, draft: codexCopy.draftHint },
     },
     events,

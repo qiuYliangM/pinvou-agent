@@ -1739,6 +1739,15 @@ impl AcpPool {
         );
     }
 
+    /// 该 ACP 会话当前是否有进行中的 prompt（checkpoint 回滚等破坏性操作的忙碌门）。
+    pub async fn is_session_busy(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|runtime| runtime.busy.load(Ordering::Acquire))
+    }
+
     pub async fn cancel(&self, session_id: &str) {
         self.cancel_pending_permissions(session_id).await;
         self.cancel_pending_elicitations(session_id).await;

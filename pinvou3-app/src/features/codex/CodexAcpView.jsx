@@ -15,6 +15,8 @@ import { ComposerPopover } from '../../components/ComposerPopover.jsx';
 import { commandExecutionDetails } from './acp-state.js';
 import { ElicitationCard, useAcpCodeAdapter } from './acp-code-adapter.jsx';
 import { useNativeCodeAdapter } from './native-code-adapter.jsx';
+import { CheckpointChip } from './CheckpointChip.jsx';
+import { useSessionCheckpoints } from './checkpoints.js';
 import {
   ConversationActivityIndicator,
   ConversationMarkdown,
@@ -874,6 +876,32 @@ export function CodexAcpView({
     .find(turn => turn.status === 'running') || null;
   const attentionPending = adapter.attentionCount > 0;
 
+  // 完全体 code 模式·变更管理闭环：turn 边界 checkpoint 入口（capabilities 门控，
+  // 两个 adapter 都声明支持；快照由 Rust 侧在 turn 开始前完成）。回滚成功后
+  // 顺带刷新工作区面板（文件树/变更列表反映回滚后的执行根）。
+  const [workspaceRefreshExtra, setWorkspaceRefreshExtra] = useState(0);
+  const sessionCheckpoints = useSessionCheckpoints({
+    sessionId: activeId,
+    enabled: Boolean(adapter.capabilities.checkpoints && activeId),
+    refreshKey: visibleTurns.length,
+    onRestored: () => setWorkspaceRefreshExtra(value => value + 1),
+  });
+  // turn.id → checkpoint：只给用户 turn 编号（原生投影有 preamble 系统项 turn，
+  // 不占序号；ACP 投影每个 turn 都对应一次 prompt）。快照失败的 turn 没有入口，
+  // 后续 turn 序号不漂移（按 turn 字段对齐，不按位置）。
+  const checkpointByTurnId = useMemo(() => {
+    const map = new Map();
+    let userTurnNumber = 0;
+    for (const turn of visibleTurns) {
+      const isUserTurn = adapter.kind === 'acp' || Boolean(turn.userItem);
+      if (!isUserTurn) continue;
+      userTurnNumber += 1;
+      const checkpoint = sessionCheckpoints.byTurn.get(userTurnNumber);
+      if (checkpoint) map.set(turn.id, checkpoint);
+    }
+    return map;
+  }, [visibleTurns, adapter.kind, sessionCheckpoints.byTurn]);
+
   async function refreshSessions() {
     const next = await invoke('list_codex_acp_sessions');
     const list = next || [];
@@ -1294,10 +1322,11 @@ export function CodexAcpView({
                 </div>
               </div>
             )}
-            {visibleTurns.map(turn => (useUnifiedConversationUi || adapter.capabilities.forceUnifiedTurns)
+            {visibleTurns.map(turn => {
+              const turnCheckpoint = checkpointByTurnId.get(turn.id) || null;
+              const turnNode = (useUnifiedConversationUi || adapter.capabilities.forceUnifiedTurns)
               ? (
                   <ConversationTurn
-                    key={turn.id}
                     turn={turn}
                     now={now}
                     copy={t.uiConversation}
@@ -1315,7 +1344,7 @@ export function CodexAcpView({
                   />
                 )
               : (
-                  <Turn key={turn.id} turn={turn} now={now}
+                  <Turn turn={turn} now={now}
                     agentId={activeAgentId} agentName={activeAgentName}
                     copy={t.uiConversation}
                     cv={t.uiCodexView}
@@ -1325,7 +1354,24 @@ export function CodexAcpView({
                     onRespondElicitation={adapter.respondElicitation}
                     responding={responding}
                     onOpenExternal={(url) => invoke('open_user_external_url', { url }).catch(showError)} />
-                ))}
+                );
+              return (
+                <React.Fragment key={turn.id}>
+                  {turnCheckpoint && (
+                    <CheckpointChip
+                      checkpoint={turnCheckpoint}
+                      previewState={sessionCheckpoints.previews[turnCheckpoint.id]}
+                      busy={busy || working}
+                      restoring={sessionCheckpoints.restoring}
+                      copy={codexCopy}
+                      onPreview={sessionCheckpoints.preview}
+                      onRestore={sessionCheckpoints.restore}
+                    />
+                  )}
+                  {turnNode}
+                </React.Fragment>
+              );
+            })}
           </div>
         </div>
 
@@ -1696,7 +1742,7 @@ export function CodexAcpView({
             onClose={() => setWorkspaceOpen(false)}
             references={workspaceReferences}
             onAddReference={addWorkspaceReference}
-            refreshToken={adapter.workspaceRefreshToken}
+            refreshToken={adapter.workspaceRefreshToken + workspaceRefreshExtra}
             onChangeCount={setWorkspaceChangeCount}
             copy={t.uiCodexWorkspace}
           />

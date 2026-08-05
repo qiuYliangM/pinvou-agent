@@ -462,6 +462,8 @@ export function useNativeCodeAdapter({
       nativeComposerControls: true,
       forceUnifiedTurns: true,
       requiresAuthToSend: false,
+      // turn 边界 checkpoint 入口（Rust 侧 chat 命令在 turn 开始前打快照）。
+      checkpoints: true,
       welcomeHints: { active: codexCopy.nativeActiveHint, draft: codexCopy.nativeDraftHint },
     },
     turns,

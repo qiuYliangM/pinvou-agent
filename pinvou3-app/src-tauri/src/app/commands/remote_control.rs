@@ -496,6 +496,9 @@ async fn web_access_chat_for_session(
         session_id,
         restrict_tools,
         turn_reservation,
+        // 远程端正式支持代码会话之前不会路由到这里（代码会话事件被过滤），
+        // 因此不产生 turn 快照；对齐桌面端时改传真实类型。
+        false,
         pool,
         store,
         app,

@@ -9,13 +9,15 @@
 //! - [`acp_record`]：ACP 会话记录的分类、恢复与配置值迁移（`acp-state.json` /
 //!   工作区基线解析）；
 //! - [`CodeSessionCatalog`]：辅助索引 + ACP 元数据兜底的统一查询面，会话类型
-//!   （`SessionKind`）解析的使用方全部收口于此。
+//!   （`SessionKind`）解析的使用方全部收口于此；
+//! - [`checkpoints`]：turn 级执行根快照与回滚（影子 git 仓库，数据落账本根）。
 //!
 //! 运行时能力（子进程托管、事件桥、Engine 会话）分别留在 `codex_acp` 与
 //! `assistant`；本模块不感知任何运行时。
 
 mod acp_record;
 mod catalog;
+pub mod checkpoints;
 mod store;
 
 pub use acp_record::CODEX_ACP_SESSION_MODEL;
