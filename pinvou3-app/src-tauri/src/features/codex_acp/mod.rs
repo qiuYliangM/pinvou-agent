@@ -3,6 +3,10 @@
 //! pinvou3 只做 ACP client、进程托管、权限路由、事件持久化和 `acp:event` 投影；
 //! Codex、Claude Code 与 Kimi 的模型调用、工具循环、会话与权限协议都由各自
 //! ACP Agent 提供。
+//!
+//! 代码会话的领域状态（类型判定、绑定、sidecar/索引恢复、ACP 会话记录）已上提到
+//! `crate::features::code_sessions`；本模块只保留 ACP 运行时，并经 re-export
+//! 保持原有公开路径兼容。
 
 mod attachments;
 mod diagnostics;
@@ -11,7 +15,6 @@ mod latest;
 mod platform;
 pub(crate) mod reader_window;
 mod runtime;
-mod store;
 pub(crate) mod workspace;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -36,7 +39,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -44,6 +47,9 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wait_timeout::ChildExt;
 
+pub use crate::features::code_sessions::{
+    validate_codex_project_workspace, AgentBackend, CodexWorkspaceKind, SessionAgentStore,
+};
 use crate::features::sessions::{SessionKind, SessionStore};
 use attachments::{prepare_codex_prompt, CodexDisplayAttachment};
 use deepseek_tui::session_manager::SessionMetadata;
@@ -54,19 +60,17 @@ use runtime::{
     resolve_codex_path, system_codex_incompatible, version_at_least, ResolvedCodex,
     MIN_CODEX_VERSION,
 };
-pub use store::{
-    validate_codex_project_workspace, AgentBackend, CodexWorkspaceKind, SessionAgentStore,
+// 该常量原为本模块的 `pub const`，拆分后上提到 code_sessions；当前 crate 内无
+// 消费方，保留 re-export 只为维持 `codex_acp::CODEX_ACP_SESSION_MODEL` 路径兼容。
+#[allow(unused_imports)]
+pub use crate::features::code_sessions::CODEX_ACP_SESSION_MODEL;
+use crate::features::code_sessions::{
+    saved_config_values, AcpConfigDefaultsStore, CodeSessionCatalog, SessionAgentRecord,
+    CLAUDE_ACP_PACKAGE, CODEX_ACP_PACKAGE,
 };
-use store::{AcpConfigDefaultsStore, SessionAgentRecord};
 
 pub const CODEX_ACP_VERSION: &str = "1.1.5";
-pub const CODEX_ACP_SESSION_MODEL: &str = "Codex (ACP)";
-const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 pub const CLAUDE_ACP_VERSION: &str = "0.62.0";
-const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-const CLAUDE_ACP_SESSION_MODEL: &str = "Claude Code (ACP)";
-const KIMI_ACP_PACKAGE: &str = "kimi acp";
-const KIMI_ACP_SESSION_MODEL: &str = "Kimi (ACP)";
 /// claude-agent-acp 要求的最低 claude CLI 版本（输出形如 `2.1.163 (Claude Code)`）。
 const MIN_CLAUDE_VERSION: &str = "2.0.0";
 /// Kimi ACP 要求的最低 kimi CLI 版本（裸 semver；旧 Python 版 kimi-cli 已废弃）。
@@ -77,312 +81,6 @@ const CLAUDE_INSTALL_SCRIPT_UNIX: &str = "https://claude.ai/install.sh";
 const CLAUDE_INSTALL_SCRIPT_WINDOWS: &str = "https://claude.ai/install.ps1";
 const KIMI_INSTALL_SCRIPT_UNIX: &str = "https://code.kimi.com/kimi-code/install.sh";
 const KIMI_INSTALL_SCRIPT_WINDOWS: &str = "https://code.kimi.com/kimi-code/install.ps1";
-
-fn backend_for_session_model(model: &str) -> Option<AgentBackend> {
-    match model {
-        CODEX_ACP_SESSION_MODEL => Some(AgentBackend::CodexAcp),
-        CLAUDE_ACP_SESSION_MODEL => Some(AgentBackend::ClaudeAcp),
-        KIMI_ACP_SESSION_MODEL => Some(AgentBackend::KimiAcp),
-        _ => None,
-    }
-}
-
-fn acp_session_backend(backend: AgentBackend, model: &str) -> Option<AgentBackend> {
-    backend
-        .is_acp()
-        .then_some(backend)
-        .or_else(|| backend_for_session_model(model))
-}
-
-fn same_workspace(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
-fn backend_for_acp_state(state: &Value) -> Result<AgentBackend> {
-    let package_backend = match state["adapter"]["package"].as_str() {
-        Some(CODEX_ACP_PACKAGE) => Some(AgentBackend::CodexAcp),
-        Some(CLAUDE_ACP_PACKAGE) => Some(AgentBackend::ClaudeAcp),
-        Some(KIMI_ACP_PACKAGE) => Some(AgentBackend::KimiAcp),
-        Some(other) => bail!("acp-state.json 包含未知 ACP adapter package: {other}"),
-        None => None,
-    };
-    let agent_backend = state["adapter"]["agentId"]
-        .as_str()
-        .map(|agent_id| AgentBackend::parse(Some(agent_id)))
-        .transpose()?
-        .filter(|backend| backend.is_acp());
-    if let (Some(package), Some(agent)) = (package_backend, agent_backend) {
-        if package != agent {
-            bail!("acp-state.json 的 Agent 与 adapter package 不匹配");
-        }
-    }
-    agent_backend
-        .or(package_backend)
-        .context("acp-state.json 缺少可识别的 ACP Agent")
-}
-
-fn acp_mode_from_state(state: &Value) -> Option<String> {
-    acp_config_values_from_state(state)
-        .remove("mode")
-        .or_else(|| {
-            state["session"]["modes"]["currentModeId"]
-                .as_str()
-                .map(str::to_string)
-        })
-}
-
-fn acp_config_values_from_state(state: &Value) -> HashMap<String, String> {
-    state["session"]["config_options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|option| {
-            Some((
-                option["id"].as_str()?.to_string(),
-                option["currentValue"].as_str()?.to_string(),
-            ))
-        })
-        .collect()
-}
-
-fn saved_config_values(record: &SessionAgentRecord) -> HashMap<String, String> {
-    let mut values = record.acp_config_values.clone();
-    if let Some(model_id) = &record.acp_model_id {
-        values
-            .entry("model".to_string())
-            .or_insert_with(|| model_id.clone());
-    }
-    if let Some(mode_id) = &record.acp_mode_id {
-        values
-            .entry("mode".to_string())
-            .or_insert_with(|| mode_id.clone());
-    }
-    values
-}
-
-fn load_acp_config_values_from_state(
-    session_id: &str,
-    expected_backend: AgentBackend,
-) -> Result<HashMap<String, String>> {
-    let state_path = crate::platform::paths::sessions_root()
-        .join(session_id)
-        .join("acp-state.json");
-    let state: Value = serde_json::from_slice(
-        &std::fs::read(&state_path)
-            .with_context(|| format!("读取 {} 失败", state_path.display()))?,
-    )
-    .with_context(|| format!("解析 {} 失败", state_path.display()))?;
-    if backend_for_acp_state(&state)? != expected_backend {
-        bail!("acp-state.json 的 Agent 与会话元数据不匹配");
-    }
-    Ok(acp_config_values_from_state(&state))
-}
-
-fn acp_recovery_record(
-    pinvou_session_id: &str,
-    expected_backend: AgentBackend,
-    state: &Value,
-    workspace_path: PathBuf,
-    temporary_workspace: &Path,
-) -> Result<SessionAgentRecord> {
-    if state["pinvouSessionId"].as_str() != Some(pinvou_session_id) {
-        bail!("acp-state.json 的 Pinvou 会话 ID 不匹配");
-    }
-    if !expected_backend.is_acp() {
-        bail!("会话元数据不是 ACP Agent");
-    }
-    let state_backend = backend_for_acp_state(state)?;
-    if state_backend != expected_backend {
-        bail!(
-            "acp-state.json 的 Agent {} 与会话元数据 {} 不匹配",
-            state_backend.display_name(),
-            expected_backend.display_name()
-        );
-    }
-    let acp_session_id = state["session"]["session_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .context("acp-state.json 缺少原 ACP session id")?
-        .to_string();
-    if !workspace_path.is_absolute() {
-        bail!("ACP 工作目录记录不是绝对路径");
-    }
-    let workspace_kind = match state["workspace"]["kind"].as_str() {
-        Some("temporary") => {
-            if !same_workspace(&workspace_path, temporary_workspace) {
-                bail!("acp-state.json 的临时工作目录与会话目录不匹配");
-            }
-            CodexWorkspaceKind::Temporary
-        }
-        Some("project") => CodexWorkspaceKind::Project,
-        Some(other) => bail!("acp-state.json 包含未知工作目录类型: {other}"),
-        None if same_workspace(&workspace_path, temporary_workspace) => {
-            CodexWorkspaceKind::Temporary
-        }
-        None => CodexWorkspaceKind::Project,
-    };
-    Ok(SessionAgentRecord {
-        backend: expected_backend,
-        acp_session_id: Some(acp_session_id),
-        acp_model_id: state["session"]["current_model_id"]
-            .as_str()
-            .map(str::to_string),
-        acp_mode_id: acp_mode_from_state(state),
-        acp_config_values: acp_config_values_from_state(state),
-        workspace_kind,
-        workspace_path: (workspace_kind == CodexWorkspaceKind::Project).then_some(workspace_path),
-        code_session: false,
-        kind: Some(SessionKind::CodeAcp),
-    })
-}
-
-fn load_acp_recovery_record(
-    session_id: &str,
-    expected_backend: AgentBackend,
-    session_store: &SessionStore,
-) -> Result<SessionAgentRecord> {
-    let temporary_workspace = session_store.session_roots(session_id)?.execution;
-    let session_root = crate::platform::paths::sessions_root().join(session_id);
-    let state_path = session_root.join("acp-state.json");
-    let state: Value = serde_json::from_slice(
-        &std::fs::read(&state_path)
-            .with_context(|| format!("读取 {} 失败", state_path.display()))?,
-    )
-    .with_context(|| format!("解析 {} 失败", state_path.display()))?;
-    let workspace_path = if let Some(path) = state["workspace"]["path"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-    {
-        PathBuf::from(path)
-    } else {
-        let baseline_path = session_root.join("codex-workspace-baseline.json");
-        let baseline: Value = serde_json::from_slice(
-            &std::fs::read(&baseline_path)
-                .with_context(|| format!("读取 {} 失败", baseline_path.display()))?,
-        )
-        .with_context(|| format!("解析 {} 失败", baseline_path.display()))?;
-        baseline["workspace_path"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .context("Codex 工作区基线缺少 workspace_path")?
-    };
-    acp_recovery_record(
-        session_id,
-        expected_backend,
-        &state,
-        workspace_path,
-        &temporary_workspace,
-    )
-}
-
-/// 启动时原生代码会话 sidecar 恢复/回填/清理的统计，供真实恢复信号计数与测试断言。
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SidecarRecoverySummary {
-    /// 真实从 sidecar 恢复的索引记录数（索引完好不误报）。
-    restored: usize,
-    /// 索引在而 sidecar 缺失时按索引补写的 sidecar 数。
-    backfilled: usize,
-    /// 已被 ACP 会话占用、作为残留清理的 sidecar 数。
-    cleaned: usize,
-}
-
-/// 扫描 session 私有目录中的原生代码会话权威 sidecar，恢复辅助索引缺失的
-/// 原生代码会话记录，并回填索引在而 sidecar 缺失的记录。
-///
-/// sidecar（`code-session.json`）随会话存续，是跨进程的权威真相源；辅助索引
-/// `session-agents.json` 可损坏/丢失后据此重建。扫描根与 sidecar 读取根同源
-/// （均由辅助索引路径派生，见 `store::code_session_sidecar_root`），避免两处
-/// 根定义漂移。对每个 sidecar：索引已持有 `CodeNative` 记录时跳过（不误报
-/// 恢复）；会话已被 ACP 占用（`CodeAcp`）时 sidecar 属历史残留，直接清理而非
-/// 反复重试；其余情况据 sidecar 恢复索引（恢复记录写入显式 `CodeNative` kind）。
-fn restore_code_native_sessions_from_sidecars(
-    agents: &SessionAgentStore,
-) -> SidecarRecoverySummary {
-    let mut summary = SidecarRecoverySummary::default();
-    let sessions_root = store::code_session_sidecar_root(agents.path());
-    let entries = match std::fs::read_dir(&sessions_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // sessions 根不存在 = 没有任何会话，无需恢复。
-            return summary;
-        }
-        Err(error) => {
-            eprintln!(
-                "[pinvou3-app] scan native code session sidecars failed ({}): {error:#}",
-                sessions_root.display()
-            );
-            return summary;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                eprintln!(
-                    "[pinvou3-app] scan native code session sidecars failed to read an entry: {error:#}"
-                );
-                continue;
-            }
-        };
-        let session_dir = entry.path();
-        if !session_dir.is_dir() {
-            continue;
-        }
-        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(sidecar) = store::read_code_session_sidecar(agents.path(), session_id) else {
-            continue;
-        };
-        let record = agents.get(session_id);
-        if record.session_kind() == SessionKind::CodeNative {
-            // 索引完好无需恢复：不计入 restored，避免每次启动误报恢复信号。
-            continue;
-        }
-        if record.session_kind() == SessionKind::CodeAcp {
-            // 会话已被 ACP 绑定：sidecar 是历史残留，恢复必然被拒，直接清理并
-            // 如实记日志，而不是每次启动重复报 degraded。
-            store::remove_code_session_sidecar(agents.path(), session_id);
-            summary.cleaned += 1;
-            eprintln!(
-                "[pinvou3-app] removed leftover native code session sidecar for ACP session {session_id}"
-            );
-            continue;
-        }
-        match agents.restore_missing_code_session_record(session_id, sidecar) {
-            Ok(true) => {
-                summary.restored += 1;
-                eprintln!("[pinvou3-app] recovered native code session index for {session_id}");
-            }
-            Ok(false) => {}
-            Err(error) => eprintln!(
-                "[pinvou3-app] native code session {session_id} remains degraded: {error:#}"
-            ),
-        }
-    }
-    // 回填自愈：索引在而 sidecar 缺失（修复前构建的存量会话，或绑定时 sidecar
-    // 写失败）时按索引补写 sidecar，写失败逐条记日志。
-    summary.backfilled = agents.backfill_missing_code_session_sidecars();
-    if summary.restored > 0 {
-        eprintln!(
-            "[pinvou3-app] recovered {} native code session index record(s) from sidecars",
-            summary.restored
-        );
-    }
-    if summary.backfilled > 0 {
-        eprintln!(
-            "[pinvou3-app] backfilled {} missing native code session sidecar(s) from index",
-            summary.backfilled
-        );
-    }
-    summary
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexAcpStatus {
@@ -733,9 +431,9 @@ pub struct AcpPool {
     sessions: Arc<Mutex<HashMap<String, Arc<AcpSession>>>>,
     pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
-    agents: SessionAgentStore,
+    /// 代码会话目录（辅助索引 + ACP 元数据兜底）；类型/后端判定收口于此。
+    catalog: CodeSessionCatalog,
     config_defaults: AcpConfigDefaultsStore,
-    acp_metadata_backends: Arc<parking_lot::RwLock<HashMap<String, AgentBackend>>>,
     session_store: SessionStore,
     installing_agents: Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
     login_states: Arc<parking_lot::RwLock<HashMap<AgentBackend, AgentLoginState>>>,
@@ -845,63 +543,14 @@ impl AcpPool {
             eprintln!("[pinvou3-app] preload Codex session metadata failed: {error:#}");
             Vec::new()
         });
-        let acp_metadata_backends = metadata
-            .iter()
-            .filter_map(|metadata| {
-                acp_session_backend(agents.backend(&metadata.id), &metadata.model)
-                    .map(|backend| (metadata.id.clone(), backend))
-            })
-            .collect::<HashMap<_, _>>();
-        for (session_id, backend) in &acp_metadata_backends {
-            if agents.backend(session_id).is_acp() {
-                continue;
-            }
-            match load_acp_recovery_record(session_id, *backend, &session_store)
-                .and_then(|record| agents.restore_missing_acp_record(session_id, record))
-            {
-                Ok(()) => eprintln!(
-                    "[pinvou3-app] recovered {} ACP session index for {session_id}",
-                    backend.display_name()
-                ),
-                Err(error) => eprintln!(
-                    "[pinvou3-app] {} ACP session {session_id} remains read-only until its index can be recovered: {error:#}",
-                    backend.display_name()
-                ),
-            }
-        }
-        // 原生代码会话的权威 sidecar 恢复：sidecar 随 session 私有目录存续，辅助
-        // 索引（session-agents.json）损坏/丢失后，据 sidecar 恢复原生代码会话类型
-        // 与项目目录绑定，避免会话静默掉回普通聊天、执行根退回私有目录。
-        restore_code_native_sessions_from_sidecars(&agents);
         let config_defaults = AcpConfigDefaultsStore::load_or_empty();
-        // 旧版本只保存了 session 级状态。按更新时间从新到旧，为每个 Agent
-        // 迁移最近一次成功配置，使升级后的第一个新会话也能继承用户选择。
-        for item in &metadata {
-            let Some(backend) = acp_metadata_backends.get(&item.id).copied() else {
-                continue;
-            };
-            if config_defaults.has_backend(backend) {
-                continue;
-            }
-            let values = load_acp_config_values_from_state(&item.id, backend)
-                .unwrap_or_else(|_| saved_config_values(&agents.get(&item.id)));
-            match config_defaults.set_all_if_absent(backend, values) {
-                Ok(true) => eprintln!(
-                    "[pinvou3-app] migrated {} ACP defaults from session {}",
-                    backend.display_name(),
-                    item.id
-                ),
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "[pinvou3-app] failed to migrate {} ACP defaults: {error:#}",
-                    backend.display_name()
-                ),
-            }
-        }
+        // 代码会话领域状态装配收口在 code_sessions：ACP 元数据兜底表构建、缺失
+        // ACP 索引恢复、原生代码会话 sidecar 恢复/回填、旧版本默认配置迁移。
+        let catalog = CodeSessionCatalog::boot(agents, &session_store, &config_defaults, &metadata);
         // 新进程无法继续持有上次进程里的 ACP prompt future。恢复原 Agent session
         // 只恢复对话上下文，不会重新挂接当时正在等待的 prompt；因此必须在任何
         // runtime lazy spawn 之前，把 timeline 中遗留的 running 回合收口。
-        for session_id in acp_metadata_backends.keys() {
+        for session_id in catalog.acp_session_ids() {
             let bridge = EventBridge::new(app.clone(), session_id.clone());
             let interrupted = bridge.interrupt_orphaned_turns("application_restarted");
             if interrupted > 0 {
@@ -915,9 +564,8 @@ impl AcpPool {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            agents,
+            catalog,
             config_defaults,
-            acp_metadata_backends: Arc::new(parking_lot::RwLock::new(acp_metadata_backends)),
             session_store,
             installing_agents: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             login_states: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -935,7 +583,7 @@ impl AcpPool {
     }
 
     pub fn agents(&self) -> &SessionAgentStore {
-        &self.agents
+        self.catalog.agents()
     }
 
     /// 会话类型以 ACP 辅助索引为主，并用 SavedSession 中持久化的 Agent 模型类型兜底。
@@ -943,73 +591,38 @@ impl AcpPool {
     /// `session-agents.json` 是可重建的辅助索引，缺失或损坏时不能让历史 Codex
     /// / Claude / Kimi 会话掉回普通聊天列表；创建会话时写入的 `* (ACP)` 元数据
     /// 是长期兼容依据。列表调用已经持有 metadata，应使用本方法避免重复读取 transcript。
+    ///
+    /// 判定实现收口在 [`CodeSessionCatalog`]，本方法仅为运行时门面。
     pub fn is_acp_metadata(&self, metadata: &SessionMetadata) -> bool {
-        let backend = self.agents.backend(&metadata.id);
-        let Some(backend) = acp_session_backend(backend, &metadata.model) else {
-            return false;
-        };
-        if !self.acp_metadata_backends.read().contains_key(&metadata.id) {
-            self.acp_metadata_backends
-                .write()
-                .insert(metadata.id.clone(), backend);
-        }
-        true
+        self.catalog.is_acp_metadata(metadata)
     }
 
     pub fn is_acp(&self, session_id: &str) -> bool {
-        self.agents.backend(session_id).is_acp()
-            || self.acp_metadata_backends.read().contains_key(session_id)
+        self.catalog.is_acp(session_id)
     }
 
     /// 会话类型判定（含 ACP 元数据兜底）：以 `SessionAgentStore::session_kind`
     /// 为唯一类型真相源；辅助索引缺失、仅凭元数据兜底识别出的 ACP 会话仍判
     /// `CodeAcp`，与 [`Self::is_acp`] 保持一致（`is_acp()` ⟺ kind == `CodeAcp`）。
     pub fn session_kind(&self, session_id: &str) -> SessionKind {
-        match self.agents.session_kind(session_id) {
-            SessionKind::Chat
-                if self.acp_metadata_backends.read().contains_key(session_id) =>
-            {
-                SessionKind::CodeAcp
-            }
-            kind => kind,
-        }
+        self.catalog.session_kind(session_id)
     }
 
     pub fn backend(&self, session_id: &str) -> AgentBackend {
-        let backend = self.agents.backend(session_id);
-        if backend.is_acp() {
-            backend
-        } else {
-            self.acp_metadata_backends
-                .read()
-                .get(session_id)
-                .copied()
-                .unwrap_or(backend)
-        }
+        self.catalog.backend(session_id)
     }
 
     fn acp_record(&self, session_id: &str) -> Result<SessionAgentRecord> {
-        let record = self.agents.get(session_id);
-        if record.backend.is_acp() {
-            return Ok(record);
-        }
-        if let Some(backend) = self.acp_metadata_backends.read().get(session_id).copied() {
-            bail!(
-                "{} 会话辅助索引缺失，且无法从 acp-state.json 与工作区基线完整恢复；\
-                 为避免在错误目录新建上下文，当前会话仅允许查看历史",
-                backend.display_name()
-            );
-        }
-        bail!("会话不是 ACP 会话")
+        self.catalog.acp_record(session_id)
     }
 
     pub fn workspace_info(&self, session_id: &str) -> Result<CodexAcpWorkspaceInfo> {
-        let record = self.agents.get(session_id);
+        let record = self.catalog.agents().get(session_id);
         if record.session_kind() == SessionKind::CodeNative {
             return code_native_workspace_info(&self.session_store, session_id, &record);
         }
         if !record.backend.is_acp() {
-            if self.acp_metadata_backends.read().contains_key(session_id) {
+            if self.catalog.is_acp(session_id) {
                 return Ok(CodexAcpWorkspaceInfo {
                     workspace_kind: CodexWorkspaceKind::Temporary,
                     workspace_path: "辅助索引缺失，无法安全恢复原工作目录".to_string(),
@@ -1040,7 +653,7 @@ impl AcpPool {
     }
 
     fn execution_workspace(&self, session_id: &str) -> Result<PathBuf> {
-        let record = self.agents.get(session_id);
+        let record = self.catalog.agents().get(session_id);
         // 防御性保留，当前不可达：两个调用方（prompt / ensure ACP runtime）都在
         // 上游通过 is_acp / acp_record 拒绝了原生代码会话；保留本分支是为了让
         // 未来直接使用本方法的路径对原生代码会话也有正确语义。
@@ -1854,7 +1467,7 @@ impl AcpPool {
             let mut sessions = self.sessions.lock().await;
             let session_ids = sessions
                 .keys()
-                .filter(|session_id| self.agents.backend(session_id) == backend)
+                .filter(|session_id| self.catalog.agents().backend(session_id) == backend)
                 .cloned()
                 .collect::<Vec<_>>();
             session_ids
@@ -2180,7 +1793,8 @@ impl AcpPool {
         let backend = self.backend(session_id);
         let mut errors = Vec::new();
         if let Err(error) = self
-            .agents
+            .catalog
+            .agents()
             .set_acp_config_value(session_id, config_id, value_id)
         {
             errors.push(format!("会话配置: {error:#}"));
@@ -2613,7 +2227,9 @@ impl AcpPool {
             AgentBackend::Deepseek => bail!("当前会话不是 ACP 会话"),
         };
         let workspace = self.execution_workspace(pinvou_session_id)?;
-        if self.agents.get(pinvou_session_id).workspace_kind == CodexWorkspaceKind::Temporary {
+        if self.catalog.agents().get(pinvou_session_id).workspace_kind
+            == CodexWorkspaceKind::Temporary
+        {
             tokio::fs::create_dir_all(&workspace).await?;
         }
 
@@ -2837,7 +2453,7 @@ impl AcpPool {
             }
         };
 
-        let saved = self.agents.get(pinvou_session_id);
+        let saved = self.catalog.agents().get(pinvou_session_id);
         let desired_config_values = if saved.acp_session_id.is_some() {
             saved_config_values(&saved)
         } else {
@@ -2885,7 +2501,7 @@ impl AcpPool {
         let models = codex_models(&config_options);
         let config_values = config_values_from_options(&config_options, &mode_state);
         let prompt_capabilities = initialized.agent_capabilities.prompt_capabilities.clone();
-        self.agents.set_acp_session(
+        self.catalog.agents().set_acp_session(
             pinvou_session_id,
             acp_session_id.clone(),
             current_model_id.clone(),
@@ -4572,131 +4188,6 @@ mod tests {
     }
 
     #[test]
-    fn acp_session_classification_survives_missing_auxiliary_index() {
-        assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, CODEX_ACP_SESSION_MODEL),
-            Some(AgentBackend::CodexAcp)
-        );
-        assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, CLAUDE_ACP_SESSION_MODEL),
-            Some(AgentBackend::ClaudeAcp)
-        );
-        assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, KIMI_ACP_SESSION_MODEL),
-            Some(AgentBackend::KimiAcp)
-        );
-        assert_eq!(
-            acp_session_backend(AgentBackend::ClaudeAcp, "unexpected legacy model"),
-            Some(AgentBackend::ClaudeAcp)
-        );
-        assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, "deepseek-chat"),
-            None
-        );
-    }
-
-    #[test]
-    fn acp_recovery_preserves_original_agent_session_mode_and_workspace() {
-        let state = json!({
-            "pinvouSessionId": "pinvou-session",
-            "adapter": {
-                "agentId": "kimi",
-                "package": KIMI_ACP_PACKAGE,
-            },
-            "session": {
-                "session_id": "acp-session",
-                "current_model_id": "kimi-test",
-                "modes": {
-                    "currentModeId": "stale-agent-mode",
-                    "availableModes": [],
-                },
-                "config_options": [
-                    {
-                        "id": "mode",
-                        "currentValue": "auto",
-                    },
-                    {
-                        "id": "reasoning_effort",
-                        "currentValue": "high",
-                    }
-                ],
-            },
-        });
-        // 用平台相关的绝对路径（/tmp 在 Windows 上不是绝对路径）。
-        let temporary = std::env::temp_dir().join("pinvou-session-workspace");
-        let project = std::env::temp_dir().join("pinvou-project");
-        let recovered = acp_recovery_record(
-            "pinvou-session",
-            AgentBackend::KimiAcp,
-            &state,
-            project.clone(),
-            &temporary,
-        )
-        .unwrap();
-
-        assert_eq!(recovered.backend, AgentBackend::KimiAcp);
-        assert_eq!(recovered.acp_session_id.as_deref(), Some("acp-session"));
-        assert_eq!(recovered.acp_model_id.as_deref(), Some("kimi-test"));
-        assert_eq!(recovered.acp_mode_id.as_deref(), Some("auto"));
-        assert_eq!(
-            recovered.acp_config_values.get("reasoning_effort"),
-            Some(&"high".to_string())
-        );
-        assert_eq!(recovered.workspace_kind, CodexWorkspaceKind::Project);
-        assert_eq!(recovered.workspace_path, Some(project));
-
-        let temporary_recovered = acp_recovery_record(
-            "pinvou-session",
-            AgentBackend::KimiAcp,
-            &state,
-            temporary.clone(),
-            &temporary,
-        )
-        .unwrap();
-        assert_eq!(
-            temporary_recovered.workspace_kind,
-            CodexWorkspaceKind::Temporary
-        );
-        assert_eq!(temporary_recovered.workspace_path, None);
-    }
-
-    #[test]
-    fn acp_recovery_rejects_incomplete_or_mismatched_state() {
-        let state = json!({
-            "pinvouSessionId": "pinvou-session",
-            "adapter": {
-                "agentId": "claude",
-                "package": CLAUDE_ACP_PACKAGE,
-            },
-            "session": {},
-        });
-        assert!(acp_recovery_record(
-            "pinvou-session",
-            AgentBackend::ClaudeAcp,
-            &state,
-            PathBuf::from("/tmp/pinvou-project"),
-            Path::new("/tmp/pinvou-session-workspace"),
-        )
-        .is_err());
-        let mismatched = json!({
-            "pinvouSessionId": "pinvou-session",
-            "adapter": {
-                "agentId": "claude",
-                "package": CLAUDE_ACP_PACKAGE,
-            },
-            "session": { "session_id": "claude-session" },
-        });
-        assert!(acp_recovery_record(
-            "pinvou-session",
-            AgentBackend::KimiAcp,
-            &mismatched,
-            PathBuf::from("/tmp/pinvou-project"),
-            Path::new("/tmp/pinvou-session-workspace"),
-        )
-        .is_err());
-    }
-
-    #[test]
     fn managed_path_is_versioned() {
         let path = managed_adapter_path().to_string_lossy().into_owned();
         assert!(path.contains(CODEX_ACP_VERSION));
@@ -5339,98 +4830,5 @@ max_context_size = 262144
         assert!(!kimi_version_supported("kimi-cli 0.31.1"));
         assert!(!kimi_version_supported("0.31"));
         assert!(!kimi_version_supported("native"));
-    }
-
-    #[test]
-    fn sidecar_startup_recovery_restores_backfills_and_cleans_leftovers() {
-        let root = std::env::temp_dir().join(format!(
-            "pinvou3-sidecar-startup-recovery-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("session-agents.json");
-        // 写入一个已绑定的原生代码会话（索引 + sidecar）。
-        let writer = SessionAgentStore::for_test(path.clone());
-        writer
-            .bind_code_native_session("code-1", CodexWorkspaceKind::Project, Some(root.clone()))
-            .unwrap();
-        // 模拟辅助索引丢失：空内存索引 + 磁盘 sidecar 仍在 → 真实恢复一次。
-        let agents = SessionAgentStore::for_test(path.clone());
-        let summary = restore_code_native_sessions_from_sidecars(&agents);
-        assert_eq!(
-            summary,
-            SidecarRecoverySummary {
-                restored: 1,
-                backfilled: 0,
-                cleaned: 0
-            }
-        );
-        assert_eq!(agents.session_kind("code-1"), SessionKind::CodeNative);
-        assert_eq!(
-            agents.get("code-1").kind,
-            Some(SessionKind::CodeNative),
-            "恢复路径必须写入显式 kind"
-        );
-        assert_eq!(
-            agents.get("code-1").workspace_path.as_deref(),
-            Some(root.as_path())
-        );
-        // 索引完好时不再误报恢复信号。
-        let summary = restore_code_native_sessions_from_sidecars(&agents);
-        assert_eq!(summary, SidecarRecoverySummary::default());
-        // sidecar 缺失（存量会话/绑定时写失败）时按索引回填自愈。
-        let sidecar_path = root
-            .join("sessions")
-            .join("code-1")
-            .join("code-session.json");
-        std::fs::remove_file(&sidecar_path).unwrap();
-        let summary = restore_code_native_sessions_from_sidecars(&agents);
-        assert_eq!(
-            summary,
-            SidecarRecoverySummary {
-                restored: 0,
-                backfilled: 1,
-                cleaned: 0
-            }
-        );
-        assert!(sidecar_path.is_file());
-        // ACP 会话的残留 sidecar：清理一次并如实计数，而不是每次启动报 degraded。
-        agents
-            .set_acp_workspace(
-                "acp-1",
-                AgentBackend::CodexAcp,
-                CodexWorkspaceKind::Temporary,
-                None,
-            )
-            .unwrap();
-        let leftover_dir = root.join("sessions").join("acp-1");
-        std::fs::create_dir_all(&leftover_dir).unwrap();
-        std::fs::write(
-            leftover_dir.join("code-session.json"),
-            serde_json::to_vec(&store::CodeSessionSidecar {
-                version: 1,
-                workspace_kind: CodexWorkspaceKind::Temporary,
-                workspace_path: None,
-                bound_at: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let summary = restore_code_native_sessions_from_sidecars(&agents);
-        assert_eq!(
-            summary,
-            SidecarRecoverySummary {
-                restored: 0,
-                backfilled: 0,
-                cleaned: 1
-            }
-        );
-        assert!(!leftover_dir.join("code-session.json").exists());
-        assert_eq!(agents.get("acp-1").backend, AgentBackend::CodexAcp);
-        // 残留已清理：再次启动扫描无任何动作。
-        let summary = restore_code_native_sessions_from_sidecars(&agents);
-        assert_eq!(summary, SidecarRecoverySummary::default());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

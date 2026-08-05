@@ -174,7 +174,8 @@ fn code_session_sidecar_version() -> u32 {
 
 /// 原生代码会话 sidecar 的根目录：`<session-agents.json 父目录>/sessions`。
 /// 生产为 `~/.pinvou3/sessions`，测试随 store.path 一并隔离。
-/// 启动扫描（mod.rs）与 sidecar 读写共用本函数，保证「扫描根 == 读取根」单一来源。
+/// 启动扫描（`super::restore_code_native_sessions_from_sidecars`）与 sidecar 读写
+/// 共用本函数，保证「扫描根 == 读取根」单一来源。
 pub(super) fn code_session_sidecar_root(store_path: &Path) -> PathBuf {
     store_path
         .parent()
@@ -426,7 +427,7 @@ impl SessionAgentStore {
         // 先持久化辅助索引，再清理权威 sidecar：persist 失败时 sidecar 仍在，与
         // 磁盘索引保持一致，不会出现「sidecar 已删、索引未更新」的中间态；若 sidecar
         // 清理失败，残留 sidecar 会在下次启动扫描时被识别为 ACP 会话残留并清理
-        // （见 mod.rs `restore_code_native_sessions_from_sidecars`）。
+        // （见 `super::restore_code_native_sessions_from_sidecars`）。
         self.persist()?;
         // 该会话不再是原生代码会话：清理权威 sidecar，防止辅助索引重建时误恢复。
         remove_code_session_sidecar(&self.path, session_id);
@@ -581,7 +582,7 @@ impl SessionAgentStore {
         self.persist()
     }
 
-    pub(super) fn restore_missing_acp_record(
+    pub(crate) fn restore_missing_acp_record(
         &self,
         session_id: &str,
         recovered: SessionAgentRecord,
