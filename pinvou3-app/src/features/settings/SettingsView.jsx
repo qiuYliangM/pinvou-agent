@@ -532,8 +532,9 @@ const SCard = React.forwardRef(({ isDark, title, titleAdornment, children, id, s
     };
 
     // 输入框底栏:模型选择器(iOS 化,复用 ModelChip 的 switchModel 逻辑;darkMode:'class' 故用 dark: 变体)。
-    // 可选“显式会话态驱动”props（代码模块原生车道用）：sessionId/sessionModelId/
-    // busy/onSwitchModel 传入时绕开 bridge 聊天 active 绑定；不传走原 bs/bridge 路径。
+    // 驱动方式统一为「显式会话态 props」：sessionId/sessionModelId/busy/onSwitchModel
+    // 传入时绕开 bridge 聊天 active 绑定；「回落 bridge active」只保留在聊天页
+    // （ChatView）调用路径，不传时走原 bs/bridge 路径，聊天页行为不变。
     const ComposerModelSelector = ({ t, bs, onGotoSettings, compact, sessionId: sessionIdProp, sessionModelId: sessionModelIdProp, busy: busyProp, onSwitchModel }) => {
       const [open, setOpen] = useState(false);
       const triggerRef = useRef(null);

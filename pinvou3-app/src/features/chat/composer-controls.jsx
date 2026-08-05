@@ -1,10 +1,11 @@
 // 聊天/代码页共用的输入框底栏控件。
 //
-// 从 ChatView 提取（2026-08）：原定义在 ChatView 组件体内。为支持代码模块原生
-// （品悟）车道复用，三个控件都接受可选的“显式会话态驱动”props：传入时绕开
-// bridge 聊天 active 绑定（bridge 的 models/knowledge/interaction 方法都绑聊天
-// activeSession 且 ensureSession 会物化聊天会话，代码车道必须直调 invoke 显式
-// 传 sessionId）；不传时走原 bs/bridge 路径，聊天页行为不变。
+// 驱动方式统一为「显式会话态 props」：传入 mountedId/onMount/onUnmount、
+// mode/busy/onSwitch 时绕开 bridge 聊天 active 绑定（bridge 的 models/knowledge/
+// interaction 方法都绑聊天 activeSession 且 ensureSession 会物化聊天会话，
+// 会话作用域场景必须直调 invoke 显式传 sessionId——代码页经会话作用域原语
+// session-conversation + 会话类型 adapter 全部显式传入）；「回落 bridge active」
+// 只保留在聊天页（ChatView）调用路径，不传 props 时行为不变。
 
 import React, { useEffect, useRef, useState } from 'react';
 import { BookOpen, Check, ChevronDown, ClipboardList, X, Zap } from '../../components/icons.jsx';

@@ -116,10 +116,14 @@ assert.equal(
   'Kimi missing model configuration must offer account recovery instead of generic downtime',
 );
 
-const view = await readFile(
-  new URL('../src/features/codex/CodexAcpView.jsx', import.meta.url),
-  'utf8',
-);
+// 视图主体 + ACP adapter：运行时安装/登录状态机已收编进 acp-code-adapter，
+// 契约按两者合并后的代码页整体断言。
+const view = await Promise.all(
+  ['CodexAcpView.jsx', 'acp-code-adapter.jsx'].map(file => readFile(
+    new URL(`../src/features/codex/${file}`, import.meta.url),
+    'utf8',
+  )),
+).then(parts => parts.join('\n'));
 assert.match(
   view,
   /refreshStatus\(activeAgentId, true\)\.catch\(showError\)/,
@@ -132,7 +136,7 @@ assert.match(
 );
 assert.match(
   view,
-  /operation=\{activeRuntimeOperation\}/,
+  /operation=\{adapter\.runtimeOperation\}/,
   'the runtime notice must only consume the active Agent operation',
 );
 assert.match(

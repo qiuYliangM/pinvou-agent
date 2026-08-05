@@ -7,28 +7,14 @@ import {
 import { AcpAgentLogo } from './AcpAgentLogo.jsx';
 import { CodexWorkspacePanel } from './CodexWorkspacePanel.jsx';
 import {
-  classifyAcpServiceFailure,
-  isAcpAuthenticationFailure,
   runtimeInstallInProgress,
   runtimeLoginInProgress,
   runtimeNoticeMode,
-  runtimeOperationFor,
 } from './runtimeNoticeState.js';
 import { ComposerPopover } from '../../components/ComposerPopover.jsx';
-import {
-  appendAcpEvent,
-  commandExecutionDetails,
-  projectAcpTimeline,
-  resolveAcpSessionControls,
-} from './acp-state.js';
-import {
-  applyNativeChatEvent,
-  appendLocalUserMessage,
-  createNativeLane,
-  hydrateNativeLane,
-  projectNativeLane,
-  removeLocalUserMessage,
-} from './code-native-lane.js';
+import { commandExecutionDetails } from './acp-state.js';
+import { ElicitationCard, useAcpCodeAdapter } from './acp-code-adapter.jsx';
+import { useNativeCodeAdapter } from './native-code-adapter.jsx';
 import {
   ConversationActivityIndicator,
   ConversationMarkdown,
@@ -39,14 +25,11 @@ import { assistantResponseAvailable, assistantResponseText } from '../conversati
 import {
   ComposerToolMenu,
 } from '../settings/SettingsView.jsx';
-import { visibleUserModels } from '../../shared/model-options.js';
 import { isNearConversationBottom } from '../conversation/conversation-model.js';
-import { QuestionChoiceCard } from '../conversation/QuestionChoiceCard.jsx';
 import { AttachmentChips } from '../attachments/AttachmentChips.jsx';
 import { HomeModeSwitcher } from '../conversation/HomeModeSwitcher.jsx';
 import {
   invokeTauri,
-  listenTauri,
   openTauriDialog,
 } from '../../platform/tauri/client.js';
 
@@ -54,7 +37,6 @@ const invoke = invokeTauri;
 const RECENT_WORKSPACES_KEY = 'pinvou_codex_recent_workspaces';
 const UNIFIED_CONVERSATION_UI_KEY = 'pinvou_conversation_ui_v2';
 const DRAFT_ATTACHMENT_KEY = '__codex_draft__';
-const DRAFT_CONTROLS_CACHE_KEY = 'pinvou_codex_draft_controls';
 
 function unifiedConversationUiEnabled() {
   try {
@@ -93,62 +75,6 @@ function forgetWorkspace(path) {
     // localStorage 不可用时仍允许当前窗口继续创建新会话。
   }
   return next;
-}
-
-// 草稿态（尚未创建会话）也需要展示模型/权限模式/推理强度等选项：ACP 的配置项是会话级的，
-// 这里缓存每个 agent 最近一次会话上报的配置快照，供新会话草稿预展示和预选。
-function loadDraftControlsCache() {
-  try {
-    const value = JSON.parse(localStorage.getItem(DRAFT_CONTROLS_CACHE_KEY) || '{}');
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  } catch {
-    return {};
-  }
-}
-
-function snapshotSessionControls(info) {
-  if (!info) return null;
-  const snapshot = {
-    models: Array.isArray(info.models) ? info.models : [],
-    current_model_id: info.current_model_id || '',
-    modes: info.modes || null,
-    config_options: Array.isArray(info.config_options) ? info.config_options : [],
-  };
-  if (!snapshot.models.length && !snapshot.modes && !snapshot.config_options.length) return null;
-  return snapshot;
-}
-
-function rememberDraftControls(agentId, info) {
-  const snapshot = snapshotSessionControls(info);
-  if (!agentId || !snapshot) return null;
-  const cache = { ...loadDraftControlsCache(), [agentId]: snapshot };
-  try {
-    localStorage.setItem(DRAFT_CONTROLS_CACHE_KEY, JSON.stringify(cache));
-  } catch {
-    // 缓存写不进去时仅影响下次草稿预展示，本次会话不受影响。
-  }
-  return snapshot;
-}
-
-function configChoices(option) {
-  const raw = option && option.options;
-  if (!Array.isArray(raw)) return [];
-  if (raw.every(item => item && Array.isArray(item.options))) {
-    return raw.flatMap(group => group.options || []);
-  }
-  return raw;
-}
-
-function configLabel(option, copy) {
-  const labels = copy?.configLabels || {};
-  switch (option && option.id) {
-    case 'mode': return labels.mode || '';
-    case 'collaboration_mode': return labels.collaboration_mode || '';
-    case 'model': return labels.model || '';
-    case 'reasoning_effort': return labels.reasoning_effort || '';
-    case 'fast-mode': return labels['fast-mode'] || '';
-    default: return option && option.name || '';
-  }
 }
 
 function CodexComposerConfigSelect({
@@ -476,165 +402,6 @@ function PermissionCard({ permission, pending, onRespond, responding, agentName,
         </div>
       </div>
     </div>
-  );
-}
-
-function ElicitationCard({ elicitation, pending, onRespond, responding, copy, conversationCopy }) {
-  const request = elicitation.request || {};
-  const schema = request.requestedSchema || {};
-  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
-  const fields = Object.entries(schema.properties || {});
-  const otherFields = new Map(fields
-    .filter(([, field]) => field && field._meta && field._meta.codex && field._meta.codex.isOtherAnswer)
-    .map(([id, field]) => [String(field._meta.codex.questionId || ''), { id, field }]));
-  const questions = fields.filter(([, field]) => (
-    !(field && field._meta && field._meta.codex && field._meta.codex.isOtherAnswer)
-  ));
-  const actionable = !!pending && !elicitation.resolved;
-
-  function choices(field) {
-    if (Array.isArray(field && field.oneOf)) {
-      return field.oneOf.map(option => ({
-        value: option && option.const,
-        label: option && (option.title || option.const),
-        description: option && option.description,
-      })).filter(option => option.value != null);
-    }
-    if (Array.isArray(field && field.enum)) {
-      return field.enum.map(value => ({ value, label: String(value), description: '' }));
-    }
-    return [];
-  }
-
-  const normalizedQuestions = questions.map(([id, field]) => {
-    const other = otherFields.get(id);
-    return {
-      id,
-      answerKey: id,
-      otherAnswerKey: other && other.id,
-      header: field.title || id,
-      question: field.description || '',
-      options: choices(field),
-      allowOther: Boolean(other),
-      otherPlaceholder: other && (other.field.title || (conversationCopy && conversationCopy.otherPlaceholder)),
-      required: required.has(id)
-        || Boolean(field && field._meta && field._meta.codex && field._meta.codex.isOther),
-      inputType: field.type || 'string',
-      secret: Boolean(field && field._meta && field._meta.codex && field._meta.codex.isSecret),
-    };
-  });
-
-  function submit(groups) {
-    const content = {};
-    for (const group of groups) {
-      const custom = group.answers.find(answer => answer.other);
-      if (custom && group.otherAnswerKey) {
-        content[group.otherAnswerKey] = custom.value;
-      } else if (group.multiSelect) {
-        content[group.answerKey] = group.answers.map(answer => answer.value);
-      } else if (group.answers[0]) {
-        content[group.answerKey] = group.answers[0].value;
-      }
-    }
-    onRespond(elicitation.elicitationId, 'accept', content);
-  }
-
-  return (
-    <QuestionChoiceCard
-      title={copy.choiceTitle}
-      description={request.message && request.message !== 'Input requested' ? request.message : ''}
-      questions={normalizedQuestions}
-      resolved={!actionable}
-      submitting={responding}
-      submitLabel={copy.submit}
-      cancelLabel={copy.cancel}
-      otherAnswerLabel={conversationCopy && conversationCopy.otherAnswer}
-      inputPlaceholder={conversationCopy && conversationCopy.inputPlaceholder}
-      statusText={!actionable
-        ? elicitation.resolved
-          ? (elicitation.action === 'accept' ? copy.submitted : copy.canceled)
-          : copy.inputExpired
-        : ''}
-      onSubmit={submit}
-      onCancel={actionable
-        ? () => onRespond(elicitation.elicitationId, 'cancel', {})
-        : undefined}
-    />
-  );
-}
-
-// 原生（品悟 Engine）会话的选择确认卡：chat:user_input_required → submit_user_input。
-// 选项归一化逻辑与主聊天 UserInputCard 对齐（allow_free_text / multi_select），
-// 但提交走显式 sessionId，不依赖 bridge 全局 activeSession。
-const NATIVE_CHAT_EVENTS = [
-  'chat:user_message',
-  'chat:turn_started',
-  'chat:reasoning_start',
-  'chat:reasoning_delta',
-  'chat:reasoning_done',
-  'chat:delta',
-  'chat:tool_start',
-  'chat:tool_delta',
-  'chat:tool_end',
-  'chat:shell_task_status',
-  'chat:compaction',
-  'chat:usage',
-  'chat:user_input_required',
-  'chat:transient_error',
-  'chat:done',
-];
-
-function isFreeTextPlaceholderOption(option) {
-  const label = String(option?.label || '').trim();
-  return /^(?:其他|其它|other)(?:\s*[\(（][^()（）]*[\)）])?$/i.test(label);
-}
-
-function NativeUserInputCard({ item, responding, onSubmitAnswers, onCancelInput, copy, conversationCopy }) {
-  const questions = (item.questions || []).map((question, index) => {
-    const allowOther = question.allow_free_text !== false;
-    return {
-      id: question.id || `question-${index + 1}`,
-      header: question.header || `Q${index + 1}`,
-      question: question.question || '',
-      options: (question.options || [])
-        .filter(option => !allowOther || !isFreeTextPlaceholderOption(option))
-        .map(option => ({
-          value: option.label,
-          label: option.label,
-          description: option.description || '',
-        })),
-      allowOther,
-      multiSelect: Boolean(question.multi_select),
-      required: !question.multi_select,
-    };
-  });
-  const actionable = !item.resolved;
-
-  function submit(groups) {
-    const answers = groups.flatMap(group => group.answers.map(answer => ({
-      id: group.questionId,
-      label: answer.other ? (conversationCopy && conversationCopy.otherAnswer) || answer.label : answer.label,
-      value: String(answer.value),
-    })));
-    onSubmitAnswers(item.toolCallId, answers);
-  }
-
-  return (
-    <QuestionChoiceCard
-      title={copy.choiceTitle}
-      questions={questions}
-      resolved={!actionable}
-      submitting={responding}
-      submitLabel={copy.submit}
-      cancelLabel={copy.cancel}
-      otherAnswerLabel={conversationCopy && conversationCopy.otherAnswer}
-      inputPlaceholder={conversationCopy && conversationCopy.inputPlaceholder}
-      statusText={!actionable
-        ? (item.cardState === 'cancelled' ? copy.canceled : copy.submitted)
-        : ''}
-      onSubmit={submit}
-      onCancel={actionable ? () => onCancelInput(item.toolCallId) : undefined}
-    />
   );
 }
 
@@ -994,6 +761,11 @@ function AgentServiceFailureNotice({
   );
 }
 
+// 代码会话视图（ACP + 原生品悟 Engine）。会话类型差异收编进两个 adapter
+// （acp-code-adapter / native-code-adapter）：视图主体只消费统一 adapter 接口
+// （turns/busy/sessionReady/send/cancel/renderItem/composer/capabilities），
+// isNativeAgent 三元分流不再散落视图；唯一的类型分发是 adapter 选择与
+// loadSession 的会话类型判断。
 export function CodexAcpView({
   theme,
   t,
@@ -1009,12 +781,6 @@ export function CodexAcpView({
   const codexCopy = t.uiCodex;
   const [agents, setAgents] = useState([]);
   const [draftAgentId, setDraftAgentId] = useState('codex');
-  const [status, setStatus] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [pending, setPending] = useState([]);
-  const [pendingElicitations, setPendingElicitations] = useState([]);
-  const [sessionInfo, setSessionInfo] = useState(null);
-  const [sessionInfoSessionId, setSessionInfoSessionId] = useState(null);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [draft, setDraft] = useState('');
   const [attachmentDrafts, setAttachmentDrafts] = useState({});
@@ -1023,10 +789,7 @@ export function CodexAcpView({
   const [workspaceChangeCount, setWorkspaceChangeCount] = useState(0);
   const [now, setNow] = useState(Date.now());
   const useUnifiedConversationUi = unifiedConversationUiEnabled();
-  const [configApplying, setConfigApplying] = useState('');
   const [working, setWorking] = useState(false);
-  const [runtimeOperations, setRuntimeOperations] = useState({});
-  const [runtimeErrors, setRuntimeErrors] = useState({});
   const [error, setError] = useState('');
   const showError = (nextError) => {
     console.error('Codex operation failed:', nextError);
@@ -1035,13 +798,8 @@ export function CodexAcpView({
   const [responding, setResponding] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
-  const [dismissedFailureKey, setDismissedFailureKey] = useState('');
   const [draftWorkspacePath, setDraftWorkspacePath] = useState(null);
   const [recentWorkspaces, setRecentWorkspaces] = useState(loadRecentWorkspaces);
-  const [draftControlsCache, setDraftControlsCache] = useState(loadDraftControlsCache);
-  // 草稿态（会话未创建）下用户预选的配置：{ [agentId]: { model?, mode?, configs: { [id]: value } } }
-  const [draftConfigSelections, setDraftConfigSelections] = useState({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const scroller = useRef(null);
   const autoScrollRef = useRef(true);
@@ -1053,152 +811,16 @@ export function CodexAcpView({
   const draftEpochRef = useRef(draftEpoch);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
-  const projection = useMemo(() => projectAcpTimeline(events), [events]);
-  // 草稿态（!activeId）没有会话，退回使用该 agent 缓存的配置快照来预展示选项。
-  const draftControlsInfo = !activeId ? draftControlsCache[draftAgentId] || null : null;
-  const sessionControlsInfo = sessionInfoSessionId === activeId ? sessionInfo : null;
-  const controls = useMemo(
-    () => resolveAcpSessionControls(sessionControlsInfo || draftControlsInfo),
-    [sessionControlsInfo, draftControlsInfo],
-  );
-  const draftConfigSelection = draftConfigSelections[draftAgentId] || null;
-  const composerControlsVisible = Boolean(sessionControlsInfo || draftControlsInfo);
-  // 有会话时以会话上报为准；草稿态优先显示用户预选，其次显示缓存快照里的当前值。
-  const composerModelValue = sessionControlsInfo
-    ? sessionControlsInfo.current_model_id || ''
-    : (draftConfigSelection && draftConfigSelection.model)
-      || (draftControlsInfo && draftControlsInfo.current_model_id)
-      || '';
-  const composerModeValue = sessionControlsInfo
-    ? controls.effectiveMode || ''
-    : (draftConfigSelection && draftConfigSelection.mode) || controls.effectiveMode || '';
-  function composerConfigOptionValue(option) {
-    if (sessionControlsInfo) return option.currentValue || '';
-    const staged = draftConfigSelection && draftConfigSelection.configs
-      ? draftConfigSelection.configs[option.id]
-      : undefined;
-    return staged !== undefined ? String(staged) : (option.currentValue || '');
-  }
-  const availableCommands = useMemo(() => {
-    const event = [...projection.global].reverse().find(item => item.event && item.event.type === 'available_commands');
-    const data = event && event.event && event.event.data || {};
-    const update = data.update || data;
-    return Array.isArray(update.availableCommands) ? update.availableCommands : [];
-  }, [projection.global]);
-  const pendingByTool = useMemo(() => Object.fromEntries(pending.map(item => [item.toolCallId, item])), [pending]);
-  const pendingByElicitation = useMemo(
-    () => Object.fromEntries(pendingElicitations.map(item => [item.elicitationId, item])),
-    [pendingElicitations],
-  );
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeId) || null,
     [sessions, activeId],
   );
   const activeAgentId = activeSession?.agent_id || draftAgentId;
-  // 原生（品悟 Engine）代码会话：发消息走 chat 命令 + chat:* 事件，会话状态按
-  // session 缓存在 lane Map 里（后台会话的 turn 也能继续推进，切回不丢流式内容）。
-  const isNativeAgent = activeAgentId === 'pinvou';
-  const nativeLanesRef = useRef(new Map());
-  const [nativeLaneTick, setNativeLaneTick] = useState(0);
-  const nativeSessionIdsRef = useRef(new Set());
-  useEffect(() => {
-    const ids = new Set(
-      sessions
-        .filter(session => session && session.agent_id === 'pinvou')
-        .map(session => session.id),
-    );
-    nativeSessionIdsRef.current = ids;
-    // 清理已删除会话的 lane，避免 nativeLanesRef 无界增长（只 set 不 delete）。
-    for (const id of nativeLanesRef.current.keys()) {
-      if (!ids.has(id)) nativeLanesRef.current.delete(id);
-    }
-  }, [sessions]);
-
-  // 原生车道才加载知识库集合与 embedding 安装态；embedding 明确未装时选择器禁用。
-  useEffect(() => {
-    if (!isNativeAgent) return undefined;
-    let alive = true;
-    invoke('kb_collection_list')
-      .then(list => { if (alive) setNativeKbCollections(Array.isArray(list) ? list : []); })
-      .catch(() => { if (alive) setNativeKbCollections([]); });
-    invoke('kb_model_status')
-      .then(status => { if (alive) setNativeKbInstalled(status ? Boolean(status.installed) : true); })
-      .catch(() => { if (alive) setNativeKbInstalled(true); });
-    return () => { alive = false; };
-  }, [isNativeAgent]);
-  function getNativeLane(sessionId) {
-    let lane = nativeLanesRef.current.get(sessionId);
-    if (!lane) {
-      lane = createNativeLane();
-      nativeLanesRef.current.set(sessionId, lane);
-    }
-    return lane;
-  }
-  const activeNativeLane = isNativeAgent && activeId
-    ? nativeLanesRef.current.get(activeId) || null
-    : null;
-  // 原生车道底栏控件（模型/工具/知识库/模式）的会话态：按 activeId 经 invoke 自查，
-  // 不读 bridge 聊天 active 绑定（bs.currentSessionModelId/modeState/mountedCollection
-  // 都绑聊天 active）。草稿态暂存 nativeDraftControls，建会话成功后再应用。
-  const [nativeControls, setNativeControls] = useState({ modelId: null, mountedId: null, mode: 'yolo' });
-  const [nativeDraftControls, setNativeDraftControls] = useState({});
-  // nativeControls 的会话归属：切会话后、refresh 返回前不展示上一会话的控件值。
-  const nativeControlsSessionRef = useRef(null);
-  // 知识库选择器的集合列表与 embedding 安装态（全局只读查询，不带会话）。
-  const [nativeKbCollections, setNativeKbCollections] = useState([]);
-  const [nativeKbInstalled, setNativeKbInstalled] = useState(null); // null=未知(不门控)
-  const nativeProjection = useMemo(
-    () => (isNativeAgent ? projectNativeLane(activeNativeLane, activeId) : null),
-    // nativeLaneTick 是 lane 内容变化的版本号（lane 本体是可变对象，靠 tick 触发重投影）。
-    [isNativeAgent, activeNativeLane, activeId, nativeLaneTick],
-  );
-  const visibleTurns = isNativeAgent
-    ? (nativeProjection ? nativeProjection.turns : [])
-    : projection.turns;
-  const busy = isNativeAgent
-    ? Boolean(activeNativeLane && activeNativeLane.busy)
-    : projection.turns.some(turn => turn.status === 'running');
-  const activeConversationTurn = [...visibleTurns]
-    .reverse()
-    .find(turn => turn.status === 'running') || null;
-  // 原生车道底栏控件的展示值（归属保护：refresh 返回前按默认/暂存显示）。
-  const nativeModeValue = activeId && nativeControlsSessionRef.current === activeId
-    ? nativeControls.mode
-    : (activeId ? 'yolo' : (nativeDraftControls.mode || 'yolo'));
-  const nativeModelChoices = visibleUserModels((bs && bs.savedModels) || [])
-    .map(model => ({ value: model.id, name: model.name || model.id }));
-  const nativeSessionModelId = activeId
-    ? (nativeControlsSessionRef.current === activeId ? nativeControls.modelId : null)
-    : (nativeDraftControls.modelId || null);
-  const nativeModelValue = nativeSessionModelId || (bs && bs.activeModelId) || '';
-  const nativeMountedId = activeId
-    ? (nativeControlsSessionRef.current === activeId ? nativeControls.mountedId : null)
-    : (nativeDraftControls.mountedId ?? null);
-  const nativeKbChoices = [
-    { value: '', name: t.kbMountRemove },
-    ...nativeKbCollections.map(collection => ({
-      value: String(collection.id),
-      name: collection.name,
-    })),
-  ];
+  const activeAgentIdRef = useRef(activeAgentId);
+  activeAgentIdRef.current = activeAgentId;
   const activeAgentName = activeSession?.agent_name
     || agents.find(agent => agent.agent_id === activeAgentId)?.agent_name
     || (activeAgentId === 'pinvou' ? '品悟' : activeAgentId === 'claude' ? 'Claude Code' : activeAgentId === 'kimi' ? 'Kimi' : 'Codex');
-  const activeAgentIdRef = useRef(activeAgentId);
-  activeAgentIdRef.current = activeAgentId;
-  const activeStatus = status?.agent_id === activeAgentId ? status : null;
-  const activeRuntimeOperation = runtimeOperationFor(runtimeOperations, activeAgentId);
-  const activeRuntimeBusy = Boolean(activeRuntimeOperation);
-  const activeRuntimeError = runtimeErrors[activeAgentId] || '';
-  const serviceFailure = useMemo(() => {
-    const latestCompleted = [...events]
-      .reverse()
-      .find(envelope => envelope?.event?.type === 'turn_completed');
-    return classifyAcpServiceFailure(latestCompleted);
-  }, [events]);
-  const visibleServiceFailure = serviceFailure?.key === dismissedFailureKey
-    ? null
-    : serviceFailure;
   const workspaceUnavailable = Boolean(
     activeSession
       && activeSession.workspace_kind === 'project'
@@ -1207,172 +829,50 @@ export function CodexAcpView({
   const attachmentKey = activeId || DRAFT_ATTACHMENT_KEY;
   const attachments = attachmentDrafts[attachmentKey] || [];
   const workspaceReferences = workspaceReferenceDrafts[attachmentKey] || [];
-  const sessionReady = isNativeAgent
-    ? (!activeId || Boolean(activeNativeLane && activeNativeLane.hydrated))
-    : (!activeId || (sessionInfoSessionId === activeId && Boolean(sessionInfo)));
+
+  // 会话类型 adapter：原生（品悟 Engine）与 ACP 各自承载会话态与行为；两个 hook
+  // 都常驻（内部按 active 门控副作用），adapter 选择是视图里唯一的类型分流点。
+  const adapterKind = activeAgentId === 'pinvou' ? 'native' : 'acp';
+  const adapterCtx = {
+    activeId,
+    activeIdRef,
+    activeAgentId,
+    activeAgentIdRef,
+    draftAgentId,
+    sessions,
+    draftWorkspacePath,
+    t,
+    bs,
+    codexCopy,
+    working,
+    setWorking,
+    responding,
+    setResponding,
+    setSessionLoading,
+    setError,
+    showError,
+    setDraft,
+    workspaceReferences,
+    updateAttachments,
+    setAttachmentDrafts,
+    setWorkspaceReferenceDrafts,
+    autoScrollRef,
+    setShowScrollBottom,
+    createSession,
+    refreshSessions,
+  };
+  const native = useNativeCodeAdapter({ ...adapterCtx, active: adapterKind === 'native' });
+  const acp = useAcpCodeAdapter({ ...adapterCtx, active: adapterKind === 'acp' });
+  const adapter = adapterKind === 'native' ? native : acp;
+
+  const visibleTurns = adapter.turns;
+  const busy = adapter.busy;
+  const sessionReady = adapter.sessionReady;
   const sessionSyncing = Boolean(activeId && !sessionReady && sessionLoading);
-
-  function applySessionInfo(info, sessionId = activeIdRef.current) {
-    if (sessionId !== activeIdRef.current) return info;
-    setSessionInfo(info);
-    setSessionInfoSessionId(sessionId || null);
-    const agentId = activeAgentIdRef.current;
-    const snapshot = rememberDraftControls(agentId, info);
-    if (snapshot) {
-      setDraftControlsCache(current => ({ ...current, [agentId]: snapshot }));
-    }
-    return info;
-  }
-
-  function stageDraftConfigSelection(patch) {
-    setDraftConfigSelections(current => {
-      const prev = current[draftAgentId] || {};
-      const next = {
-        model: patch.model !== undefined ? patch.model : prev.model,
-        mode: patch.mode !== undefined ? patch.mode : prev.mode,
-        configs: { ...(prev.configs || {}), ...(patch.configs || {}) },
-      };
-      return { ...current, [draftAgentId]: next };
-    });
-  }
-
-  // 首次发送创建会话后，把草稿态预选的模型/权限模式/配置应用到新会话。
-  // 以新会话实际上报的 config_options 为准自适应：走 config 的项用 set_config_option，
-  // 否则退回 set_model/set_mode；与当前值相同或会话未暴露的项跳过。
-  async function applyDraftConfigSelections(targetId, info) {
-    const staged = draftConfigSelections[draftAgentId];
-    if (!staged) return info;
-    let current = info || null;
-    const currentOptionValue = (configId) => {
-      const options = current && Array.isArray(current.config_options) ? current.config_options : [];
-      const option = options.find(item => item && item.id === configId);
-      return option ? String(option.currentValue ?? '') : null;
-    };
-    try {
-      if (staged.model) {
-        const viaConfig = currentOptionValue('model') !== null;
-        const currentValue = viaConfig
-          ? currentOptionValue('model')
-          : String(current && current.current_model_id || '');
-        if (String(staged.model) !== currentValue) {
-          current = viaConfig
-            ? await invoke('set_codex_acp_config_option', { sessionId: targetId, configId: 'model', valueId: staged.model })
-            : await invoke('set_codex_acp_model', { sessionId: targetId, modelId: staged.model });
-        }
-      }
-      if (staged.mode) {
-        const viaConfig = currentOptionValue('mode') !== null;
-        const currentValue = viaConfig
-          ? currentOptionValue('mode')
-          : String(current && current.modes && current.modes.currentModeId || '');
-        if (String(staged.mode) !== currentValue) {
-          current = viaConfig
-            ? await invoke('set_codex_acp_config_option', { sessionId: targetId, configId: 'mode', valueId: staged.mode })
-            : await invoke('set_codex_acp_mode', { sessionId: targetId, modeId: staged.mode });
-        }
-      }
-      for (const [configId, valueId] of Object.entries(staged.configs || {})) {
-        const optionValue = currentOptionValue(configId);
-        if (optionValue === null || optionValue === String(valueId)) continue;
-        current = await invoke('set_codex_acp_config_option', { sessionId: targetId, configId, valueId });
-      }
-    } catch (err) {
-      showError(err);
-    }
-    return current;
-  }
-
-  /// 拉取原生会话的模型/知识库/模式状态（全部 per-session 命令，显式 sessionId）。
-  async function refreshNativeControls(sessionId) {
-    const [modelId, mountedId, modeState] = await Promise.all([
-      invoke('get_session_model_id', { sessionId }).catch(() => null),
-      invoke('session_mounted_collection', { sessionId }).catch(() => null),
-      invoke('get_mode_state', { sessionId }).catch(() => null),
-    ]);
-    setNativeControls({
-      modelId: modelId || null,
-      mountedId: mountedId ?? null,
-      mode: (modeState && modeState.mode) || 'yolo',
-    });
-    nativeControlsSessionRef.current = sessionId;
-  }
-
-  /// 草稿态暂存的控件选择在新会话上应用；失败报错不静默（逐个应用，mode 最后）。
-  async function applyNativeDraftControls(sessionId) {
-    const staged = nativeDraftControls;
-    const hasStaged = staged.modelId || staged.mountedId != null || staged.mode;
-    if (!hasStaged) return;
-    try {
-      if (staged.modelId) {
-        await invoke('set_session_model', { sessionId, modelId: staged.modelId });
-      }
-      if (staged.mountedId != null) {
-        await invoke('session_mount_collection', { sessionId, collectionId: staged.mountedId });
-      }
-      if (staged.mode === 'plan') {
-        await invoke('set_plan_mode_next', { sessionId });
-      }
-      setNativeDraftControls({});
-    } catch (err) {
-      showError(err);
-    }
-  }
-
-  /// 切模型：set_session_model 会 evict 该会话 engine，lane busy 时由控件禁用兜底。
-  async function switchNativeModel(sessionId, modelId) {
-    if (!sessionId) {
-      setNativeDraftControls(current => ({ ...current, modelId }));
-      return;
-    }
-    setError('');
-    try {
-      await invoke('set_session_model', { sessionId, modelId });
-      await refreshNativeControls(sessionId);
-    } catch (err) { showError(err); }
-  }
-
-  async function mountNativeKb(collectionId) {
-    if (!activeId) {
-      setNativeDraftControls(current => ({ ...current, mountedId: collectionId }));
-      return;
-    }
-    setError('');
-    try {
-      await invoke('session_mount_collection', { sessionId: activeId, collectionId });
-      await refreshNativeControls(activeId);
-    } catch (err) { showError(err); }
-  }
-
-  async function unmountNativeKb() {
-    if (!activeId) {
-      setNativeDraftControls(current => ({ ...current, mountedId: null }));
-      return;
-    }
-    setError('');
-    try {
-      await invoke('session_unmount_collection', { sessionId: activeId });
-      await refreshNativeControls(activeId);
-    } catch (err) { showError(err); }
-  }
-
-  /// Plan↔Yolo：对齐聊天页语义——切回 Yolo 时若 turn 在跑先取消
-  /// （用代码车道已有的 cancel_generation 显式 sessionId 调用，不经 bridge）。
-  async function switchNativeMode(target, { isPlan, busy: chipBusy } = {}) {
-    if (!activeId) {
-      setNativeDraftControls(current => ({ ...current, mode: target }));
-      return;
-    }
-    setError('');
-    try {
-      if (target === 'plan' && !isPlan) {
-        await invoke('set_plan_mode_next', { sessionId: activeId });
-      } else if (target === 'yolo' && isPlan) {
-        if (chipBusy) await invoke('cancel_generation', { sessionId: activeId });
-        await invoke('exit_plan_to_yolo', { sessionId: activeId });
-      }
-      await refreshNativeControls(activeId);
-    } catch (err) { showError(err); }
-  }
+  const activeConversationTurn = [...visibleTurns]
+    .reverse()
+    .find(turn => turn.status === 'running') || null;
+  const attentionPending = adapter.attentionCount > 0;
 
   async function refreshSessions() {
     const next = await invoke('list_codex_acp_sessions');
@@ -1388,17 +888,10 @@ export function CodexAcpView({
     return list;
   }
 
-  async function refreshStatus(agentId = activeAgentId, recheck = false) {
-    // recheck=true 强制后端忽略缓存重新探测（「重新检测」按钮）；轮询不传，保持读缓存。
-    const next = await invoke('get_acp_agent_status', recheck ? { agentId, recheck: true } : { agentId });
-    if (next?.agent_id === activeAgentIdRef.current) setStatus(next);
-    return next;
-  }
-
   function selectDraftAgent(agentId) {
     if (activeId || !agentId) return;
     setDraftAgentId(agentId);
-    setStatus(null);
+    acp.clearStatus();
     setError('');
   }
 
@@ -1407,71 +900,16 @@ export function CodexAcpView({
     sessionLoadRequestRef.current = requestId;
     activeIdRef.current = id;
     setError('');
-    setSessionInfo(null);
-    setSessionInfoSessionId(null);
+    acp.resetSessionInfo();
     setSessionLoading(true);
+    const isStale = () => sessionLoadRequestRef.current !== requestId;
     try {
-      // 原生（品悟）会话：历史与 turn timeline 来自 SavedSession / timing_events，
-      // 不走 ACP 的 timeline / pending / session_info 命令。
-      if (nativeSessionIdsRef.current.has(id)) {
-        const [saved, sessionTimeline] = await Promise.all([
-          invoke('load_session', { id, setActive: false }),
-          invoke('get_session_timeline', { sessionId: id }).catch(() => []),
-        ]);
-        if (sessionLoadRequestRef.current !== requestId) return null;
-        const lane = getNativeLane(id);
-        hydrateNativeLane(lane, saved, sessionTimeline || []);
-        // lane 随组件卸载销毁，chat:user_input_required 不重发：经后端 pending
-        // 登记还原挂起的确认卡（applyNativeChatEvent 按 toolCallId 幂等去重），
-        // 并顺带恢复 turn 进行中的 busy 展示。
-        const pendingState = await invoke('get_pending_user_inputs', { sessionId: id })
-          .catch(() => null);
-        if (sessionLoadRequestRef.current !== requestId) return null;
-        if (pendingState) {
-          (pendingState.pending || []).forEach(request => {
-            applyNativeChatEvent(lane, 'chat:user_input_required', {
-              session_id: id,
-              id: request.id,
-              questions: request.questions,
-            });
-          });
-          if (pendingState.busy && !lane.busy) {
-            lane.busy = true;
-            lane.thinking = { active: true, startedAt: Date.now(), phase: 'thinking', toolName: null };
-          }
-        }
-        await refreshNativeControls(id);
-        if (sessionLoadRequestRef.current !== requestId) return null;
-        setNativeLaneTick(tick => tick + 1);
-        return null;
-      }
-      const [timeline, permissions, elicitations] = await Promise.all([
-        invoke('get_codex_acp_timeline', { sessionId: id }),
-        invoke('get_codex_acp_pending_permissions', { sessionId: id }),
-        invoke('get_codex_acp_pending_elicitations', { sessionId: id }),
-      ]);
-      if (sessionLoadRequestRef.current !== requestId) return null;
-      setEvents(timeline || []);
-      setPending(permissions || []);
-      setPendingElicitations(elicitations || []);
-      const session = sessions.find(item => item.id === id);
-      const runtime = await invoke('get_acp_agent_status', {
-        agentId: session?.agent_id || draftAgentId,
-      });
-      if (sessionLoadRequestRef.current !== requestId) return null;
-      if (runtime?.agent_id === activeAgentIdRef.current) setStatus(runtime);
-      if (runtime.installed && runtime.node_supported) {
-        try {
-          const info = await invoke('get_codex_acp_session_info', { sessionId: id });
-          if (sessionLoadRequestRef.current !== requestId) return null;
-          return applySessionInfo(info, id);
-        } catch (err) {
-          if (sessionLoadRequestRef.current === requestId) showError(err);
-        }
-      }
-      return null;
+      // 会话类型分发：原生（品悟）会话走会话作用域状态机（SavedSession hydration +
+      // chat:* 事件推进），ACP 会话走后端 timeline / pending / session_info。
+      if (native.store.isManaged(id)) return await native.loadSession(id, isStale);
+      return await acp.loadSession(id, isStale);
     } finally {
-      if (sessionLoadRequestRef.current === requestId) setSessionLoading(false);
+      if (!isStale()) setSessionLoading(false);
     }
   }
 
@@ -1482,8 +920,8 @@ export function CodexAcpView({
       workspacePath,
       agentId: draftAgentId,
     });
-    // loadSession 用 nativeSessionIdsRef 判定分流；新会话先登记，避免它读到旧 prop。
-    if (draftAgentId === 'pinvou') nativeSessionIdsRef.current.add(metadata.id);
+    // loadSession 用会话作用域 store 判定分流；新会话先登记，避免它读到旧 prop。
+    if (draftAgentId === 'pinvou') native.registerSession(metadata.id);
     if (workspacePath) setRecentWorkspaces(rememberWorkspace(workspacePath));
     await refreshSessions();
     skipNextActiveLoadRef.current = metadata.id;
@@ -1520,12 +958,8 @@ export function CodexAcpView({
         [DRAFT_ATTACHMENT_KEY]: current[activeId] || [],
       }));
     }
-    setEvents([]);
-    setPending([]);
-    setPendingElicitations([]);
+    acp.resetConversation();
     sessionLoadRequestRef.current += 1;
-    setSessionInfo(null);
-    setSessionInfoSessionId(null);
     setSessionLoading(false);
     setError('');
     if (onActiveSessionChange) onActiveSessionChange(null);
@@ -1642,86 +1076,8 @@ export function CodexAcpView({
   }
 
   useEffect(() => {
-    let unlisten = null;
     Promise.all([refreshAgents(), refreshSessions()]).catch(showError);
-    listenTauri('acp:event', message => {
-      const incoming = message.payload;
-      setEvents(current => incoming && incoming.sessionId === activeIdRef.current ? appendAcpEvent(current, incoming) : current);
-      if (incoming && incoming.sessionId === activeIdRef.current) {
-        const type = incoming.event && incoming.event.type;
-        const data = incoming.event && incoming.event.data || {};
-        if (type === 'permission_requested') {
-          setPending(current => [...current.filter(item => item.toolCallId !== data.toolCallId), {
-            sessionId: incoming.sessionId, toolCallId: data.toolCallId, request: data.request,
-          }]);
-        } else if (type === 'elicitation_requested') {
-          setPendingElicitations(current => [
-            ...current.filter(item => item.elicitationId !== data.elicitationId),
-            {
-              sessionId: incoming.sessionId,
-              elicitationId: data.elicitationId,
-              request: data.request,
-            },
-          ]);
-        } else if (type === 'elicitation_resolved') {
-          setPendingElicitations(current => current.filter(
-            item => item.elicitationId !== data.elicitationId,
-          ));
-        } else if (type === 'permission_resolved' || type === 'turn_completed') {
-          if (type === 'permission_resolved') setPending(current => current.filter(item => item.toolCallId !== data.toolCallId));
-          refreshSessions().catch(() => {});
-        } else if (type === 'runtime_ready') {
-          invoke('get_codex_acp_session_info', { sessionId: incoming.sessionId })
-            .then(info => applySessionInfo(info, incoming.sessionId))
-            .catch(() => {});
-        }
-      }
-    }).then(fn => { unlisten = fn; });
-    return () => { if (unlisten) unlisten(); };
   }, []);
-
-  // 原生（品悟）会话的 engine 事件：按 session 推进对应 lane，仅当前会话 bump 渲染；
-  // turn 边界顺手刷新会话列表（标题/时间戳），与 acp:event 的 turn_completed 处理对齐。
-  useEffect(() => {
-    let disposed = false;
-    let unlisteners = [];
-    Promise.all(NATIVE_CHAT_EVENTS.map(name => listenTauri(name, message => {
-      const payload = (message && message.payload) || {};
-      const sessionId = payload.session_id;
-      if (!sessionId || !nativeSessionIdsRef.current.has(sessionId)) return;
-      const lane = getNativeLane(sessionId);
-      const changed = applyNativeChatEvent(lane, name, payload);
-      if (name === 'chat:turn_started' || name === 'chat:done') {
-        refreshSessions().catch(() => {});
-      }
-      if (changed && sessionId === activeIdRef.current) {
-        setNativeLaneTick(tick => tick + 1);
-      }
-    }))).then(fns => {
-      if (disposed) fns.forEach(fn => fn());
-      else unlisteners = fns;
-    }).catch(error => console.warn('[codex] native chat events unavailable', error));
-    return () => {
-      disposed = true;
-      unlisteners.forEach(fn => fn());
-    };
-  }, []);
-
-  useEffect(() => {
-    // 原生（品悟）会话没有 ACP 状态机，跳过 get_acp_agent_status（后端会拒绝非 ACP agent）。
-    if (activeAgentId === 'pinvou') {
-      setStatus(null);
-      return;
-    }
-    // 用户主动切换 Agent 后必须绕过进程内探测缓存，立即反映 App 外的安装/卸载。
-    refreshStatus(activeAgentId, true).catch(showError);
-  }, [activeAgentId]);
-
-  useEffect(() => {
-    const latest = events[events.length - 1];
-    if (!isAcpAuthenticationFailure(latest)) return;
-    refreshStatus(activeAgentId).catch(() => {});
-  }, [events.length, activeAgentId]);
 
   useEffect(() => {
     if (!activeId) {
@@ -1729,11 +1085,7 @@ export function CodexAcpView({
       sessionLoadRequestRef.current += 1;
       if (preserveDraftWorkspaceRef.current) preserveDraftWorkspaceRef.current = false;
       else setDraftWorkspacePath(null);
-      setEvents([]);
-      setPending([]);
-      setPendingElicitations([]);
-      setSessionInfo(null);
-      setSessionInfoSessionId(null);
+      acp.resetConversation();
       setSessionLoading(false);
       return;
     }
@@ -1749,21 +1101,6 @@ export function CodexAcpView({
     draftEpochRef.current = draftEpoch;
     beginDraft(null, { clearComposer: true });
   }, [draftEpoch]);
-
-  useEffect(() => {
-    if (!activeStatus?.login_in_progress) return undefined;
-    let cancelled = false;
-    let timer = null;
-    const poll = async () => {
-      await refreshStatus(activeAgentId).catch(() => {});
-      if (!cancelled) timer = window.setTimeout(poll, 750);
-    };
-    timer = window.setTimeout(poll, 750);
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [activeAgentId, activeStatus?.login_in_progress]);
 
   useEffect(() => {
     setNow(Date.now());
@@ -1800,7 +1137,7 @@ export function CodexAcpView({
     }
     const shouldShow = element.scrollHeight > element.clientHeight + 4;
     setShowScrollBottom(current => current === shouldShow ? current : shouldShow);
-  }, [events.length, visibleTurns.length, nativeLaneTick]);
+  }, [acp.workspaceRefreshToken, visibleTurns.length, native.workspaceRefreshToken]);
 
   useEffect(() => {
     autoScrollRef.current = true;
@@ -1824,99 +1161,14 @@ export function CodexAcpView({
     element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
   }
 
-  function beginRuntimeOperation(agentId, operation) {
-    setRuntimeOperations(current => ({ ...current, [agentId]: operation }));
-    setRuntimeErrors(current => ({ ...current, [agentId]: '' }));
-  }
-
-  function finishRuntimeOperation(agentId, operation) {
-    setRuntimeOperations(current => {
-      if (current[agentId] !== operation) return current;
-      const next = { ...current };
-      delete next[agentId];
-      return next;
-    });
-  }
-
-  function showRuntimeError(agentId, nextError) {
-    console.error(`${agentId} runtime operation failed:`, nextError);
-    const message = codexCopy.showRawErrors ? String(nextError) : codexCopy.operationFailed;
-    setRuntimeErrors(current => ({ ...current, [agentId]: message }));
-  }
-
-  async function install(actionOverride = null) {
-    const agentId = activeAgentId;
-    beginRuntimeOperation(agentId, 'install');
-    setError('');
-    const poll = window.setInterval(() => refreshStatus(agentId).catch(() => {}), 500);
-    try {
-      const payload = { agent: agentId };
-      if (typeof actionOverride === 'string' && actionOverride) payload.action = actionOverride;
-      const next = await invoke('install_acp_agent', payload);
-      if (next?.agent_id === activeAgentIdRef.current) setStatus(next);
-    }
-    catch (err) { showRuntimeError(agentId, err); }
-    finally {
-      window.clearInterval(poll);
-      await refreshStatus(agentId).catch(() => {});
-      finishRuntimeOperation(agentId, 'install');
-    }
-  }
-
-  async function login() {
-    const agentId = activeAgentId;
-    beginRuntimeOperation(agentId, 'login');
-    setError('');
-    try {
-      const next = await invoke('login_acp_agent', { agentId });
-      if (next?.agent_id === activeAgentIdRef.current) setStatus(next);
-    }
-    catch (err) { showRuntimeError(agentId, err); }
-    finally { finishRuntimeOperation(agentId, 'login'); }
-  }
-
-  async function switchAccount() {
-    const agentId = activeAgentId;
-    setAccountMenuOpen(false);
-    if (serviceFailure?.key) setDismissedFailureKey(serviceFailure.key);
-    beginRuntimeOperation(agentId, 'switch-account');
-    setError('');
-    try {
-      const next = await invoke('switch_acp_agent_account', { agentId });
-      if (next?.agent_id === activeAgentIdRef.current) setStatus(next);
-    } catch (err) {
-      showRuntimeError(agentId, err);
-    } finally {
-      finishRuntimeOperation(agentId, 'switch-account');
-    }
-  }
-
-  async function openLogin() {
-    const agentId = activeAgentId;
-    setRuntimeErrors(current => ({ ...current, [agentId]: '' }));
-    try { await invoke('open_acp_agent_login_url', { agentId }); }
-    catch (err) { showRuntimeError(agentId, err); }
-  }
-
-  async function submitLoginCode(code) {
-    const agentId = activeAgentId;
-    setRuntimeErrors(current => ({ ...current, [agentId]: '' }));
-    try {
-      await invoke('submit_acp_agent_login_code', { agentId, code });
-      await refreshStatus(agentId);
-    } catch (err) {
-      showRuntimeError(agentId, err);
-    }
-  }
-
   async function send() {
     const message = draft.trim();
     const readyAttachments = attachments.filter(attachment => (
       attachment.status === 'ready' && attachment.result
     ));
     if ((!message && !readyAttachments.length && !workspaceReferences.length)
-      || busy || working || activeRuntimeBusy) return;
-    if (!isNativeAgent && !activeStatus?.authenticated) {
+      || busy || working || adapter.runtimeBusy) return;
+    if (adapter.capabilities.requiresAuthToSend && !adapter.activeStatus?.authenticated) {
       setError(codexCopy.loginRequiredBeforeSend);
       return;
     }
@@ -1926,275 +1178,7 @@ export function CodexAcpView({
     }
     if (workspaceUnavailable) return;
     if (activeId && !sessionReady) return;
-    if (isNativeAgent) {
-      await sendNative(message, readyAttachments);
-      return;
-    }
-    setWorking(true); setError('');
-    try {
-      let targetId = activeId;
-      if (!targetId) {
-        const created = await createSession(draftWorkspacePath);
-        targetId = created.id;
-        const appliedInfo = await applyDraftConfigSelections(targetId, created.info);
-        if (appliedInfo && appliedInfo !== created.info) applySessionInfo(appliedInfo, targetId);
-        setDraftConfigSelections(current => {
-          const next = { ...current };
-          delete next[draftAgentId];
-          return next;
-        });
-        setAttachmentDrafts(current => {
-          const draftAttachments = current[DRAFT_ATTACHMENT_KEY] || [];
-          const next = { ...current, [targetId]: draftAttachments };
-          delete next[DRAFT_ATTACHMENT_KEY];
-          return next;
-        });
-        setWorkspaceReferenceDrafts(current => {
-          const draftReferences = current[DRAFT_ATTACHMENT_KEY] || [];
-          const next = { ...current, [targetId]: draftReferences };
-          delete next[DRAFT_ATTACHMENT_KEY];
-          return next;
-        });
-      }
-      autoScrollRef.current = true;
-      setShowScrollBottom(false);
-      setDraft('');
-      await invoke('codex_acp_prompt', {
-        sessionId: targetId,
-        message,
-        attachments: readyAttachments.map(attachment => attachment.result),
-        workspaceReferences,
-      });
-      updateAttachments(targetId, current => current.filter(
-        attachment => !readyAttachments.some(ready => ready.id === attachment.id),
-      ));
-      setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
-    } catch (err) {
-      showError(err);
-      setDraft(message);
-    } finally {
-      setWorking(false);
-    }
-  }
-
-  /// 原生（品悟 Engine）发送：草稿态先建会话（强制临时工作区），随后走 chat 命令；
-  /// 用户气泡乐观插入 lane，chat 命令同步失败（空消息 / turn 占用等）时回滚。
-  async function sendNative(message, readyAttachments) {
-    setWorking(true); setError('');
-    try {
-      let targetId = activeId;
-      if (!targetId) {
-        const created = await createSession(draftWorkspacePath);
-        targetId = created.id;
-        // 草稿态暂存的模型/知识库/模式选择先落到新会话（失败会显式报错）。
-        await applyNativeDraftControls(targetId);
-        setAttachmentDrafts(current => {
-          const draftAttachments = current[DRAFT_ATTACHMENT_KEY] || [];
-          const next = { ...current, [targetId]: draftAttachments };
-          delete next[DRAFT_ATTACHMENT_KEY];
-          return next;
-        });
-        setWorkspaceReferenceDrafts(current => {
-          const draftReferences = current[DRAFT_ATTACHMENT_KEY] || [];
-          const next = { ...current, [targetId]: draftReferences };
-          delete next[DRAFT_ATTACHMENT_KEY];
-          return next;
-        });
-      }
-      const referencePrefix = workspaceReferences.length
-        ? `${workspaceReferences.map(path => `@${path}`).join(' ')}\n\n`
-        : '';
-      const displayText = message + (readyAttachments.length
-        ? `${message ? '\n' : ''}📎 ${readyAttachments.map(attachment => attachment.basename).join(', ')}`
-        : '');
-      const lane = getNativeLane(targetId);
-      const optimisticId = appendLocalUserMessage(lane, displayText);
-      setNativeLaneTick(tick => tick + 1);
-      autoScrollRef.current = true;
-      setShowScrollBottom(false);
-      setDraft('');
-      try {
-        await invoke('chat', {
-          message: referencePrefix + message,
-          attachments: readyAttachments.map(attachment => attachment.result),
-          sessionId: targetId,
-          restrictTools: false,
-        });
-      } catch (sendError) {
-        removeLocalUserMessage(lane, optimisticId);
-        setNativeLaneTick(tick => tick + 1);
-        throw sendError;
-      }
-      updateAttachments(targetId, current => current.filter(
-        attachment => !readyAttachments.some(ready => ready.id === attachment.id),
-      ));
-      setWorkspaceReferenceDrafts(current => ({ ...current, [targetId]: [] }));
-    } catch (err) {
-      showError(err);
-      setDraft(message);
-    } finally {
-      setWorking(false);
-    }
-  }
-
-  async function cancel() {
-    if (!activeId) return;
-    if (isNativeAgent) {
-      await invoke('cancel_generation', { sessionId: activeId }).catch(showError);
-      return;
-    }
-    await invoke('cancel_codex_acp', { sessionId: activeId }).catch(showError);
-  }
-
-  /// 原生会话的选择确认卡提交/取消：chat:user_input_required → submit_user_input /
-  /// cancel_user_input（显式 sessionId，不经过 bridge 全局 activeSession）。
-  async function respondNativeInput(toolCallId, answers) {
-    if (!activeId) return;
-    setResponding(true); setError('');
-    try {
-      await invoke('submit_user_input', { toolCallId, answers, sessionId: activeId });
-      markNativeInputResolved(toolCallId, 'submitted');
-    } catch (err) { showError(err); }
-    finally { setResponding(false); }
-  }
-
-  async function cancelNativeInput(toolCallId) {
-    if (!activeId) return;
-    setResponding(true); setError('');
-    try {
-      await invoke('cancel_user_input', { toolCallId, sessionId: activeId });
-      markNativeInputResolved(toolCallId, 'cancelled');
-    } catch (err) { showError(err); }
-    finally { setResponding(false); }
-  }
-
-  function markNativeInputResolved(toolCallId, cardState) {
-    const lane = getNativeLane(activeId);
-    const card = [...lane.items].reverse().find(item => (
-      item && item.type === 'user_input' && item.toolCallId === toolCallId && !item.resolved
-    ));
-    if (card) {
-      card.resolved = true;
-      card.cardState = cardState;
-    }
-    setNativeLaneTick(tick => tick + 1);
-  }
-
-  // 原生（品悟）车道 deepseek 投影项渲染：agent_message 用 lane 保存的原始 markdown；
-  // user_input 走选择确认卡；careful_blocked 是拦截提示（无需交互）；system 是引擎
-  // 透传提示。reasoning / tool_group 由 ConversationTimeline 默认渲染。
-  function renderNativeItem(item) {
-    if (item.type === 'agent_message' && item.legacyItem) {
-      return (
-        <ConversationMarkdown
-          text={item.legacyItem.text}
-          onOpenExternal={(url) => invoke('open_user_external_url', { url }).catch(showError)}
-        />
-      );
-    }
-    if (item.type === 'user_input' && item.legacyItem) {
-      return (
-        <NativeUserInputCard
-          item={item.legacyItem}
-          responding={responding}
-          onSubmitAnswers={respondNativeInput}
-          onCancelInput={cancelNativeInput}
-          copy={codexCopy}
-          conversationCopy={t.uiConversation}
-        />
-      );
-    }
-    if (item.type === 'permission' && item.extensionType === 'careful_blocked') {
-      return (
-        <div className="rounded-xl border border-red-500/20 bg-red-500/[0.06] px-3 py-2 text-[12px] text-red-600 dark:text-red-300">
-          {codexCopy.nativeBlockedNotice}
-        </div>
-      );
-    }
-    if (item.type === 'system_notice' && item.legacyItem) {
-      const legacy = item.legacyItem;
-      if (legacy.compactPhase) {
-        const label = legacy.compactPhase === 'start'
-          ? codexCopy.compactStart
-          : legacy.compactPhase === 'fail'
-            ? codexCopy.compactFail
-            : codexCopy.compactDone;
-        return (
-          <div className="px-1 text-[11px] text-gray-400">
-            {label}{legacy.text ? ` · ${legacy.text}` : ''}
-          </div>
-        );
-      }
-      return <div className="px-1 text-[11px] text-gray-400">{legacy.text}</div>;
-    }
-    return undefined;
-  }
-
-  async function respond(toolCallId, optionId) {
-    if (!activeId) return;
-    setResponding(true); setError('');
-    try {
-      await invoke('respond_codex_acp_permission', { sessionId: activeId, toolCallId, optionId });
-      setPending(current => current.filter(item => item.toolCallId !== toolCallId));
-    } catch (err) { showError(err); }
-    finally { setResponding(false); }
-  }
-
-  async function respondElicitation(elicitationId, action, content) {
-    if (!activeId) return;
-    setResponding(true); setError('');
-    try {
-      await invoke('respond_codex_acp_elicitation', {
-        sessionId: activeId,
-        elicitationId,
-        action,
-        content,
-      });
-      setPendingElicitations(current => current.filter(
-        item => item.elicitationId !== elicitationId,
-      ));
-    } catch (err) { showError(err); }
-    finally { setResponding(false); }
-  }
-
-  async function changeModel(modelId) {
-    if (!modelId || activeRuntimeBusy) return;
-    if (!activeId) {
-      stageDraftConfigSelection({ model: modelId });
-      return;
-    }
-    setWorking(true); setConfigApplying('model');
-    try { applySessionInfo(await invoke('set_codex_acp_model', { sessionId: activeId, modelId })); }
-    catch (err) { showError(err); }
-    finally { setWorking(false); setConfigApplying(''); }
-  }
-
-  async function changeConfig(configId, valueId) {
-    if (activeRuntimeBusy) return;
-    if (!activeId) {
-      stageDraftConfigSelection({ configs: { [configId]: valueId } });
-      return;
-    }
-    setWorking(true); setConfigApplying(configId); setError('');
-    try {
-      applySessionInfo(await invoke('set_codex_acp_config_option', {
-        sessionId: activeId, configId, valueId,
-      }));
-    } catch (err) { showError(err); }
-    finally { setWorking(false); setConfigApplying(''); }
-  }
-
-  async function changeMode(modeId) {
-    if (!modeId || activeRuntimeBusy) return;
-    if (!activeId) {
-      stageDraftConfigSelection({ mode: modeId });
-      return;
-    }
-    setWorking(true); setConfigApplying('mode'); setError('');
-    try {
-      applySessionInfo(await invoke('set_codex_acp_mode', { sessionId: activeId, modeId }));
-    } catch (err) { showError(err); }
-    finally { setWorking(false); setConfigApplying(''); }
+    await adapter.send(message, readyAttachments);
   }
 
   return (
@@ -2209,7 +1193,7 @@ export function CodexAcpView({
               {`${activeAgentName} · ${activeSession.workspace_kind === 'project' ? activeSession.workspace_path : codexCopy.temporaryWorkspace}${activeSession.workspace_available ? '' : ` · ${codexCopy.projectMissing}`}`}
             </div>
           </div>
-          {configApplying && <span className="text-[10px] text-blue-500 animate-pulse">{codexCopy.applyingConfig}</span>}
+          {adapter.configApplying && <span className="text-[10px] text-blue-500 animate-pulse">{codexCopy.applyingConfig}</span>}
           {busy && <StatusBadge status="running" copy={t.uiConversation} />}
           <button
             type="button"
@@ -2269,37 +1253,34 @@ export function CodexAcpView({
                   {codexCopy.recreate}
                 </button>
               </div>
-            ) : isNativeAgent ? (
-              // 原生（品悟）会话没有 ACP 登录/安装状态机；错误由 chat:done 事件内联展示。
-              null
-            ) : (
+            ) : adapter.capabilities.runtimeNotice ? (
               <>
                 <RuntimeNotice
-                  status={activeStatus}
-                  working={working || activeRuntimeBusy}
-                  operation={activeRuntimeOperation}
-                  error={activeRuntimeError || error}
-                  onInstall={install}
-                  onLogin={login}
-                  onOpenLogin={openLogin}
-                  onSubmitLoginCode={submitLoginCode}
-                  onRefresh={() => refreshStatus(activeAgentId, true)}
+                  status={adapter.activeStatus}
+                  working={working || adapter.runtimeBusy}
+                  operation={adapter.runtimeOperation}
+                  error={adapter.runtimeError || error}
+                  onInstall={adapter.install}
+                  onLogin={adapter.login}
+                  onOpenLogin={adapter.openLogin}
+                  onSubmitLoginCode={adapter.submitLoginCode}
+                  onRefresh={() => adapter.refreshStatus(activeAgentId, true)}
                   resetKey={draftEpoch}
                   suppressAdvisoryUpgrade={Boolean(activeId)}
                   copy={codexCopy}
                 />
-                {activeStatus?.authenticated && (
+                {adapter.activeStatus?.authenticated && (
                   <AgentServiceFailureNotice
-                    failure={visibleServiceFailure}
+                    failure={adapter.serviceFailure}
                     agentName={activeAgentName}
-                    working={working || activeRuntimeBusy}
-                    onSwitchAccount={switchAccount}
-                    onDismiss={() => setDismissedFailureKey(serviceFailure?.key || '')}
+                    working={working || adapter.runtimeBusy}
+                    onSwitchAccount={adapter.switchAccount}
+                    onDismiss={adapter.dismissServiceFailure}
                     copy={codexCopy}
                   />
                 )}
               </>
-            )}
+            ) : null}
             {!visibleTurns.length && (
               <div className="flex min-h-[320px] flex-1 flex-col items-center justify-center text-center">
                 <div className="w-14 h-14 rounded-2xl bg-black/[0.04] dark:bg-white/[0.08] flex items-center justify-center shadow-lg"><AcpAgentLogo agentId={activeAgentId} className="h-8 w-8" title={activeAgentName} /></div>
@@ -2308,42 +1289,27 @@ export function CodexAcpView({
                 </div>
                 <div className="mt-2 max-w-md text-[13px] leading-6 text-gray-500 dark:text-gray-400">
                   {activeSession
-                    ? (isNativeAgent ? codexCopy.nativeActiveHint : codexCopy.activeHint)
-                    : isNativeAgent
-                      ? codexCopy.nativeDraftHint
-                      : codexCopy.draftHint}
+                    ? adapter.capabilities.welcomeHints.active
+                    : adapter.capabilities.welcomeHints.draft}
                 </div>
               </div>
             )}
-            {visibleTurns.map(turn => (useUnifiedConversationUi || isNativeAgent)
+            {visibleTurns.map(turn => (useUnifiedConversationUi || adapter.capabilities.forceUnifiedTurns)
               ? (
                   <ConversationTurn
                     key={turn.id}
                     turn={turn}
                     now={now}
                     copy={t.uiConversation}
-                    pendingByTool={pendingByTool}
-                    onRespond={respond}
+                    pendingByTool={adapter.pendingByTool}
+                    onRespond={adapter.respond}
                     responding={responding}
                     assistantAvatar={(
                       <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center text-[#1F1F1F] dark:text-[#E3E3E3]">
                         <AcpAgentLogo agentId={activeAgentId} className="h-5 w-5" title={activeAgentName} />
                       </div>
                     )}
-                    renderItem={isNativeAgent
-                      ? (item) => renderNativeItem(item)
-                      : (item) => item.type === 'elicitation'
-                        ? (
-                            <ElicitationCard
-                              elicitation={item.elicitation}
-                              pending={pendingByElicitation[item.elicitation.elicitationId]}
-                              onRespond={respondElicitation}
-                              responding={responding}
-                              copy={codexCopy}
-                              conversationCopy={t.uiConversation}
-                            />
-                          )
-                        : undefined}
+                    renderItem={(item) => adapter.renderItem(item)}
                     agentLabel={activeAgentName}
                     onOpenExternal={(url) => invoke('open_user_external_url', { url }).catch(showError)}
                   />
@@ -2353,10 +1319,10 @@ export function CodexAcpView({
                     agentId={activeAgentId} agentName={activeAgentName}
                     copy={t.uiConversation}
                     cv={t.uiCodexView}
-                    pendingByTool={pendingByTool}
-                    pendingByElicitation={pendingByElicitation}
-                    onRespond={respond}
-                    onRespondElicitation={respondElicitation}
+                    pendingByTool={adapter.pendingByTool}
+                    pendingByElicitation={adapter.pendingByElicitation}
+                    onRespond={adapter.respond}
+                    onRespondElicitation={adapter.respondElicitation}
                     responding={responding}
                     onOpenExternal={(url) => invoke('open_user_external_url', { url }).catch(showError)} />
                 ))}
@@ -2369,10 +1335,10 @@ export function CodexAcpView({
               <button
                 type="button"
                 onClick={scrollConversationToBottom}
-                aria-label={pending.length || pendingElicitations.length ? codexCopy.attentionLatest : codexCopy.latest}
-                title={pending.length || pendingElicitations.length ? codexCopy.attentionLatest : codexCopy.latest}
+                aria-label={attentionPending ? codexCopy.attentionLatest : codexCopy.latest}
+                title={attentionPending ? codexCopy.attentionLatest : codexCopy.latest}
                 className={`pointer-events-auto w-9 h-9 rounded-full flex items-center justify-center shadow-lg backdrop-blur transition-all hover:-translate-y-0.5 active:translate-y-0 border ${
-                  pending.length || pendingElicitations.length
+                  attentionPending
                     ? 'bg-amber-500/95 text-white border-amber-400'
                     : 'bg-white/95 dark:bg-[#2B2C2F]/95 text-[#1F1F1F] dark:text-[#E3E3E3] border-black/10 dark:border-white/10'
                 }`}
@@ -2393,7 +1359,7 @@ export function CodexAcpView({
                 copy={t.uiHomeMode}
               />
             )}
-            {sessionSyncing && !isNativeAgent && (
+            {sessionSyncing && adapter.capabilities.sessionSyncingHint && (
               <div data-testid="acp-session-loading" className="mb-2 flex items-center gap-2 px-3 text-[11px] text-blue-600 dark:text-blue-300">
                 <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-blue-500/20 border-t-blue-500" />
                 <span>{codexCopy.sessionSyncing}</span>
@@ -2441,12 +1407,12 @@ export function CodexAcpView({
                   ))}
                 </div>
               )}
-              {commandOpen && availableCommands.length > 0 && (
+              {commandOpen && adapter.availableCommands.length > 0 && (
                 <>
                   <button aria-label={codexCopy.commandMenuClose} className="fixed inset-0 z-30 cursor-default" onClick={() => setCommandOpen(false)} />
                   <div className="absolute z-40 left-0 right-0 bottom-full mb-2 max-h-72 overflow-y-auto rounded-2xl border border-black/[0.08] dark:border-white/10 bg-white/95 dark:bg-[#202124]/95 backdrop-blur-xl shadow-xl p-2">
                     <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-gray-400">{codexCopy.agentCommands}</div>
-                    {availableCommands.map(command => (
+                    {adapter.availableCommands.map(command => (
                       <button key={command.name} type="button"
                         onClick={() => { setDraft(`/${command.name}${command.input ? ' ' : ''}`); setCommandOpen(false); }}
                         className="w-full rounded-xl px-3 py-2 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
@@ -2528,40 +1494,36 @@ export function CodexAcpView({
                     <Paperclip size={16} />
                   </button>
                   <button type="button" onClick={() => setCommandOpen(value => !value)}
-                    disabled={!availableCommands.length}
+                    disabled={!adapter.availableCommands.length}
                     className="h-7 px-2 rounded-lg text-[11px] font-mono hover:bg-black/[0.05] dark:hover:bg-white/[0.07] disabled:opacity-40"
-                    title={availableCommands.length ? codexCopy.commandsAvailable : codexCopy.commandsAfterSession}>/</button>
-                  {isNativeAgent && (
+                    title={adapter.availableCommands.length ? codexCopy.commandsAvailable : codexCopy.commandsAfterSession}>/</button>
+                  {adapter.capabilities.nativeComposerControls && (
                     // 原生（品悟）车道的底栏控件：与 ACP 配置组同一套
                     // CodexComposerConfigSelect 视觉语言；行为（直调 per-session 命令、
-                    // 草稿暂存、busy 禁用、归属保护）不变。Plan 降级说明：本期不接
-                    // plan_snapshot/accept_plan，切 Plan 后方案以文本/普通工具卡呈现。
+                    // 草稿暂存、busy 禁用、归属保护）由 native adapter 承载。
                     <div data-testid="native-composer-controls" className="flex min-w-0 flex-wrap items-center gap-2">
                       <CodexComposerConfigSelect
                         id="native-mode"
                         testId="native-mode"
                         label={codexCopy.permissionMode}
-                        value={nativeModeValue}
+                        value={adapter.composer.modeValue}
                         choices={[
                           { value: 'yolo', name: t.modeYolo },
                           { value: 'plan', name: t.modePlan },
                         ]}
-                        onChange={target => switchNativeMode(String(target), {
-                          isPlan: nativeModeValue === 'plan',
-                          busy,
-                        })}
-                        title={`${t.modeSwitchTitle} · ${nativeModeValue === 'plan' ? t.modePlan : t.modeYolo}`}
+                        onChange={adapter.composer.onModeChange}
+                        title={`${t.modeSwitchTitle} · ${adapter.composer.modeValue === 'plan' ? t.modePlan : t.modeYolo}`}
                       />
-                      {nativeModelChoices.length > 0 && (
+                      {adapter.composer.modelChoices.length > 0 && (
                         <CodexComposerConfigSelect
                           id="native-model"
                           testId="native-model"
                           label={codexCopy.model}
-                          value={nativeModelValue}
-                          choices={nativeModelChoices}
-                          onChange={modelId => switchNativeModel(activeId, String(modelId))}
-                          disabled={busy || working}
-                          title={busy || working ? t.modelSwitchBusy : undefined}
+                          value={adapter.composer.modelValue}
+                          choices={adapter.composer.modelChoices}
+                          onChange={adapter.composer.onModelChange}
+                          disabled={adapter.composer.modelDisabled}
+                          title={adapter.composer.modelTitle}
                         />
                       )}
                       <ComposerToolMenu
@@ -2577,46 +1539,44 @@ export function CodexAcpView({
                         id="native-kb"
                         testId="native-kb"
                         label={t.kbMount}
-                        value={nativeMountedId == null ? '' : String(nativeMountedId)}
-                        choices={nativeKbChoices}
-                        onChange={value => (
-                          String(value) === '' ? unmountNativeKb() : mountNativeKb(Number(value))
-                        )}
-                        disabled={nativeKbInstalled === false}
-                        title={nativeKbInstalled === false ? t.kbMountNoModel : t.kbMountTitle}
+                        value={adapter.composer.mountedValue}
+                        choices={adapter.composer.kbChoices}
+                        onChange={adapter.composer.onKbChange}
+                        disabled={adapter.composer.kbDisabled}
+                        title={adapter.composer.kbTitle}
                       />
                     </div>
                   )}
-                  {!isNativeAgent && (
+                  {adapter.capabilities.accountMenu && (
                   <div className="relative min-w-0">
                     <button
                       type="button"
                       data-testid="acp-account-menu-trigger"
-                      onClick={() => setAccountMenuOpen(value => !value)}
+                      onClick={() => adapter.setAccountMenuOpen(value => !value)}
                       className="inline-flex h-7 min-w-0 max-w-[260px] items-center gap-1.5 rounded-lg px-2 text-[10px] text-gray-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
                       title={codexCopy.accountAndService}
                     >
                       <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                        visibleServiceFailure
+                        adapter.serviceFailure
                           ? 'bg-red-500'
-                          : activeStatus?.installed && activeStatus?.authenticated
+                          : adapter.activeStatus?.installed && adapter.activeStatus?.authenticated
                             ? 'bg-emerald-500'
                             : 'bg-gray-400'
                       }`} />
                       <span className="hidden min-w-0 truncate sm:inline">
-                        {activeStatus?.installed && activeStatus?.authenticated
-                          ? `${activeAgentName} ${visibleServiceFailure ? codexCopy.serviceAbnormal : codexCopy.connectedSuffix}`
+                        {adapter.activeStatus?.installed && adapter.activeStatus?.authenticated
+                          ? `${activeAgentName} ${adapter.serviceFailure ? codexCopy.serviceAbnormal : codexCopy.connectedSuffix}`
                           : `${activeAgentName} ${codexCopy.notReadySuffix}`}
                       </span>
                       <ChevronDown size={11} className="shrink-0" />
                     </button>
-                    {accountMenuOpen && (
+                    {adapter.accountMenuOpen && (
                       <>
                         <button
                           type="button"
                           aria-label={codexCopy.closeAccountMenu}
                           className="fixed inset-0 z-30 cursor-default"
-                          onClick={() => setAccountMenuOpen(false)}
+                          onClick={() => adapter.setAccountMenuOpen(false)}
                         />
                         <div
                           data-testid="acp-account-menu"
@@ -2628,21 +1588,21 @@ export function CodexAcpView({
                             </div>
                             <div className="min-w-0 flex-1">
                               <div className="truncate text-[12px] font-semibold">{activeAgentName}</div>
-                              <div className={`mt-0.5 text-[10px] ${visibleServiceFailure ? 'text-red-500' : 'text-gray-400'}`}>
-                                {visibleServiceFailure
+                              <div className={`mt-0.5 text-[10px] ${adapter.serviceFailure ? 'text-red-500' : 'text-gray-400'}`}>
+                                {adapter.serviceFailure
                                   ? codexCopy.serviceAbnormal
-                                  : activeStatus?.authenticated
+                                  : adapter.activeStatus?.authenticated
                                     ? codexCopy.accountAuthorized
                                     : codexCopy.accountNotAuthorized}
-                                {runtimeSourceLabel(activeStatus, codexCopy) ? ` · ${runtimeSourceLabel(activeStatus, codexCopy)}` : ''}
+                                {runtimeSourceLabel(adapter.activeStatus, codexCopy) ? ` · ${runtimeSourceLabel(adapter.activeStatus, codexCopy)}` : ''}
                               </div>
                             </div>
                           </div>
                           <div className="mt-1 border-t border-black/[0.05] pt-1 dark:border-white/[0.06]">
                             <button
                               type="button"
-                              onClick={switchAccount}
-                              disabled={working || activeRuntimeBusy || activeStatus?.login_in_progress}
+                              onClick={adapter.switchAccount}
+                              disabled={working || adapter.runtimeBusy || adapter.activeStatus?.login_in_progress}
                               className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[12px] font-medium hover:bg-black/[0.04] disabled:opacity-40 dark:hover:bg-white/[0.06]"
                             >
                               <User size={15} className="text-blue-500" />
@@ -2654,8 +1614,8 @@ export function CodexAcpView({
                             <button
                               type="button"
                               onClick={() => {
-                                setAccountMenuOpen(false);
-                                refreshStatus(activeAgentId, true).catch(showError);
+                                adapter.setAccountMenuOpen(false);
+                                adapter.refreshStatus(activeAgentId, true).catch(showError);
                               }}
                               className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[12px] hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
                             >
@@ -2668,46 +1628,46 @@ export function CodexAcpView({
                     )}
                   </div>
                   )}
-                  {composerControlsVisible && !isNativeAgent && (
+                  {adapter.capabilities.acpComposerControls && adapter.composer.visible && (
                     <div data-testid="codex-composer-configs" className="flex flex-wrap items-center gap-2">
-                      {controls.fallbackModels.length > 0 && (
+                      {adapter.composer.models.length > 0 && (
                         <CodexComposerConfigSelect
                           id="model"
                           label={codexCopy.model}
-                          value={composerModelValue}
-                          choices={controls.fallbackModels.map(model => ({
+                          value={adapter.composer.modelValue}
+                          choices={adapter.composer.models.map(model => ({
                             value: model.id,
                             name: model.name || model.id,
                           }))}
-                          onChange={changeModel}
-                          disabled={busy || working || activeRuntimeBusy}
+                          onChange={adapter.composer.onModelChange}
+                          disabled={busy || working || adapter.runtimeBusy}
                           unsetLabel={codexCopy.notSet}
                         />
                       )}
-                      {controls.fallbackModes && controls.fallbackModes.availableModes && (
+                      {adapter.composer.modes && adapter.composer.modes.availableModes && (
                         <CodexComposerConfigSelect
                           id="mode"
                           label={codexCopy.permissionMode}
-                          value={composerModeValue}
-                          choices={controls.fallbackModes.availableModes.map(item => ({
+                          value={adapter.composer.modeValue}
+                          choices={adapter.composer.modes.availableModes.map(item => ({
                             value: item.id,
                             name: item.name || item.id,
                           }))}
-                          onChange={changeMode}
-                          disabled={busy || working || activeRuntimeBusy}
+                          onChange={adapter.composer.onModeChange}
+                          disabled={busy || working || adapter.runtimeBusy}
                           title={codexCopy.sessionModeTitle}
                           unsetLabel={codexCopy.notSet}
                         />
                       )}
-                      {controls.configOptions.map(option => (
+                      {adapter.composer.configOptions.map(option => (
                         <CodexComposerConfigSelect
                           key={option.id}
                           id={option.id}
-                          label={configLabel(option, codexCopy)}
-                          value={composerConfigOptionValue(option)}
-                          choices={configChoices(option)}
-                          onChange={value => changeConfig(option.id, value)}
-                          disabled={busy || working || activeRuntimeBusy}
+                          label={adapter.composer.configLabel(option)}
+                          value={adapter.composer.configOptionValue(option)}
+                          choices={adapter.composer.configChoices(option)}
+                          onChange={value => adapter.composer.onConfigChange(option.id, value)}
+                          disabled={busy || working || adapter.runtimeBusy}
                           title={option.description || option.name}
                           unsetLabel={codexCopy.notSet}
                         />
@@ -2716,9 +1676,9 @@ export function CodexAcpView({
                   )}
                 </div>
                 {busy ? (
-                  <button onClick={cancel} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
+                  <button onClick={adapter.cancel} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
                 ) : (
-                  <button onClick={send} disabled={!sessionReady || (!draft.trim() && !attachments.some(attachment => attachment.status === 'ready') && !workspaceReferences.length) || working || activeRuntimeBusy || (!isNativeAgent && (!activeStatus || !activeStatus.installed || !activeStatus.authenticated))}
+                  <button onClick={send} disabled={!sessionReady || (!draft.trim() && !attachments.some(attachment => attachment.status === 'ready') && !workspaceReferences.length) || working || adapter.runtimeBusy || adapter.sendDisabled}
                     className="w-9 h-9 rounded-full flex items-center justify-center bg-[#007AFF] text-white shadow-sm hover:bg-[#006EE6] disabled:bg-black/[0.06] dark:disabled:bg-white/10 disabled:text-gray-400 disabled:shadow-none">
                     <Send size={16} />
                   </button>
@@ -2736,7 +1696,7 @@ export function CodexAcpView({
             onClose={() => setWorkspaceOpen(false)}
             references={workspaceReferences}
             onAddReference={addWorkspaceReference}
-            refreshToken={isNativeAgent ? nativeLaneTick : events.length}
+            refreshToken={adapter.workspaceRefreshToken}
             onChangeCount={setWorkspaceChangeCount}
             copy={t.uiCodexWorkspace}
           />

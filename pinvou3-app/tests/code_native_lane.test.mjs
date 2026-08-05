@@ -13,7 +13,7 @@ const temp = mkdtempSync(path.join(tmpdir(), 'pinvou3-code-native-lane-'));
 writeFileSync(path.join(temp, 'package.json'), '{"type":"module"}\n');
 mkdirSync(path.join(temp, 'conversation'), { recursive: true });
 mkdirSync(path.join(temp, 'codex'), { recursive: true });
-for (const file of ['conversation-model.js', 'deepseek-conversation.js']) {
+for (const file of ['conversation-model.js', 'deepseek-conversation.js', 'session-conversation.js']) {
   copyFileSync(path.join(root, 'src', 'features', 'conversation', file), path.join(temp, 'conversation', file));
 }
 copyFileSync(path.join(root, 'src', 'features', 'codex', 'code-native-lane.js'), path.join(temp, 'codex', 'code-native-lane.js'));

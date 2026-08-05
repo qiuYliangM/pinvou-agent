@@ -317,7 +317,13 @@ try {
   'ACP auth status and hosted login must be driven by the real Agent CLIs instead of credential-file existence alone');
   assert.ok(!runtime.includes('runtime.prompt(content, mode_id)'), 'prompt must not overwrite acknowledged config with local UI mode');
 
-  const codexView = readFileSync(path.join(root, 'src', 'features', 'codex', 'CodexAcpView.jsx'), 'utf8');
+  // 视图主体 + 两个会话类型 adapter（ACP/原生）：isNativeAgent 三元分流已收编进
+  // adapter，契约按三者合并后的代码页整体断言（视图在前，保持 indexOf 顺序断言有效）。
+  const codexView = [
+    'CodexAcpView.jsx',
+    'acp-code-adapter.jsx',
+    'native-code-adapter.jsx',
+  ].map(file => readFileSync(path.join(root, 'src', 'features', 'codex', file), 'utf8')).join('\n');
   const runtimeNoticeState = readFileSync(
     path.join(root, 'src', 'features', 'codex', 'runtimeNoticeState.js'),
     'utf8',
@@ -355,7 +361,7 @@ try {
     && codexView.includes("invoke('submit_acp_agent_login_code'")
     && codexView.includes('status.login_code')
     && codexView.includes('status.login_input_required')
-    && codexView.includes('if (!isNativeAgent && !activeStatus?.authenticated)')
+    && codexView.includes('adapter.capabilities.requiresAuthToSend && !adapter.activeStatus?.authenticated)')
     && codexView.includes('isAcpAuthenticationFailure(latest)'),
   'the code page must host browser/device-code login, block unauthenticated prompts, and refresh after token expiry');
   assert.ok(codexView.includes('codexCopy.temporarySession'), 'temporary sessions must remain an explicit choice');
@@ -387,7 +393,7 @@ try {
   assert.ok(accountTriggerIndex > composerFooterIndex
     && composerConfigsIndex > accountTriggerIndex,
   'Codex session controls must live in the composer footer right of the connection status');
-  assert.ok(codexView.includes('composerControlsVisible && !isNativeAgent && (')
+  assert.ok(codexView.includes('adapter.capabilities.acpComposerControls && adapter.composer.visible && (')
     && codexView.includes('data-testid="codex-composer-configs"')
     && !codexView.includes('创建后同步'),
   'Codex controls must render from the session report or, in draft, the cached agent snapshot');
@@ -520,7 +526,7 @@ try {
     && !codexView.includes('throw new Error(codexCopy.sessionSyncing)'),
   'ACP session restoration must show a loading state and suppress sending without reporting a red error');
   assert.ok(codexView.includes('const activeStatus = status?.agent_id === activeAgentId ? status : null')
-    && codexView.includes('status={activeStatus}')
+    && codexView.includes('status={adapter.activeStatus}')
     && codexView.includes('next?.agent_id === activeAgentIdRef.current')
     && codexView.includes('[activeAgentId, activeStatus?.login_in_progress]'),
   'switching ACP sessions must never render or keep polling the previous Agent status');
@@ -532,12 +538,12 @@ try {
   assert.ok(baseStyles.includes('.codex-markdown ol { list-style:decimal outside; }'),
     'Codex ordered lists must retain numbering after Tailwind preflight');
 
-  // 原生（品悟）车道底栏四控件契约：仅 isNativeAgent 渲染、与 ACP 配置组同一套
-  // CodexComposerConfigSelect 视觉、直调 per-session 命令、绝不复用 bridge 聊天
-  // active 绑定方法。
+  // 原生（品悟）车道底栏四控件契约：仅 native adapter capabilities 声明渲染、与
+  // ACP 配置组同一套 CodexComposerConfigSelect 视觉、直调 per-session 命令、绝不
+  // 复用 bridge 聊天 active 绑定方法。
   const composerControls = readFileSync(path.join(root, 'src', 'features', 'chat', 'composer-controls.jsx'), 'utf8');
   assert.ok(codexView.includes('data-testid="native-composer-controls"')
-    && codexView.includes('{isNativeAgent && (')
+    && codexView.includes('{adapter.capabilities.nativeComposerControls && (')
     && codexView.includes('testId="native-mode"')
     && codexView.includes('testId="native-model"')
     && codexView.includes('testId="native-kb"')
