@@ -860,8 +860,9 @@ impl AppEngine {
         // session_id,execute 时只访问该会话挂载的知识集)。工具常驻所有会话,挂没挂集由
         // 运行时判断。
         engine_config.extra_tools.0.extend(extra_tools);
-        // 工具门控:连接器开关禁用 +(知识库为空时)隐藏 kb_search/kb_open_source。compute 返回
-        // **完整**列表(已含连接器禁用),直接覆盖 build_engine_config 设的「连接器-only」初值,
+        // 工具门控:传入的 `disallowed` 已是 EnginePool 按会话解析的完整工具 profile
+        // (resolve_tool_profile:连接器按会话 scope + kb 不可用隐藏 + 代码会话隐藏
+        // present_artifact),直接覆盖 build_engine_config 设的「plain 连接器-only」初值,
         // 让新会话天生正确——空知识库就看不到知识工具,不会宣称能本地检索。
         let mut scheduled_disallowed_tools = disallowed.clone();
         // One automation run owns exactly one engine turn. Goal tools can

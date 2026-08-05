@@ -26,6 +26,7 @@ Rust 后端按“功能优先、平台适配次之”组织：
 
 当前 Rust 依赖方向为 `lib.rs/app → features → platform/core`。feature 不能引用
 `app/commands`，feature 之间也不能形成依赖环。跨功能协作由组合根注入：Engine 工具和
-工具门控通过 `EngineToolFactory` / `ToolPolicy` 注入，Tauri 事件通过 `AppEventBus`
+知识库可用性通过 `EngineToolFactory` / `KbUsabilityProbe` 注入（工具策略本身声明在
+bridge `resolve_tool_profile`），Tauri 事件通过 `AppEventBus`
 转发，远控附件 staging 通过 `AttachmentStager` 注入。资源 bundle、连接器可见性协调和
 路径安全策略属于跨功能基础设施，统一位于 `platform/`。

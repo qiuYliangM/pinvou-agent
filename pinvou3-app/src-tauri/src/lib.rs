@@ -420,24 +420,20 @@ pub fn run() {
                         )),
                     ]
                 });
-            let tool_policy: crate::features::assistant::engine_pool::ToolPolicy =
+            // kb 可用性探针:只把 KnowledgeService 的运行期状态(有已索引内容且
+            // 语义模型就绪)搬进 EnginePool,不含任何工具策略——策略全部声明在
+            // bridge.resolve_tool_profile(spawn 定型 + Op 热更的单一来源)。
+            let kb_probe: crate::features::assistant::engine_pool::KbUsabilityProbe =
                 std::sync::Arc::new(|app| {
-                    let mut tools = crate::features::marketplace::disabled_tool_names();
-                    let kb_usable = app
-                        .try_state::<knowledge::KnowledgeService>()
+                    app.try_state::<knowledge::KnowledgeService>()
                         .map(|service| service.has_indexed_content() && service.semantic_ready())
-                        .unwrap_or(false);
-                    if !kb_usable {
-                        tools.push("kb_search".to_string());
-                        tools.push("kb_open_source".to_string());
-                    }
-                    tools
+                        .unwrap_or(false)
                 });
             match EnginePool::new_with_dependencies(
                 handle.clone(),
                 store_for_engine.clone(),
                 tool_factory,
-                tool_policy,
+                kb_probe,
             ) {
                 Ok(mut pool) => {
                     // 两个根：执行根（engine cwd/shell）对绑了项目目录的原生代码会话

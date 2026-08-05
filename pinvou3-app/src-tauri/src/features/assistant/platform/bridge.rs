@@ -417,28 +417,46 @@ impl Pinvou3Bridge {
         self.session_kind(session_id) == SessionKind::CodeNative
     }
 
-    /// 会话级工具整形:原生代码会话没有产出物面板/成品卡语义(提示词也不再提及),
-    /// 隐藏 present_artifact;其他会话原样返回。spawn 初值与全局热刷都经此整形。
+    /// 声明式工具 profile:按会话一次性解析完整的 `EngineConfig.disallowed_tools`。
+    /// spawn 定型与热更广播(`EnginePool::refresh_disallowed_tools` →
+    /// `Op::SetDisallowedTools`)的单一来源,与 skill 维度的
+    /// [`Self::shape_disabled_skills`] 同形态(docs/code-native-agent-完全体
+    /// 架构设计.md §1.1 病灶 5:「全局闭包产初值 + 按会话打补丁」两层机制已
+    /// 收编为本解析函数)。
+    ///
+    /// `kb_usable` 是知识库可用性的实时读数(由 EnginePool 注入的探针从
+    /// KnowledgeService 读取;探针只搬运运行期状态,不含工具策略):`false` 时
+    /// 隐藏 kb_search/kb_open_source。
+    ///
+    /// 按会话 kind 解析:
+    /// - 原生代码会话 → kb 不可用隐藏 + code scope 连接器禁用集
+    ///   ([`marketplace::disabled_tool_names_for`] Code;code 未初始化 = 已装
+    ///   连接器全禁的安全默认) + present_artifact 隐藏(代码会话没有产出物
+    ///   面板/成品卡语义,提示词也不再提及)。连接器维度是**替换**语义:plain
+    ///   scope 的连接器禁用不穿透进代码会话(「plain 关、code 开」成立,与
+    ///   disabled_skills 一致);两个 scope 各自持久化(见
+    ///   [`marketplace::ConnectorScope`]),互不影响。
+    /// - 其他会话(普通/ACP/定时) → plain scope 连接器禁用集
+    ///   ([`marketplace::disabled_tool_names`]) + kb 不可用隐藏。ACP 会话走
+    ///   子进程链路不经 EnginePool(见 commands::chat 路由守卫),本分支只是
+    ///   解析完备性兜底;定时会话继承 plain——两者与 profile 化之前逐字节一致。
     ///
     /// skill 维度的隔离由会话能力档案(`disabled_skills`,见
     /// [`Self::shape_disabled_skills`] 与 docs/code-native-agent-会话能力档案设计.md)
     /// 承担——catalogue 不列出 + `load_skill` 按会话集判定,这里不再整体禁用
     /// `load_skill`(过渡方案 D 已退役)。
-    ///
-    /// 传入的 `tools` 是全局(plain scope)的禁用工具名。对代码会话,连接器工具
-    /// 不再沿用 plain scope 的禁用集,而是改用 code scope 的禁用集 —— 两个 scope
-    /// 各自持久化(见 [`marketplace::ConnectorScope`]),互不影响;非连接器禁用
-    /// (kb_search 等)仍保留。
-    pub fn shape_disallowed_tools(&self, session_id: &str, mut tools: Vec<String>) -> Vec<String> {
+    pub fn resolve_tool_profile(&self, session_id: &str, kb_usable: bool) -> Vec<String> {
         const PRESENT_ARTIFACT: &str = "mcp_pinvou3_present_artifact";
         if self.is_code_session(session_id) {
-            // 用 code scope 的连接器禁用集替换 plain scope 的连接器禁用集。
-            let plain_connector = crate::features::marketplace::disabled_tool_names();
-            let code_connector = crate::features::marketplace::disabled_tool_names_for(
+            // 非连接器禁用项(kb 隐藏)在前;连接器禁用集取 code scope。
+            let mut tools = Vec::new();
+            if !kb_usable {
+                tools.push("kb_search".to_string());
+                tools.push("kb_open_source".to_string());
+            }
+            for blocked in crate::features::marketplace::disabled_tool_names_for(
                 crate::features::marketplace::ConnectorScope::Code,
-            );
-            tools.retain(|tool| !plain_connector.iter().any(|blocked| blocked == tool));
-            for blocked in code_connector {
+            ) {
                 if !tools.iter().any(|tool| tool == &blocked) {
                     tools.push(blocked);
                 }
@@ -446,8 +464,15 @@ impl Pinvou3Bridge {
             if !tools.iter().any(|tool| tool == PRESENT_ARTIFACT) {
                 tools.push(PRESENT_ARTIFACT.to_string());
             }
+            tools
+        } else {
+            let mut tools = crate::features::marketplace::disabled_tool_names();
+            if !kb_usable {
+                tools.push("kb_search".to_string());
+                tools.push("kb_open_source".to_string());
+            }
+            tools
         }
-        tools
     }
 
     /// 会话能力档案的 skill 维度:按会话解析 `EngineConfig.disabled_skills`
@@ -459,7 +484,7 @@ impl Pinvou3Bridge {
     ///   (含旧版无前缀裸 id 兼容) + code 禁用连接器的 companion skills,经
     ///   [`skill_marketplace::disabled_skill_names`] 映射为模型可见 skill 名。
     ///   code scope 未初始化时连接器默认全禁,其 companion skills 随之全禁——
-    ///   与 [`Self::shape_disallowed_tools`] 的安全默认一致;`skill:` 条目只在
+    ///   与 [`Self::resolve_tool_profile`] 的安全默认一致;`skill:` 条目只在
     ///   用户显式关闭时落盘,普通 skill 初始默认启用。`Some` 对底座是**替换**
     ///   进程级全局集(非并集):code 开关独立于 plain,「plain 关、code 开」成立。
     /// - 其他会话(普通/ACP/定时) → `None`:无档案,回落进程级全局集合
@@ -1255,7 +1280,10 @@ impl Pinvou3Bridge {
             goal_token_budget,
             goal_status,
             // pinvou3 工具开关:从全局持久的"被禁用连接器"算出禁用工具全名作为初值,
-            // 让新对话/新窗口的引擎都继承用户的开关状态(持久语义)。
+            // 让新对话/新窗口的引擎都继承用户的开关状态(持久语义)。无会话上下文
+            // 的裸 build(含 L1 headless)只含 plain 连接器;spawn_for_session 按会话
+            // 经 `resolve_tool_profile` 覆盖完整 profile(连接器按会话 scope +
+            // kb 不可用隐藏 + 代码会话隐藏 present_artifact)。
             disallowed_tools: {
                 let n = crate::features::marketplace::disabled_tool_names();
                 if n.is_empty() {
@@ -2129,15 +2157,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 声明式工具 profile(resolve_tool_profile):原生代码会话没有产出物面板/成品卡
+    /// 语义(提示词也不再提及),隐藏 present_artifact;普通会话取 plain 集 + kb 隐藏。
     #[test]
-    fn code_session_tool_shaping_hides_present_artifact_only_for_code_sessions() {
+    fn code_session_tool_profile_hides_present_artifact_only_for_code_sessions() {
+        let (_lock, _env) = locked_env(&["PINVOU3_HOME"]);
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou3-bridge-tool-profile-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PINVOU3_HOME", &dir);
+        let kb_hidden = || vec!["kb_search".to_string(), "kb_open_source".to_string()];
+
         let mut bridge = fixture_bridge();
-        // 未注入 resolver：一律按非代码会话处理。
-        let plain = vec!["kb_search".to_string()];
-        assert_eq!(
-            bridge.shape_disallowed_tools("sess-plain", plain.clone()),
-            plain
-        );
+        // 未注入 resolver：一律按普通会话处理 —— plain 连接器禁用集(空) + kb 不可用隐藏。
+        assert_eq!(bridge.resolve_tool_profile("sess-plain", false), kb_hidden());
 
         bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
             if session_id == "sess-code-temp" || session_id == "sess-code-project" {
@@ -2156,35 +2192,36 @@ mod tests {
         assert!(bridge.is_code_session("sess-code-project"));
         assert!(!bridge.is_code_session("sess-plain"));
 
-        // 临时与绑项目的代码会话都隐藏成品卡工具;普通会话不受影响。
+        // 临时与绑项目的代码会话都隐藏成品卡工具;kb 不可用隐藏保持在前。
         // (load_skill 不再在此禁用——skill 隔离由会话能力档案 disabled_skills 承担,
         // 见 code_session_skill_profile_* 测试。)
         for sid in ["sess-code-temp", "sess-code-project"] {
-            let shaped = bridge.shape_disallowed_tools(sid, plain.clone());
-            assert!(shaped.contains(&"mcp_pinvou3_present_artifact".to_string()));
-            assert!(shaped.contains(&"kb_search".to_string()));
-            assert!(!shaped.contains(&"load_skill".to_string()));
-            // 幂等：不重复追加。
-            let twice = bridge.shape_disallowed_tools(sid, shaped);
+            let profile = bridge.resolve_tool_profile(sid, false);
+            let mut expect = kb_hidden();
+            expect.push("mcp_pinvou3_present_artifact".to_string());
+            assert_eq!(profile, expect);
+            assert!(!profile.contains(&"load_skill".to_string()));
+            // 纯解析:重复调用结果一致,不重复追加。
+            assert_eq!(bridge.resolve_tool_profile(sid, false), profile);
+            // kb 可用时只剩 present_artifact 隐藏。
             assert_eq!(
-                twice
-                    .iter()
-                    .filter(|tool| *tool == "mcp_pinvou3_present_artifact")
-                    .count(),
-                1
+                bridge.resolve_tool_profile(sid, true),
+                vec!["mcp_pinvou3_present_artifact".to_string()]
             );
         }
-        assert_eq!(
-            bridge.shape_disallowed_tools("sess-plain", plain.clone()),
-            plain
-        );
+        // 普通会话:plain 集(空) + kb 不可用隐藏;kb 可用时无禁用项。
+        assert_eq!(bridge.resolve_tool_profile("sess-plain", false), kb_hidden());
+        assert!(bridge.resolve_tool_profile("sess-plain", true).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 代码会话的连接器禁用集来自 code scope(独立于 plain scope):
     /// plain 禁用 weather 但 code 未初始化(默认全禁已装连接器)时,weather 仍被禁;
-    /// code 显式只禁用 pptx 时,weather 恢复可用、pptx 保持禁用;非连接器禁用不受影响。
+    /// code 显式只禁用 pptx 时,weather 恢复可用、pptx 保持禁用;非连接器禁用
+    /// (kb 隐藏)不受影响;ACP/定时会话与普通会话同取 plain 集(现状语义保留)。
     #[test]
-    fn code_session_tool_shaping_uses_code_scope_for_connectors() {
+    fn code_session_tool_profile_uses_code_scope_for_connectors() {
         let (_lock, _env) = locked_env(&["PINVOU3_HOME"]);
         let dir =
             std::env::temp_dir().join(format!("pinvou3-bridge-shape-test-{}", std::process::id()));
@@ -2222,10 +2259,11 @@ mod tests {
 
         let mut bridge = fixture_bridge();
         bridge.set_session_kind_resolver(std::sync::Arc::new(|session_id: &str| {
-            if session_id == "sess-code" {
-                SessionKind::CodeNative
-            } else {
-                SessionKind::Chat
+            match session_id {
+                "sess-code" => SessionKind::CodeNative,
+                "sess-acp" => SessionKind::CodeAcp,
+                "sess-sched" => SessionKind::ScheduledRun,
+                _ => SessionKind::Chat,
             }
         }));
 
@@ -2235,25 +2273,47 @@ mod tests {
             ConnectorScope::Plain,
             &["weather".to_string()],
         );
-        // code scope 未初始化 → 默认全禁已装连接器。
-        let tools = vec!["kb_search".to_string()];
-        let shaped = bridge.shape_disallowed_tools("sess-code", tools.clone());
-        assert!(shaped.contains(&weather[0]));
-        assert!(shaped.contains(&pptx[0]));
-        assert!(shaped.contains(&"kb_search".to_string()));
+        // code scope 未初始化 → 默认全禁已装连接器;kb 不可用隐藏与
+        // present_artifact 隐藏一并入档。
+        let profile = bridge.resolve_tool_profile("sess-code", false);
+        assert!(profile.contains(&weather[0]));
+        assert!(profile.contains(&pptx[0]));
+        assert!(profile.contains(&"kb_search".to_string()));
+        assert!(profile.contains(&"kb_open_source".to_string()));
+        assert!(profile.contains(&"mcp_pinvou3_present_artifact".to_string()));
 
         // code 显式只禁 pptx → weather 恢复,pptx 仍禁;plain 的 weather 禁用不再影响代码会话。
         crate::features::marketplace::save_disabled_connectors_for(
             ConnectorScope::Code,
             &["pptx".to_string()],
         );
-        let shaped = bridge.shape_disallowed_tools("sess-code", tools.clone());
-        assert!(!shaped.contains(&weather[0]));
-        assert!(shaped.contains(&pptx[0]));
+        let profile = bridge.resolve_tool_profile("sess-code", false);
+        assert!(!profile.contains(&weather[0]));
+        assert!(profile.contains(&pptx[0]));
+        // kb 可用时代码会话不再隐藏 kb 工具,present_artifact 仍隐藏。
+        let profile = bridge.resolve_tool_profile("sess-code", true);
+        assert!(!profile.iter().any(|tool| tool.starts_with("kb_")));
+        assert!(profile.contains(&"mcp_pinvou3_present_artifact".to_string()));
 
-        // 普通会话不整形:原样返回传入的全局禁用集(全局禁用集由 EnginePool 按 plain scope 计算)。
-        let shaped = bridge.shape_disallowed_tools("sess-plain", tools.clone());
-        assert_eq!(shaped, tools);
+        // 普通/ACP/定时会话同一解析:plain scope 集 + kb 不可用隐藏
+        // (与退役前 tool_policy 闭包 + 不整形的语义逐字节一致)。
+        let plain_profile = vec![
+            weather[0].clone(),
+            "kb_search".to_string(),
+            "kb_open_source".to_string(),
+        ];
+        for sid in ["sess-plain", "sess-acp", "sess-sched"] {
+            assert_eq!(
+                bridge.resolve_tool_profile(sid, false),
+                plain_profile,
+                "{sid} 应取 plain 集"
+            );
+            assert_eq!(
+                bridge.resolve_tool_profile(sid, true),
+                vec![weather[0].clone()],
+                "{sid} kb 可用时不应有隐藏项"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

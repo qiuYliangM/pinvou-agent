@@ -237,7 +237,11 @@ impl PreparedRuntimeState {
 
 pub type EngineToolFactory =
     Arc<dyn Fn(&AppHandle, &str) -> Vec<Arc<dyn ToolSpec>> + Send + Sync + 'static>;
-pub type ToolPolicy = Arc<dyn Fn(&AppHandle) -> Vec<String> + Send + Sync + 'static>;
+/// 知识库可用性探针:只回答「kb 工具当前是否可用」(有已索引内容且语义模型
+/// 就绪),把运行期 app 状态搬进 EnginePool。探针不含任何工具策略——策略全部
+/// 声明在 [`Pinvou3Bridge::resolve_tool_profile`](spawn 定型 + Op 热更的单一
+/// 来源,与 disabled_skills 同形态)。
+pub type KbUsabilityProbe = Arc<dyn Fn(&AppHandle) -> bool + Send + Sync + 'static>;
 
 fn should_sync_session(_is_scheduled: bool, _has_messages: bool) -> bool {
     // SyncSession carries both transcript history and the authoritative Session
@@ -262,7 +266,7 @@ pub struct EnginePool {
     app: AppHandle,
     store: SessionStore,
     tool_factory: EngineToolFactory,
-    tool_policy: ToolPolicy,
+    kb_probe: KbUsabilityProbe,
     runtime_model_provider: Arc<dyn RuntimeModelProvider>,
     /// 所有 session 共享一份已 boot 的 bridge(boot 会写盘 / 设 env,只能一次)。
     /// commands 读 model / workspace 也走这里。
@@ -277,7 +281,7 @@ impl EnginePool {
             app,
             store,
             Arc::new(|_, _| Vec::new()),
-            Arc::new(|_| Vec::new()),
+            Arc::new(|_| true),
         )
     }
 
@@ -285,13 +289,13 @@ impl EnginePool {
         app: AppHandle,
         store: SessionStore,
         tool_factory: EngineToolFactory,
-        tool_policy: ToolPolicy,
+        kb_probe: KbUsabilityProbe,
     ) -> Result<Self> {
         Self::new_with_runtime_model_provider(
             app,
             store,
             tool_factory,
-            tool_policy,
+            kb_probe,
             Arc::new(PassthroughRuntimeModelProvider),
         )
     }
@@ -300,7 +304,7 @@ impl EnginePool {
         app: AppHandle,
         store: SessionStore,
         tool_factory: EngineToolFactory,
-        tool_policy: ToolPolicy,
+        kb_probe: KbUsabilityProbe,
         runtime_model_provider: Arc<dyn RuntimeModelProvider>,
     ) -> Result<Self> {
         let bridge = Pinvou3Bridge::boot()?;
@@ -315,7 +319,7 @@ impl EnginePool {
             app,
             store,
             tool_factory,
-            tool_policy,
+            kb_probe,
             runtime_model_provider,
             bridge,
         })
@@ -341,14 +345,34 @@ impl EnginePool {
         self.model_update_revisions.bump(model_id);
     }
 
-    pub fn compute_disallowed_tools(&self) -> Vec<String> {
-        (self.tool_policy)(&self.app)
+    /// 声明式工具 profile:解析该会话当前完整的 disallowed_tools
+    /// (spawn 初值与热更广播同源,见 [`Pinvou3Bridge::resolve_tool_profile`])。
+    pub fn resolve_tool_profile(&self, session_id: &str) -> Vec<String> {
+        self.bridge
+            .resolve_tool_profile(session_id, (self.kb_probe)(&self.app))
     }
 
-    pub async fn refresh_disallowed_tools(&self) -> Vec<String> {
-        let tools = self.compute_disallowed_tools();
-        self.set_disallowed_all(tools.clone()).await;
-        tools
+    /// 工具开关/kb 门控热更:按会话重新解析 profile 广播给**所有在跑的
+    /// session engine** → 写入各自 config.disallowed_tools,下一轮即生效。
+    /// 每个会话各解各的(代码会话 = code scope 替换集 + present_artifact 隐藏,
+    /// 其余 = plain 集 + kb 不可用隐藏)。没起的会话下次 spawn 时经同一解析拿
+    /// 初值,新窗口/新对话都继承同一份开关状态(持久语义)。
+    /// 触发点:连接器开关(set_disabled_connectors)、知识库删库/状态变化
+    /// (refresh_kb_tool_gate)、挂集 turn 的工具门控补刷(commands::chat)。
+    pub async fn refresh_disallowed_tools(&self) {
+        let entries = self.entries.lock().await;
+        for (sid, entry) in entries.iter() {
+            if let Err(e) = entry
+                .engine
+                .handle
+                .send(Op::SetDisallowedTools {
+                    tools: self.resolve_tool_profile(sid),
+                })
+                .await
+            {
+                eprintln!("[engine_pool] refresh_disallowed_tools {sid} failed: {e:?}");
+            }
+        }
     }
 
     /// 会话能力档案热更:按会话 kind 把 skill 禁用集广播给在跑引擎
@@ -522,8 +546,8 @@ impl EnginePool {
             bridge,
             session_id,
             extra_tools,
-            self.bridge
-                .shape_disallowed_tools(session_id, self.compute_disallowed_tools()),
+            // 声明式工具 profile:spawn 定型的 disallowed_tools 初值。
+            self.resolve_tool_profile(session_id),
             self.turn_lifecycles.for_session(session_id),
             shell_manager,
             turn_shell_tasks,
@@ -929,27 +953,6 @@ impl EnginePool {
         }
         if let Some(cancellation) = shell_cancellation {
             cancellation.cleanup().await;
-        }
-    }
-
-    /// pinvou3 工具开关(全局持久):把"被禁用的工具全名"(模型可见全名,小写)广播给
-    /// **所有在跑的 session engine** → 写入各自 config.disallowed_tools,下一轮即隐藏。
-    /// 没起的会话下次 spawn 时从持久列表读初值(build_engine_config),所以新窗口/新对话
-    /// 都继承同一份禁用状态。
-    pub async fn set_disallowed_all(&self, tools: Vec<String>) {
-        let entries = self.entries.lock().await;
-        for (sid, entry) in entries.iter() {
-            // 全局热刷同样按会话整形（代码会话保留 present_artifact 隐藏）。
-            if let Err(e) = entry
-                .engine
-                .handle
-                .send(Op::SetDisallowedTools {
-                    tools: self.bridge.shape_disallowed_tools(sid, tools.clone()),
-                })
-                .await
-            {
-                eprintln!("[engine_pool] set_disallowed_all {sid} failed: {e:?}");
-            }
         }
     }
 

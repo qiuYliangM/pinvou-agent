@@ -191,11 +191,11 @@ pub(crate) async fn chat_with_reservation(
     // 若 kb_search 当前仍不可用,不要注入“必须调用 kb_search”的提示,避免模型把提示/sudo
     // 状态当普通文本复述给用户。
     if let Some(cid) = store.mounted_collection(&sid) {
-        let disallowed = pool.compute_disallowed_tools();
+        let disallowed = pool.resolve_tool_profile(&sid);
         let kb_search_hidden = disallowed
             .iter()
             .any(|t| t.eq_ignore_ascii_case("kb_search"));
-        pool.set_disallowed_all(disallowed).await;
+        pool.refresh_disallowed_tools().await;
         if !kb_search_hidden {
             let coll_name = app
                 .try_state::<KnowledgeService>()
