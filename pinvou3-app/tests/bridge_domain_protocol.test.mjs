@@ -80,8 +80,10 @@ const protocolSources = {
 
 const expectedProtocolHashes = {
   // P0-A/P0-B 有意协议变更：cancel_generation 返回 CancelOutcome、
-  // chat:done 携带 generation、新增 chat:steer_committed/steer_dropped 监听。
-  chat: 'PLACEHOLDER_CHAT_RECOMPUTE',
+  // chat:done 携带 generation、steer_chat 成功返回 opaque steer_id、
+  // chat:steer_committed/steer_dropped 按 steer_id 结算排队 chip、
+  // 新增 withdraw_steer（排队 chip 的 ×/⚡ 撤回引擎内 steer 副本）。
+  chat: '6918230fed8dcf951ec62316bd30908a9d0855e340b1f0449ceeb4e979679447',
   dependencies: '2cb185d38dabeb35f48773457c182e1c35951b210f5d0fc853b074eb2eb68626',
   interaction: '3f275b9c4fc77ebf42a56df1c84d638ca5f1f8a3b80612efebeddf1a39f14efd',
   knowledge: '9105a42c6b69f04d0bc28b6a72e0746648110a44823891ded3261cdcbc99766b',

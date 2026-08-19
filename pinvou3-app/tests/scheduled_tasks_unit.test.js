@@ -2556,7 +2556,8 @@ async function interruptQueuedFailureRestoresChipToQueue() {
   var view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
   assert.strictEqual(view.queued.length, 1, "⚡ 失败把消息恢复到排队区(不是输入框)");
   assert.strictEqual(view.queued[0].text, "瞬发失败要回排队区");
-  assert.strictEqual(view.queued[0].steerId, "steer-f1", "恢复的 chip 保持 steered,由后续 dropped/committed 事件结算");
+  assert.strictEqual(view.queued[0].steered, false, "恢复的 chip 降级为非 steered:撤回已发出,保持 steered 会阻塞 flushQueued 且下一轮永远不来");
+  assert.strictEqual(view.queued[0].steerId, null, "降级后 steerId 清空,chip 由 flushQueued 正常消费");
   assert.ok(
     view.chatItems.some(function (item) {
       return item.type === "system" && String(item.text || "").indexOf("插队发送失败") >= 0;
