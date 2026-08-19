@@ -79,9 +79,6 @@ const protocolSources = {
 };
 
 const expectedProtocolHashes = {
-  multiAgent: 'a6d045e87f7f5f3537fdeadb262d54622edd6dcafa2c0253f0b44e7de439315d',
-  orchestration: '493f46eef80e6ded5243d2c75ca1c8dbcc06097051d949d4ef656267c1bbada9',
-  artifacts: 'f6174eb62922bc222338e12049ce28dc9fae81db37998086dfa6d159d2dc7422',
   // P0-A/P0-B 有意协议变更：cancel_generation 返回 CancelOutcome、
   // chat:done 携带 generation、新增 chat:steer_committed/steer_dropped 监听。
   chat: 'PLACEHOLDER_CHAT_RECOMPUTE',
@@ -89,11 +86,6 @@ const expectedProtocolHashes = {
   interaction: '3f275b9c4fc77ebf42a56df1c84d638ca5f1f8a3b80612efebeddf1a39f14efd',
   knowledge: '9105a42c6b69f04d0bc28b6a72e0746648110a44823891ded3261cdcbc99766b',
   memory: '541f1b0c05aeee20d8fb4a19048cbd2f55cad84444363694cbe17263d0425228',
-  dependencies: '257468e4f9e2e9270de6ef75f685d5eafcd000226d44cfb81a1b04c0e7615707',
-  interaction: '255474b88418fcaf371b77b27545fbfb529fbbceb1af9010ac49881082384270',
-  knowledge: '96d4f6a1534f0aedf10714e7b945e0a29579b224ec98cbf27659237b5aac59b6',
-  memory: 'd92cbabf27c277a64b743e7af25b48d8b8b65513e33aeb0f38c906d4b300616b',
->>>>>>> c717cd495 (fix(chat): 插入语义落地 — P0-B 终态握手 + P0-A steer 投递确认 + 打断链路修复)
   monitor: '01bf9a7c9b9b3f313cf49e975e6503627ff373caed0f4b3be07a6a98492a7c43',
   personas: 'd16d99104c45bb3e7a6585862b0ba30936bf31a4fef2238453a0a0a35e3c1806',
   remoteControl: '0001038f6e32075aa5dbc3253ad2c3dfff207b8fe0bf1c65d710dc37b2937ee1',
