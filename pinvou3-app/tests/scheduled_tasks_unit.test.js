@@ -2635,6 +2635,141 @@ async function withdrawTooLateCommittedStillBubbles() {
   );
 }
 
+async function steerInvokeHangTimesOutAndRestoresInput() {
+  // MAJOR-1 回归:steer_chat invoke 挂起(不 reject 不 resolve,模拟引擎
+  // 任务卡死)→ 25s 兜底超时后走失败恢复:chip 移除、输入框文字恢复,
+  // 不允许队头悬挂阻塞 flushQueued。
+  var timeouts = [];
+  var harness = createBridgeHarness(null, {
+    setTimeout: function (fn, ms) {
+      timeouts.push({ fn: fn, ms: ms });
+      return timeouts.length; // 不真跑,由测试手动触发模拟超时
+    },
+    clearTimeout: function () {},
+  });
+  var bridge = harness.bridge;
+  assert.strictEqual(await bridge.sessions.switchToSession("chat-steer-hang"), true);
+  harness.emit("chat:turn_started", { session_id: "chat-steer-hang" });
+  await tick();
+  harness.handlers.steer_chat = function () {
+    return new Promise(function () {}); // 永不结算
+  };
+
+  await bridge.chat.sendMessage("卡死也要拿回的一句");
+  await tick();
+  await tick();
+  var view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
+  assert.strictEqual(view.queued.length, 1, "chip 在 steer invoke 在途时显示");
+
+  // 触发 steer 的兜底超时(25s):手动 fire 挂起的 setTimeout。
+  var steerTimer = timeouts.find(function (t) { return t.ms === 25000; });
+  assert.ok(steerTimer, "steer invoke 必须有 25s 兜底超时");
+  steerTimer.fn();
+  await tick();
+  await tick();
+  view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
+  assert.strictEqual(view.queued.length, 0, "超时后悬挂 chip 被移除");
+  assert.strictEqual(bridge.state.getMany(['chat']).composerDraft, "卡死也要拿回的一句", "超时后文字恢复到输入框");
+  assert.ok(
+    view.chatItems.some(function (item) {
+      return item.type === "system" && String(item.text || "").indexOf("插队失败") >= 0;
+    }),
+    "超时给出本地化提示"
+  );
+}
+
+async function interruptQueuedFailureLeavesFlushableChip() {
+  // MAJOR-2 回归:⚡ 失败恢复的 chip 必须降级为非 steered——撤回已发出,
+  // 引擎只在下一轮 drain 时才结算;保持 steered 会让 flushQueued 让路且
+  // 下一轮永远不来(排队区卡死)。降级后 chat:done 触发 flush 正常消费它。
+  var harness = createBridgeHarness();
+  var bridge = harness.bridge;
+  assert.strictEqual(await bridge.sessions.switchToSession("chat-zap-degrade"), true);
+  harness.emit("chat:turn_started", { session_id: "chat-zap-degrade" });
+  await tick();
+  harness.handlers.steer_chat = function () { return "steer-d1"; };
+  harness.handlers.cancel_generation = function () { return { terminal: true, generation: 1 }; };
+  var chatAttempts = 0;
+  harness.handlers.chat = function () {
+    chatAttempts += 1;
+    if (chatAttempts === 1) throw new Error("send boom");
+    return "ok";
+  };
+
+  await bridge.chat.sendMessage("降级后要能重发的一句");
+  await tick();
+  await tick();
+  var queuedId = bridge.state.getMany(['sessions', 'chat', 'scheduled']).queued[0].id;
+  assert.strictEqual(await bridge.chat.interruptAndSendQueued("chat-zap-degrade", queuedId), false, "⚡ 首次失败");
+
+  var view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
+  assert.strictEqual(view.queued.length, 1, "chip 恢复到排队区");
+  assert.strictEqual(view.queued[0].steered, false, "降级为非 steered");
+
+  // 下一轮 done 到来:降级 chip 不再挡 flushQueued,被正常发送。
+  harness.handlers.chat = function () { return "ok"; };
+  harness.emit("chat:done", { session_id: "chat-zap-degrade", generation: 2 });
+  await tick();
+  await tick();
+  view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
+  assert.strictEqual(view.queued.length, 0, "chat:done 后 flush 消费降级 chip(不再被 steered 队头阻塞)");
+}
+
+async function interruptAndSendTimeoutWhileBusyFailsWithoutSending() {
+  // P2 回归(公开 API 超时语义):cancel 返回 terminal=false 后等不到 chat:done,
+  // 25s 兜底超时且会话仍 busy —— interruptAndSend 必须显式 reject 且不调用
+  // chat(此时发送会稳定撞 session_turn_in_progress,调用方不接异常就丢消息)。
+  var timeouts = [];
+  var harness = createBridgeHarness(null, {
+    setTimeout: function (fn, ms) {
+      timeouts.push({ fn: fn, ms: ms });
+      return timeouts.length;
+    },
+    clearTimeout: function () {},
+  });
+  var bridge = harness.bridge;
+  assert.strictEqual(await bridge.sessions.switchToSession("chat-interrupt-timeout"), true);
+  harness.emit("chat:turn_started", { session_id: "chat-interrupt-timeout" });
+  await tick();
+  harness.handlers.cancel_generation = function () { return { terminal: false, generation: 7 }; };
+  harness.handlers.chat = function () { return "ok"; };
+
+  var outcome = null;
+  var p = bridge.chat
+    .interruptAndSend("chat-interrupt-timeout", "超时也要保住的一句", null, [], null, false)
+    .then(function () { outcome = "sent"; }, function (e) { outcome = e; });
+  await tick();
+  await tick();
+  await tick();
+
+  var waitTimer = timeouts.find(function (t) { return t.ms === 25000; });
+  assert.ok(waitTimer, "waitForChatDone 必须有 25s 兜底超时");
+  waitTimer.fn();
+  await p;
+  // 注意:bridge 跑在 vm 上下文里,抛出的 Error 是另一个 realm 的实例,
+  // 不能用 instanceof 判定。
+  assert.ok(
+    outcome && typeof outcome.message === "string",
+    "超时仍 busy 必须显式失败,不能静默发送"
+  );
+  assert.ok(
+    /still busy|not sent/.test(String(outcome && outcome.message)),
+    "错误信息说明取消未完结、消息未发送"
+  );
+  assert.strictEqual(
+    harness.calls.filter(function (call) { return call.cmd === "chat"; }).length,
+    0,
+    "超时仍 busy 时不得尝试 doSendFor(会撞 session_turn_in_progress)"
+  );
+
+  // 会话最终结束(取消 unwind 完成)后,调用方可以安全重试同一条消息。
+  harness.emit("chat:done", { session_id: "chat-interrupt-timeout", generation: 7 });
+  await tick();
+  await tick();
+  var retry = await bridge.chat.interruptAndSend("chat-interrupt-timeout", "超时也要保住的一句", null, [], null, false);
+  assert.strictEqual(retry, true, "turn 终态后重试同一条消息成功(消息未丢失)");
+}
+
 async function transcriptFallbackRecoversAfterCompactionShrink() {
   var harness = createBridgeHarness();
   var bridge = harness.bridge;
@@ -5823,6 +5958,9 @@ Promise.resolve()
   .then(interruptQueuedSteeredChipWithdrawsBeforeSending)
   .then(interruptQueuedFailureRestoresChipToQueue)
   .then(interruptQueuedWhileIdleSendsWithoutCancel)
+  .then(steerInvokeHangTimesOutAndRestoresInput)
+  .then(interruptQueuedFailureLeavesFlushableChip)
+  .then(interruptAndSendTimeoutWhileBusyFailsWithoutSending)
   .then(withdrawTooLateCommittedStillBubbles)
   .then(transcriptFallbackRecoversAfterCompactionShrink)
   .then(terminalEventWinsStaleRunningOpen)
