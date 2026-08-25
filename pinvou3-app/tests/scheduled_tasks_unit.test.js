@@ -2716,8 +2716,7 @@ async function interruptQueuedFailureLeavesFlushableChip() {
   assert.strictEqual(view.queued.length, 0, "chat:done 后 flush 消费降级 chip(不再被 steered 队头阻塞)");
 }
 
-async function interruptAndSendTimeoutWhileBusyFailsWithoutSending() {
-  // P2 回归(公开 API 超时语义):cancel 返回 terminal=false 后等不到 chat:done,
+async function interruptAndSendTimeoutWhileBusyFailsWithoutSending() {  // P2 回归(公开 API 超时语义):cancel 返回 terminal=false 后等不到 chat:done,
   // 25s 兜底超时且会话仍 busy —— interruptAndSend 必须显式 reject 且不调用
   // chat(此时发送会稳定撞 session_turn_in_progress,调用方不接异常就丢消息)。
   var timeouts = [];
