@@ -1,6 +1,8 @@
 (function () {
+  // biome-ignore lint/suspicious/noRedundantUseStrict: verbatim classic-script artifact; strict mode is part of the payload
   "use strict";
 
+  // biome-ignore lint/suspicious/noAssignInExpressions: registry bootstrap of the verbatim payload; splitting statements would diverge from the artifact
   const registry = window.__PINVOU_TAURI_BRIDGE_FEATURES__ = window.__PINVOU_TAURI_BRIDGE_FEATURES__ || {};
   registry.chat = function (context) {
     const state = context.state;
@@ -881,7 +883,11 @@
   // chip 在回填前被用户 × 移除时暂存项会残留,量极小且 steer_id 唯一,可接受。
   const pendingSteerEvents = {};
   function stashSteerEvent(sid, steerId, kind) {
-    const byId = pendingSteerEvents[sid] || (pendingSteerEvents[sid] = Object.create(null));
+    let byId = pendingSteerEvents[sid];
+    if (!byId) {
+      byId = Object.create(null);
+      pendingSteerEvents[sid] = byId;
+    }
     byId[steerId] = kind;
   }
   function takeSteerEvent(sid, steerId) {
@@ -905,7 +911,11 @@
   }
 
   function rememberWithdrawn(sid, steerId, text) {
-    const byId = withdrawnSteers[sid] || (withdrawnSteers[sid] = Object.create(null));
+    let byId = withdrawnSteers[sid];
+    if (!byId) {
+      byId = Object.create(null);
+      withdrawnSteers[sid] = byId;
+    }
     byId[steerId] = String(text || "");
   }
   function takeWithdrawn(sid, steerId) {
