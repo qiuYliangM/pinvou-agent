@@ -1,8 +1,6 @@
 (function () {
-  // biome-ignore lint/suspicious/noRedundantUseStrict: verbatim classic-script artifact; strict mode is part of the payload
   "use strict";
 
-  // biome-ignore lint/suspicious/noAssignInExpressions: registry bootstrap of the verbatim payload; splitting statements would diverge from the artifact
   const registry = window.__PINVOU_TAURI_BRIDGE_FEATURES__ = window.__PINVOU_TAURI_BRIDGE_FEATURES__ || {};
   registry.chat = function (context) {
     const state = context.state;
@@ -53,13 +51,13 @@
   // 排队消息——chat:done handler 在打断消息 doSendFor 之前触发 flushQueued，
   // 若不挡，排队消息会先 reserve 成功、打断消息反而撞 session_turn_in_progress。
   // 打断消息发出（或其失败路径收尾）后清除，排队消息由打断轮的 chat:done 继续。
-  var interruptInFlight = {};
+  const interruptInFlight = {};
 
   // steer_chat invoke 的兜底超时。Rust 侧 steer() await 底座 mpsc send,
   // 引擎任务卡住(不死、不 drain channel)时 invoke 永不结算——输入框已清空、
   // chip 无 steerId 回填,排队区会被这个悬挂 chip 阻塞。25s 与
   // waitForChatDone 的兜底对齐:正常引擎入队是同步量级,25s 只兜真实卡死。
-  var STEER_INVOKE_TIMEOUT_MS = 25000;
+  const STEER_INVOKE_TIMEOUT_MS = 25000;
 
   // ── Chat Items (display format for React) ────────────────────────
   function addChatItem(item) {
@@ -294,7 +292,7 @@
         // 新一轮已被后端受理：会话中未提交的「打开」（pending enable）自此进入
         // 上下文并锁死（ComposerToolMenu 监听）。bridge 层不反向依赖 features，
         // 与 chat-events.js 的 pinvou:tools-changed 一样内联派发。
-        try { window.dispatchEvent(new CustomEvent("pinvou:chat-round-committed", { detail: { scope: "plain" } })); } catch { /* silently ignored */ }
+        try { window.dispatchEvent(new CustomEvent("pinvou:chat-round-committed", { detail: { scope: "plain" } })); } catch { /* dispatch may fail in non-DOM test harness */ }
         recordAuthoritySyncDiagnostic("local_turn_admitted", Object.assign({
           operation: "send",
         }, authoritySyncBufferSnapshot(sid, turnOwnerBuffer)));
@@ -367,7 +365,7 @@
     // 打断在途：排队消息让路，打断消息优先（否则 flush 先 reserve，
     // 打断消息反而撞 turn_in_progress 丢失）。
     if (interruptInFlight[sid]) return;
-    var pendingBuffer = sessionStates[sid];
+    const pendingBuffer = sessionStates[sid];
     if (pendingBuffer && pendingBuffer.remoteTurnActive) {
       reconcileRemoteTurn(sid).then(function (ready) {
         if (ready) flushQueued(sid);
@@ -380,9 +378,9 @@
     // 队首是已投递引擎的 steer chip（等 chat:steer_committed 转气泡 / dropped
     // 移除）→ 让路不发送。它已在引擎侧排队，重复 doSendFor 会变两条消息。
     if (q[0].steered) return;
-    var item = q.shift();
-    var attachments = item.attachments || [];
-    var displayText = item.displayText == null
+    const item = q.shift();
+    const attachments = item.attachments || [];
+    const displayText = item.displayText == null
       ? formatAttachmentDisplayText(item.text, attachments)
       : item.displayText;
     notify();
@@ -451,6 +449,61 @@
         function (error) { return { ok: false, error }; }
       );
     return { accepted: true, queued: false, completion };
+  }
+
+  // steer invoke 返回 steer_id 后的回填:结算早到的 committed/dropped 事件;
+  // chip 在回填前被 ×/⚡ 接走(cancelled)时补发撤回。
+  function onSteerBackfill(queuedItem, sid, steerId) {
+    // 旧后端(无返回值)时 chip 保持无 id,由 transcript_committed
+    // 计数兜底结算;新后端回填 id 后立即结算可能早到的 committed/dropped。
+    queuedItem.steerId = steerId || null;
+    if (!queuedItem.steerId) return;
+    if (queuedItem.cancelled) {
+      withdrawSteerChip(sid, queuedItem);
+      return;
+    }
+    settlePendingSteerEvent(sid, queuedItem);
+  }
+
+  // steer 失败(invoke reject/25s 超时;session 不存在/引擎没起):绝不静默
+  // 降级 invoke("chat") —— busy 下必撞 session_turn_in_progress,文本会
+  // 无痕蒸发。移除 chip、把文本恢复到输入框/草稿并提示,处置权还给用户。
+  // 队列按 sid 路由:steer 最长 25s 才结算,期间用户可能已切走会话,
+  // state.queued 已指向别会话工作集,必须按引用从目标会话队列取 chip
+  // (同 steeredQueueFor 语义),否则 chip(steered:true, steerId:null)
+  // 永久卡在后台会话队头,flushQueued 让路、该会话排队消息全部饿死。
+  function onSteerFailure(queuedItem, sid, steerPreparation, steerInputText, err) {
+    console.warn("[pinvou3][chat-ui] steer failed, restoring draft", {
+      sid, error: err && err.toString ? err.toString() : err,
+    });
+    const failureQueue = steeredQueueFor(sid);
+    const failureIndex = failureQueue ? failureQueue.indexOf(queuedItem) : -1;
+    // 快照恢复带 sid 守卫(会话已切走时不覆盖新会话的 UI turn 状态)——
+    // 与 sendMessage 内 restoreUiTurnState 同口径,这里显式展开(嵌套函数
+    // 不可达)。
+    const snap = steerPreparation.snapshot;
+    if (snap && state.activeSessionId === sid) {
+      state.scheduledTaskPendingGuide = snap.scheduledTaskPendingGuide;
+      state.scheduledTaskCreationSessionId = snap.scheduledTaskCreationSessionId;
+      state.scheduledTaskDraft = snap.scheduledTaskDraft;
+      state.activeSkill = snap.activeSkill;
+    }
+    if (failureIndex >= 0 && state.activeSessionId === sid &&
+        String(state.composerDraft || "").trim() === "") {
+      // 仅在本回调真正接管 chip 且输入框为空时回填:chip 已被 ×/⚡ 接走
+      // 时文本由那条路径处置,再回填会复活已放弃的文字或与 ⚡ 发送中的
+      // 同文重复;输入框已有新内容时覆盖会砸掉用户等待期间打的字。
+      failureQueue.splice(failureIndex, 1);
+      setComposerDraft(steerInputText);
+      prefillComposer(steerInputText);
+    } else if (failureIndex >= 0) {
+      // 输入框被占用或会话已切走:chip 原地降级为纯本地排队(同 ⚡ 失败
+      // 降级语义),文本保留、由 flushQueued 在轮末发送,×/⚡ 仍可用。
+      queuedItem.steered = false;
+      queuedItem.steerId = null;
+    }
+    addSystemItem("⚠️ " + bt("steerFailed"));
+    notify();
   }
 
   async function sendMessage(text, meta) {
@@ -555,85 +608,54 @@
     // 按 steer_id 结算;× 取消走 withdraw_steer 真撤回(见 removeQueued)。
     // 附件:steer 通道只载文本,带附件退回纯本地排队(queuePrepared,
     // 本轮 chat:done 后由 flushQueued 发送)。
-    if (isBusyFor(sid)) {
-      if (readyAttachments.length > 0) {
-        var busyQueuePreparation = consumeUiTurnState();
-        queuePrepared(busyQueuePreparation);
-        return;
+    // busy 分支整体提取为嵌套函数(闭包可达 consumeUiTurnState 等局部
+    // helper),把 sendMessage 认知复杂度压回 lint 阈值内。
+    const busySteerBranch = function () {
+      if (isBusyFor(sid)) {
+        if (readyAttachments.length > 0) {
+          const busyQueuePreparation = consumeUiTurnState();
+          queuePrepared(busyQueuePreparation);
+          return;
+        }
+        const steerPreparation = consumeUiTurnState();
+        const steerText = steerPreparation.payloadText;
+        const steerInputText = text;
+        // 清空 composer draft(对齐 sendMessage 成功路径)。走 setComposerDraft
+        // 同步会话 buffer,切走再切回不会复活已发送文字;后台会话的 steer
+        // (远控等)不得清掉当前活跃会话的输入框。
+        if (state.activeSessionId === sid) setComposerDraft("");
+        // 排队 chip 立即显示。steered=true 标记已投递引擎：flushQueued 跳过它
+        // （防重复发送）。steerId 在 invoke 返回后回填;事件可能早于 invoke
+        // 返回,未决事件按 session 暂存(见下方 pendingSteerEvents)。
+        const queuedItem = {
+          id: ++context.itemIdSeq,
+          text: steerText,
+          displayText: steerText,
+          attachments: [],
+          meta: null,
+          restrictTools: false,
+          queuedAt: Date.now(),
+          steered: true,
+          steerId: null,
+          cancelled: false,
+        };
+        state.queued.push(queuedItem);
+        notify();
+        // 回填/失败恢复提取为模块级函数(显式传参),也把 sendMessage 的
+        // 认知复杂度压回 lint 阈值内。
+        steer(sid, steerText)
+          .then(function (steerId) { onSteerBackfill(queuedItem, sid, steerId); })
+          .catch(function (err) { onSteerFailure(queuedItem, sid, steerPreparation, steerInputText, err); });
       }
-      var steerPreparation = consumeUiTurnState();
-      var steerText = steerPreparation.payloadText;
-      var steerInputText = text;
-      // 清空 composer draft(对齐 sendMessage 成功路径)。走 setComposerDraft
-      // 同步会话 buffer,切走再切回不会复活已发送文字;后台会话的 steer
-      // (远控等)不得清掉当前活跃会话的输入框。
-      if (state.activeSessionId === sid) setComposerDraft("");
-      // 排队 chip 立即显示。steered=true 标记已投递引擎：flushQueued 跳过它
-      // （防重复发送）。steerId 在 invoke 返回后回填;事件可能早于 invoke
-      // 返回,未决事件按 session 暂存(见下方 pendingSteerEvents)。
-      var queuedItem = {
-        id: ++context.itemIdSeq,
-        text: steerText,
-        displayText: steerText,
-        attachments: [],
-        meta: null,
-        restrictTools: false,
-        queuedAt: Date.now(),
-        steered: true,
-        steerId: null,
-        cancelled: false,
-      };
-      state.queued.push(queuedItem);
-      notify();
-      steer(sid, steerText)
-        .then(function (steerId) {
-          // 旧后端(无返回值)时 chip 保持无 id,由 transcript_committed
-          // 计数兜底结算;新后端回填 id 后立即结算可能早到的 committed/dropped。
-          queuedItem.steerId = steerId || null;
-          if (!queuedItem.steerId) return;
-          // ×/⚡ 在 id 回填前已点:chip 已本地移除/转走,补发撤回。
-          if (queuedItem.cancelled) {
-            withdrawSteerChip(sid, queuedItem);
-            return;
-          }
-          settlePendingSteerEvent(sid, queuedItem);
-        })
-        .catch(function (err) {
-          console.warn("[pinvou3][chat-ui] steer failed, restoring draft", {
-            sid: sid, error: err && err.toString ? err.toString() : err,
-          });
-          // steer 失败(session 不存在/引擎没起):绝不静默降级 invoke("chat")
-          // ——busy 下必撞 session_turn_in_progress,文本会无痕蒸发。移除 chip、
-          // 把文本恢复到输入框/草稿并提示,处置权还给用户。
-          // 队列按 sid 路由:steer 最长 25s 才结算,期间用户可能已切走会话,
-          // state.queued 已指向别会话工作集,必须按引用从目标会话队列取 chip
-          // (同 steeredQueueFor 语义),否则 chip(steered:true, steerId:null)
-          // 永久卡在后台会话队头,flushQueued 让路、该会话排队消息全部饿死。
-          var failureQueue = steeredQueueFor(sid);
-          var failureIndex = failureQueue ? failureQueue.indexOf(queuedItem) : -1;
-          restoreUiTurnState(steerPreparation.snapshot);
-          if (failureIndex >= 0 && state.activeSessionId === sid &&
-              String(state.composerDraft || "").trim() === "") {
-            // 仅在本回调真正接管 chip 且输入框为空时回填:chip 已被 ×/⚡ 接走
-            // 时文本由那条路径处置,再回填会复活已放弃的文字或与 ⚡ 发送中的
-            // 同文重复;输入框已有新内容时覆盖会砸掉用户等待期间打的字。
-            failureQueue.splice(failureIndex, 1);
-            setComposerDraft(steerInputText);
-            prefillComposer(steerInputText);
-          } else if (failureIndex >= 0) {
-            // 输入框被占用或会话已切走:chip 原地降级为纯本地排队(同 ⚡ 失败
-            // 降级语义),文本保留、由 flushQueued 在轮末发送,×/⚡ 仍可用。
-            queuedItem.steered = false;
-            queuedItem.steerId = null;
-          }
-          addSystemItem("⚠️ " + bt("steerFailed"));
-          notify();
-        });
+    };
+
+    if (isBusyFor(sid)) {
+      busySteerBranch();
       return;
     }
     // 兼容旧行为:state.queued 非空时仍走 flushQueued(跨 session 远控等边缘场景)
     if (state.queued.length > 0) {
-      var queuedPreparation = consumeUiTurnState();
+      const queuedPreparation = consumeUiTurnState();
       queuePrepared(queuedPreparation);
       flushQueued(sid);
       return;
@@ -825,26 +847,26 @@
   // 引擎没起时 reject。busy 时的 plain send 走这里(见 sendMessage);
   // 远控/其他宿主也可用。
   async function steer(sid, content) {
-    safeConsoleInfo("[pinvou3][chat-ui] steer start", { sid: sid, len: (content || "").length });
+    safeConsoleInfo("[pinvou3][chat-ui] steer start", { sid, len: (content || "").length });
     // invoke 无传输层超时:引擎卡住(不死不 drain)时 steer_chat 永不结算,
     // chip(steered:true, steerId:null)会卡住队头并阻塞 flushQueued。超时
     // 走 catch 的失败恢复(移除 chip、恢复输入框)——若引擎随后恢复并注入,
     // 用户已拿到文字,重复注入由用户重发自行裁决,优于无限悬挂。
-    var invokePromise = invoke("steer_chat", { sessionId: sid, content: String(content || "") });
-    var timeoutId = null;
-    var timeout = new Promise(function (_, reject) {
+    const invokePromise = invoke("steer_chat", { sessionId: sid, content: String(content || "") });
+    let timeoutId = null;
+    const timeout = new Promise(function (_, reject) {
       timeoutId = setTimeout(function () {
         reject(new Error("steer_chat timed out"));
       }, STEER_INVOKE_TIMEOUT_MS);
     });
-    var steerId;
+    let steerId;
     try {
       steerId = await Promise.race([invokePromise, timeout]);
     } finally {
       clearTimeout(timeoutId);
     }
     invokePromise.catch(function () { /* 超时后正常 reject 吞掉,避免 unhandledrejection */ });
-    safeConsoleInfo("[pinvou3][chat-ui] steer accepted", { sid: sid, steerId: steerId });
+    safeConsoleInfo("[pinvou3][chat-ui] steer accepted", { sid, steerId });
     return steerId == null ? null : String(steerId);
   }
 
@@ -853,30 +875,30 @@
   // chip 还没回填 steerId,无法匹配。按 session 暂存 steer_id → 结果,
   // chip 回填 id 时立即结算(sendMessage 的 steer().then)。
   // chip 在回填前被用户 × 移除时暂存项会残留,量极小且 steer_id 唯一,可接受。
-  var pendingSteerEvents = {};
+  const pendingSteerEvents = {};
   function stashSteerEvent(sid, steerId, kind) {
-    var byId = pendingSteerEvents[sid] || (pendingSteerEvents[sid] = Object.create(null));
+    const byId = pendingSteerEvents[sid] || (pendingSteerEvents[sid] = Object.create(null));
     byId[steerId] = kind;
   }
   function takeSteerEvent(sid, steerId) {
-    var byId = pendingSteerEvents[sid];
+    const byId = pendingSteerEvents[sid];
     if (!byId || !byId[steerId]) return null;
-    var kind = byId[steerId];
+    const kind = byId[steerId];
     delete byId[steerId];
     return kind;
   }
   // 已主动撤回的 steer(chip 已乐观移除):此后 dropped 到达 = 撤回生效,
   // 静默(不重复提示);committed 到达 = 撤回太迟(引擎已注入),以引擎为准
   // 用暂存文本补气泡。key = steer_id,值 = 消息文本。
-  var withdrawnSteers = {};
+  const withdrawnSteers = {};
   function rememberWithdrawn(sid, steerId, text) {
-    var byId = withdrawnSteers[sid] || (withdrawnSteers[sid] = Object.create(null));
+    const byId = withdrawnSteers[sid] || (withdrawnSteers[sid] = Object.create(null));
     byId[steerId] = String(text || "");
   }
   function takeWithdrawn(sid, steerId) {
-    var byId = withdrawnSteers[sid];
-    if (!byId || !Object.prototype.hasOwnProperty.call(byId, steerId)) return undefined;
-    var text = byId[steerId];
+    const byId = withdrawnSteers[sid];
+    if (!byId || !Object.prototype.hasOwnProperty.call(byId, steerId)) return;
+    const text = byId[steerId];
     delete byId[steerId];
     return text;
   }
@@ -886,9 +908,9 @@
       : (sessionStates[sid] && sessionStates[sid].queued);
   }
   function findSteerChipIndex(sid, steerId) {
-    var q = steeredQueueFor(sid);
+    const q = steeredQueueFor(sid);
     if (!q) return -1;
-    for (var i = 0; i < q.length; i++) {
+    for (let i = 0; i < q.length; i++) {
       if (q[i] && q[i].steered && q[i].steerId && q[i].steerId === steerId) return i;
     }
     return -1;
@@ -910,7 +932,7 @@
   // 事件先到、chip 后到(回填 steerId)时的立即结算。
   function settlePendingSteerEvent(sid, item) {
     if (!item || !item.steerId) return;
-    var kind = takeSteerEvent(sid, item.steerId);
+    const kind = takeSteerEvent(sid, item.steerId);
     if (!kind) return;
     // chip 可能已被用户 × 移除:队列里找不到就丢弃该事件结果。
     if (findSteerChipIndex(sid, item.steerId) < 0) return;
@@ -922,12 +944,12 @@
   // 等回填 id 后由 settlePendingSteerEvent 结算。
   function settleSteerCommitted(sid, steerId) {
     if (findSteerChipIndex(sid, steerId) < 0) {
-      var withdrawnText = takeWithdrawn(sid, steerId);
+      const withdrawnText = takeWithdrawn(sid, steerId);
       if (withdrawnText !== undefined) {
         runSyncOnSession(sid, function () {
           // ⚡ 成功路径的 doSendFor 已渲染同文气泡 → 跳过防重(竞态窗口极小)。
-          var lastUser = null;
-          for (var i = state.chatItems.length - 1; i >= 0; i--) {
+          let lastUser = null;
+          for (let i = state.chatItems.length - 1; i >= 0; i--) {
             if (state.chatItems[i] && state.chatItems[i].type === "user") { lastUser = state.chatItems[i]; break; }
           }
           if (lastUser && lastUser.text === withdrawnText) return;
@@ -940,10 +962,10 @@
       return;
     }
     runSyncOnSession(sid, function () {
-      var q = steeredQueueFor(sid);
-      var index = findSteerChipIndex(sid, steerId);
+      const q = steeredQueueFor(sid);
+      const index = findSteerChipIndex(sid, steerId);
       if (!q || index < 0) return;
-      var item = q[index];
+      const item = q[index];
       q.splice(index, 1);
       // 消息已进引擎 transcript；气泡用 chip 文本渲染，transcript_committed
       // 稍后会把 state.messages 同步为权威版本。
@@ -961,8 +983,8 @@
       return;
     }
     runSyncOnSession(sid, function () {
-      var q = steeredQueueFor(sid);
-      var index = findSteerChipIndex(sid, steerId);
+      const q = steeredQueueFor(sid);
+      const index = findSteerChipIndex(sid, steerId);
       if (!q || index < 0) return;
       q.splice(index, 1);
       addSystemItem("⚠️ " + bt("steerDropped"));
@@ -986,15 +1008,15 @@
   // 兜底超时。调用方据此前置区分「可以安全 reserve」与「取消 unwind 未完结」。
   function waitForChatDone(sid, generation, timeoutMs) {
     return new Promise(function (resolve) {
-      var timer = null;
-      var resolved = false;
-      var unlisten = null;
+      let timer = null;
+      let resolved = false;
+      let unlisten = null;
       function done(observed) {
         if (resolved) return;
         resolved = true;
         if (timer) { clearTimeout(timer); timer = null; }
         if (unlisten && typeof unlisten === "function") {
-          try { unlisten(); } catch (_) {}
+          try { unlisten(); } catch { /* unlisten may already be gone */ }
           unlisten = null;
         }
         resolve(observed === true);
@@ -1002,11 +1024,11 @@
       // 通过 TAURI.event.listen 直接订阅 webview 事件,匹配 sid 后 resolve。
       // Tauri 2 的 listen 返回 Promise<UnlistenFn>,on 收到事件即回调。
       if (TAURI && TAURI.event && typeof TAURI.event.listen === "function") {
-        var p = TAURI.event.listen("chat:done", function (e) {
+        const p = TAURI.event.listen("chat:done", function (e) {
           if (!e || !e.payload || e.payload.session_id !== sid) {
             return;
           }
-          var payloadGeneration = e.payload.generation;
+          const payloadGeneration = e.payload.generation;
           if (generation != null && payloadGeneration != null &&
               Number(payloadGeneration) !== Number(generation)) {
             return;
@@ -1017,14 +1039,14 @@
           p.then(function (un) {
             // listen 的 Promise 可能晚于超时/事件 resolve:此时立即退订,
             // 否则监听器泄漏一个(有 resolved 守卫无功能危害,但会累积)。
-            if (resolved) { try { un(); } catch (_) {} return; }
+            if (resolved) { try { un(); } catch { /* already unlistened */ } return; }
             unlisten = un;
           }).catch(function () {});
         }
       } else {
         // 兜底:轮询 busy(for 测试环境或 web 模式)
-        var deadline = Date.now() + timeoutMs;
-        var poll = function () {
+        const deadline = Date.now() + timeoutMs;
+        const poll = function () {
           if (resolved) return;
           if (!isBusyFor(sid)) { done(true); return; }
           if (Date.now() >= deadline) { done(false); return; }
@@ -1039,7 +1061,7 @@
   }
 
   async function interruptAndSend(sid, text, displayText, attachments, meta, restrictTools) {
-    safeConsoleInfo("[pinvou3][chat-ui] interrupt-and-send start", { sid: sid });
+    safeConsoleInfo("[pinvou3][chat-ui] interrupt-and-send start", { sid });
     interruptInFlight[sid] = true;
     try {
       // 1) cancel 当前 turn。cancel_generation 返回 CancelOutcome { generation, terminal }：
@@ -1050,7 +1072,7 @@
       //    前端都无法靠等事件收敛，只能由命令返回值确认终态。
       // 按 sid 判断 busy(await 期间用户可能切换会话,state.busy 会张冠李戴)。
       if (isBusyFor(sid)) {
-        var outcome = null;
+        let outcome = null;
         try {
           // keepInbox=true（打断语义）：未注入的 steer 保留给下一轮，排队
           // chip 不被静默取消；停止按钮（cancelGeneration）不传此参数，
@@ -1059,12 +1081,12 @@
         } catch (e) {
           console.warn("[pinvou3][chat-ui] cancel failed before interrupt", e);
         }
-        var terminal = !!(outcome && outcome.terminal);
-        var generation = outcome && outcome.generation;
+        const terminal = !!(outcome && outcome.terminal);
+        const generation = outcome && outcome.generation;
         if (!terminal) {
           // 事件驱动等待（P0-B）：后端保证 chat:done 到达时 reserve 闸门已重开，
           // 不再需要固定 sleep 补窗口。超时仅作最后兜底。
-          var observed = await waitForChatDone(sid, generation, 25000);
+          const observed = await waitForChatDone(sid, generation, 25000);
           if (!observed && isBusyFor(sid)) {
             // 25s 兜底超时且会话仍 busy：取消 unwind 未完结，此时 doSendFor
             // 会稳定撞 session_turn_in_progress。bridge.chat.interruptAndSend
@@ -1081,12 +1103,10 @@
       // 2) 不整体清空 queue：打断只放弃当前轮进度，保留用户排队中的其他消息
       //    （远控注入的 steer 由引擎侧 keepInbox 语义保留给下一轮）。
       // 3) 附件由调用方随消息传入（排队 chip 的 attachments 已是 payload 形态）。
-      var attachmentPayload = attachments || [];
+      const attachmentPayload = attachments || [];
       // 4) 真正发新消息；失败时由调用方负责恢复（chip ⚡ 恢复回排队区）。
-      var result = await doSendFor(sid, text, displayText, attachmentPayload, meta, restrictTools, true);
+      const result = await doSendFor(sid, text, displayText, attachmentPayload, meta, restrictTools, true);
       return result;
-    } catch (e) {
-      throw e;
     } finally {
       interruptInFlight[sid] = false;
     }
@@ -1101,19 +1121,19 @@
   // 结算,保持 steered 会让 flushQueued 让路且下一轮永远不来(排队区卡死);
   // 引擎侧残留由迟到的 steer_committed 补气泡,去重已有处理。
   async function interruptAndSendQueued(sid, queuedId) {
-    var queueOf = function () {
+    const queueOf = function () {
       return sid === state.activeSessionId
         ? state.queued
         : (sessionStates[sid] && sessionStates[sid].queued);
     };
-    var q = queueOf();
+    const q = queueOf();
     if (!q) return false;
-    var index = -1;
-    for (var i = 0; i < q.length; i++) {
+    let index = -1;
+    for (let i = 0; i < q.length; i++) {
       if (q[i] && q[i].id === queuedId) { index = i; break; }
     }
     if (index < 0) return false; // chip 已不在(重复点击/已取消)——天然 single-flight
-    var item = q[index];
+    const item = q[index];
     q.splice(index, 1);
     withdrawSteerChip(sid, item);
     notify();
@@ -1123,7 +1143,7 @@
       );
     } catch (e) {
       console.warn("[pinvou3][chat-ui] interrupt-queued failed, restoring chip", {
-        sid: sid, error: e && e.toString ? e.toString() : e,
+        sid, error: e && e.toString ? e.toString() : e,
       });
       // 恢复的 chip 降级为非 steered(纯本地排队):撤回已发给引擎,引擎只在
       // 下一轮 drain 时才发 steer_dropped 结算;而 chat 发送已失败,若保留
@@ -1135,7 +1155,7 @@
         item.steerId = null;
         item.cancelled = false;
       }
-      var retryQueue = queueOf();
+      const retryQueue = queueOf();
       if (retryQueue) retryQueue.splice(Math.min(index, retryQueue.length), 0, item);
       runSyncOnSession(sid, function () {
         addSystemItem("⚠️ " + bt("interruptQueuedFailed"));
@@ -1172,7 +1192,7 @@
     try {
       await invoke("save_session_messages", { id: state.activeSessionId, messages: state.messages });
       // artifacts 一起落盘，重启/切换 session 后能恢复
-      try { await invoke("save_session_artifacts", { id: state.activeSessionId, paths: state.artifacts.map(function (a) { return a.path; }) }); } catch { /* artifact persistence failure does not block message persistence */ }
+      try { await invoke("save_session_artifacts", { id: state.activeSessionId, paths: state.artifacts.map(function (a) { return a.path; }) }); } catch { /* artifacts persist is best-effort */ }
       // Auto-title
       const meta = state.sessions.find(function (s) { return s.id === state.activeSessionId; });
       if (meta && (isDefaultChatTitle(meta.title) || personaPlaceholderTitles[state.activeSessionId])) {
@@ -1227,10 +1247,10 @@
       dismissPinvouReview,
       persistPinvouReviews,
       cancelGeneration,
-      steer,
-      persistMessages,
       interruptAndSend,
       interruptAndSendQueued,
+      persistMessages,
+      steer,
       settleSteerCommitted,
       settleSteerDropped,
     };
