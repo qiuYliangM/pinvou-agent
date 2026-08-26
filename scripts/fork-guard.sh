@@ -68,7 +68,6 @@ fingerprints=(
   "T1|引擎回收 steer 不静默悬挂回归       |CodeWhale/crates/tui/src/core/engine/tests.rs|fn engine_drop_reports_unconsumed_steers_best_effort"
   "T1|steer 撤回宿主入口                  |CodeWhale/crates/tui/src/core/engine/handle.rs|pub fn withdraw_steer"
   "T1|撤回有界且阻止注入回归             |CodeWhale/crates/tui/src/core/engine/tests.rs|async fn steer_lifecycle_withdrawal_is_bounded_and_prevents_commit"
-  "T2|取消只终止当前轮前台 Shell 回归     |CodeWhale/crates/tui/src/tools/shell/tests.rs|fn kill_running_turn_foreground_scopes_to_this_turns_unowned_foreground_shells"
   "T1|编辑目标分类排除工具结果和内部信封  |CodeWhale/crates/tui/src/runtime_handoff.rs|pub fn edit_last_turn_target"
   "T1|宿主复用权威编辑目标分类            |CodeWhale/crates/tui/src/lib.rs|edit_last_turn_target,"
   "T1|编辑上一轮截断在真实用户消息        |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_edit_last_turn_cuts_at_user_prompt_before_tool_results"
@@ -98,7 +97,6 @@ fingerprints=(
   "T2|旧 action alias 解析为 canonical   |CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn custom_child_allowlist_omitting_load_skill_fails_closed"
   "T2|cancel 只杀本轮前台 shell          |CodeWhale/crates/tui/src/tools/shell.rs|fn kill_running_turn_foreground"
   "T2|前台范围 kill 不误杀后台回归        |CodeWhale/crates/tui/src/tools/shell/tests.rs|fn kill_running_turn_foreground_scopes_to_this_turns_unowned_foreground_shells"
-
   "T3|ambient project authority 密封       |CodeWhale/crates/tui/src/project_context.rs|fn forkguard_runtime_loader_ignores_ambient_project_authority"
   "T3|Permissions 100 KiB 窄例外回归      |CodeWhale/crates/tui/src/prompts.rs|fn forkguard_instruction_fragment_preserves_content_beyond_default_cap"
   "T3|disabled Skill 不可见且不可加载      |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_disabled_skill_is_neither_rendered_nor_loadable"

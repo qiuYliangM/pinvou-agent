@@ -369,7 +369,10 @@ pub(crate) async fn chat_with_reservation(
 ///
 /// 失败模式:
 /// - session 不存在 / engine 没起 → 返回 Err,前端走失败恢复路径
-/// - channel 满 → 走 mpsc::send error 路径,前端按错误展示
+/// - 引擎空闲(无 active turn 可接 steer) → 返回 Err,前端走失败恢复路径
+/// - steer channel 满 → 底座 `reserve_owned().await` 挂起等容量(不是立即
+///   报错);等待期间目标轮切换则报 "steer target changed"。引擎任务卡死
+///   不 drain 时本命令会长期不结算,前端 invoke 已有 25s 兜底超时。
 ///
 /// 返回引擎生成的 opaque steer id,前端据此关联 chat:steer_committed /
 /// chat:steer_dropped 事件。

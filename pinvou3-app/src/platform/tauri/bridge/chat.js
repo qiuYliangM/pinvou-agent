@@ -502,7 +502,11 @@
       queuedItem.steered = false;
       queuedItem.steerId = null;
     }
-    addSystemItem("⚠️ " + bt("steerFailed"));
+    // 提示按 sid 路由:steer 最长 25s 才结算,期间用户可能已切走会话,
+    // 无条件 addSystemItem 会把警告写进当前活跃会话的时间线。
+    runSyncOnSession(sid, function () {
+      addSystemItem("⚠️ " + bt("steerFailed"));
+    });
     notify();
   }
 
@@ -891,6 +895,15 @@
   // 静默(不重复提示);committed 到达 = 撤回太迟(引擎已注入),以引擎为准
   // 用暂存文本补气泡。key = steer_id,值 = 消息文本。
   const withdrawnSteers = {};
+  // 会话删除/驱逐时清掉本会话的 steer 中间状态:暂存事件/撤回文本(含用户
+  // 消息文本,不应驻留已删会话)/打断在途标记。引擎侧残留由底座
+  // SyncSession/Shutdown 的 SteerDropped 兜底,前端无需等事件。
+  function purgeSteerState(sid) {
+    delete pendingSteerEvents[sid];
+    delete withdrawnSteers[sid];
+    delete interruptInFlight[sid];
+  }
+
   function rememberWithdrawn(sid, steerId, text) {
     const byId = withdrawnSteers[sid] || (withdrawnSteers[sid] = Object.create(null));
     byId[steerId] = String(text || "");
@@ -969,7 +982,9 @@
       q.splice(index, 1);
       // 消息已进引擎 transcript；气泡用 chip 文本渲染，transcript_committed
       // 稍后会把 state.messages 同步为权威版本。
-      state.chatItems = state.chatItems.filter(function (ci) { return !ci.turnErrorNotice; });
+      state.chatItems = state.chatItems.filter(function (ci) {
+        return !ci.turnErrorNotice && !ci.authoritySyncNotice;
+      });
       addChatItem({ type: "user", text: item.text, time: timeStr() });
     });
     notify();
@@ -1253,6 +1268,7 @@
       steer,
       settleSteerCommitted,
       settleSteerDropped,
+      purgeSteerState,
     };
   };
 })();

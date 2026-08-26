@@ -1717,7 +1717,11 @@ const ToolWelcomeCard = ({ toolId, _theme, t, onSend }) => {
                   t={t}
                   onSend={(q) => {
                     setWelcomeToolId(null);
-                    sendChatMessage(q);
+                    // sendChatMessage 失败路径会 re-throw(当前实现无 reject,
+                    // 但与 handleSend 的防御保持一致,避免未来变成悬浮异常)。
+                    Promise.resolve(sendChatMessage(q)).catch((err) => {
+                      console.warn("[pinvou3][chat-ui] welcome-card send failed", err);
+                    });
                   }}
                 />
               </div>
@@ -2169,8 +2173,8 @@ const ToolWelcomeCard = ({ toolId, _theme, t, onSend }) => {
                       )}
                       {(!busy || hasDraftText || hasReadyAttachment) && (
                         <button type="button" onClick={handleSend} disabled={!ready}
-                          aria-label={isQueue ? t.queueMsg : t.sendMsg}
-                          title={isQueue ? t.queueMsgTip : t.sendMsg}
+                          aria-label={busy ? t.queueMsg : t.sendMsg}
+                          title={busy ? t.queueMsgTip : t.sendMsg}
                           className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center transition-all ${ready ? (isQueue ? 'bg-gradient-to-b from-[#47A1FF] to-[#007AFF] text-white shadow-md ring-2 ring-amber-300 dark:ring-amber-400' : 'bg-gradient-to-b from-[#47A1FF] to-[#007AFF] text-white shadow-md hover:-translate-y-0.5 active:translate-y-0') : 'bg-black/5 dark:bg-white/10 text-gray-400 cursor-not-allowed'}`}>
                           <Send size={17} className="translate-x-[1px]" />
                         </button>

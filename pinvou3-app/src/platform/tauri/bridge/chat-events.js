@@ -390,7 +390,14 @@
     if (!state.queued || state.queued.length === 0) return;
     invoke("load_session", { id: sid, setActive: false }).then(function (saved) {
       if (!saved || !Array.isArray(saved.messages)) return;
-      const preCount = committedBuffer.lastSeenMessageCount || 0;
+      // 懒初始化基线=快照长度(无更早可信用数)。配对不用 slice(preCount)
+      // 从头数新增,而是「尾部对齐」:从快照尾部向前匹配队首 legacy chip
+      // 的同文 user 消息——历史中的同文旧消息永远排在新注入之前,不会
+      // 被误配对(修复懒初始化首事件 slice(0) 全历史的误 drain)。
+      const lazyBaseline = committedBuffer.lastSeenMessageCount == null;
+      const preCount = lazyBaseline
+        ? saved.messages.length
+        : committedBuffer.lastSeenMessageCount;
       const newMessages = saved.messages;
       // compaction 等会让 transcript 收缩:基线跟着重置,否则
       // newMessages.length <= preCount 恒成立,兜底永久失效。
@@ -398,15 +405,27 @@
         committedBuffer.lastSeenMessageCount = newMessages.length;
         return;
       }
-      if (newMessages.length === preCount) return;
+      // 懒初始化(首次兜底)没有"上一帧"可比,长度相等也要继续——注入刚
+      // 发生时本帧快照的尾部就是注入结果,交给下方尾部对齐校验。
+      if (!lazyBaseline && newMessages.length === preCount) return;
       committedBuffer.lastSeenMessageCount = newMessages.length;
       runSyncOnSession(sid, function () {
         state.messages = newMessages;
-        const userAdditions = newMessages
-          .slice(preCount)
-          .filter(function (m) { return m && m.role === "user"; });
-        for (let i = 0; i < userAdditions.length && state.queued.length > 0; i++) {
-          const message = userAdditions[i];
+        // 尾部对齐:可 drain 的候选 = 快照里 preCount 之后的新增 user 消息;
+        // 懒初始化(preCount === length)时候选为空,但注入刚发生的场景下
+        // 尾部消息本身就是注入结果——用尾部回溯与队首 chip 逐条同文校验,
+        // 只在「尾部连续匹配」时 drain,历史同文旧消息不会误配对。
+        const additions = newMessages.slice(Math.min(preCount, newMessages.length));
+        const userAdditions = additions.filter(function (m) { return m && m.role === "user"; });
+        const tailCandidates = [];
+        for (let i = newMessages.length - 1;
+             i >= 0 && tailCandidates.length < Math.max(state.queued.length, 1) && i >= newMessages.length - 16;
+             i--) {
+          if (newMessages[i] && newMessages[i].role === "user") tailCandidates.unshift(newMessages[i]);
+        }
+        const scanList = userAdditions.length > 0 ? [...userAdditions, ...tailCandidates.slice(userAdditions.length)] : tailCandidates;
+        for (let i = 0; i < scanList.length && state.queued.length > 0; i++) {
+          const message = scanList[i];
           const item = state.queued[0];
           // 只结算 legacy steer chip(steered 且无 steerId):带 id 的由
           // chat:steer_committed 权威结算,普通排队 chip 归 flushQueued,
