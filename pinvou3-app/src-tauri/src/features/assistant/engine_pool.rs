@@ -1983,6 +1983,37 @@ impl EnginePool {
             },
         )
         .await;
+        // 「停止=清空」契约的空闲窗口兜底（第三轮评审点 2）：turn 自然结束、
+        // lifecycle 已空闲（target=None）但前端 busy 未复位时按 ⏹，闸门函数
+        // 阶段一的 idle 守卫不会执行 cancel 闭包，上一轮 keepInbox park 的
+        // steer 会逃过 StopDropInbox、下一轮照常注入且无 chat:steer_dropped。
+        // 此时对在场 engine 补发一次 StopDropInbox——底座只抬高
+        // drop_through_generation 屏障 retire parked steer（无 parked 时
+        // no-op），对已空闲 token 无副作用。仅停止路径做（打断的 keepInbox
+        // 本就要保留 parked steer）；即便与刚 reserve 的新轮竞速，⏹ 语义
+        // 本就是停止该会话一切生成，方向一致。
+        if !keep_inbox && target.is_none() {
+            let still_idle = self
+                .turn_lifecycles
+                .get(session_id)
+                .and_then(|lc| lc.current_turn_generation())
+                .is_none();
+            if still_idle {
+                if let Some(engine) = self.handle_for(session_id).await {
+                    // handle_for 的 await 后再复查一次，缩小区间。
+                    let idle_recheck = self
+                        .turn_lifecycles
+                        .get(session_id)
+                        .and_then(|lc| lc.current_turn_generation())
+                        .is_none();
+                    if idle_recheck {
+                        engine.cancel_current_with_mode(
+                            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+                        );
+                    }
+                }
+            }
+        }
         // 组装轮次结果。`terminal=true` 只允许三种情况：
         //   1) claim 路径——终态由 cancel 自身完成（其 chat:done 发在 cancel
         //      返回前、前端监听器注册前，必然错过，必须由命令返回值确认）；
