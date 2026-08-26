@@ -3018,6 +3018,53 @@ async function transcriptFallbackRecoversAfterCompactionShrink() {
   );
 }
 
+async function transcriptFallbackRoutesByEventSessionNotActiveQueue() {
+  // R4 回归(PR #308 五轮复审):legacy 后端兜底的入口守卫必须按事件 sid 路由
+  // ——旧实现读活跃会话 state.queued,steer 后切走会话时(活跃队列空)整体
+  // return,后台会话的 legacy chip 悬挂并阻塞 flushQueued 队头。
+  const harness = createBridgeHarness();
+  const bridge = harness.bridge;
+  harness.handlers.steer_chat = function () { return null; }; // legacy: 无 steerId
+  const disk = [
+    { role: "user", content: [{ type: "text", text: "背景问题" }] },
+  ];
+  harness.handlers.load_session = function () {
+    return {
+      metadata: { id: "chat-bg-fallback", title: "Bg", message_count: disk.length },
+      transcript_revision: "rev-live",
+      messages: disk,
+      artifacts: [],
+    };
+  };
+  assert.strictEqual(await bridge.sessions.switchToSession("chat-bg-fallback"), true);
+  harness.emit("chat:turn_started", { session_id: "chat-bg-fallback" });
+  await tick();
+
+  await bridge.chat.sendMessage("后台兜底消息");
+  // 切走到别的会话:chip 随工作集进 sessionStates["chat-bg-fallback"].queued,
+  // 活跃会话队列变空——旧守卫在此直接 return,兜底永不执行。
+  assert.strictEqual(await bridge.sessions.switchToSession("other-session"), true);
+
+  disk.push({ role: "user", content: [{ type: "text", text: "后台兜底消息" }] });
+  await harness.emit("chat:transcript_committed", { session_id: "chat-bg-fallback", transcript_revision: "rev-bg1" });
+  await tick();
+  await tick();
+
+  // 切回原会话观察(后台工作集快照不进 getMany 域):chip 必须已被事件路由的
+  // 兜底 drain,并出现用户气泡。
+  assert.strictEqual(await bridge.sessions.switchToSession("chat-bg-fallback"), true);
+  await tick();
+  const view = bridge.state.getMany(['sessions', 'chat', 'scheduled']);
+  assert.strictEqual(view.queued.length, 0, "background legacy chip settles via event-sid-routed fallback");
+  // 气泡已写入后台会话的 chatItems(切回后可见);switchToSession 走缓存
+  // 快路径不重建 items,兜底新增的 item 在切回后仍在。
+  const bubble = view.chatItems.some(function (item) { return item.type === "user" && item.text === "后台兜底消息"; });
+  const inMessages = view.messages.some(function (m) { return m && m.role === "user" && JSON.stringify(m.content).includes("后台兜底消息"); });
+  assert.ok(bubble || inMessages,
+    "background legacy chip turns into a user bubble (or is hydrated from the synced transcript) after switching away"
+  );
+}
+
 async function terminalEventWinsStaleRunningOpen() {
   const harness = createBridgeHarness();
   const bridge = harness.bridge;
@@ -6158,6 +6205,7 @@ Promise.resolve()
   .then(steerTimeoutWhileSwitchedAwayUnblocksBackgroundQueue)
   .then(withdrawTooLateCommittedStillBubbles)
   .then(transcriptFallbackRecoversAfterCompactionShrink)
+  .then(transcriptFallbackRoutesByEventSessionNotActiveQueue)
   .then(terminalEventWinsStaleRunningOpen)
   .then(completedRunReopenPreservesStreamingFollowup)
   .then(scheduledDoneBeforeBufferCreatesTerminalTombstone)

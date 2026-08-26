@@ -110,8 +110,11 @@ struct TurnLifecycleState {
     ///
     /// 此标记由 [`arm_pending_cancel`] 在 cancel 路径设置（仅当 turn 尚未
     /// started），由事件转发器在收到 `TurnStarted` 后通过
-    /// [`take_pending_cancel`] 原子取出并重新 `cancel_current()`——此时
-    /// `reset_cancel_token()` 已经执行过，cancel 命中的是当前轮次的活跃 token。
+    /// [`take_pending_cancel`] 原子取出并按存储的 mode 重放
+    /// `cancel_with_mode`——此时 `reset_cancel_token()` 已经执行过，cancel
+    /// 命中的是当前轮次的活跃 token。mode 必须随标记一起保存：重放若改用
+    /// 无 mode 的 `cancel()`（硬编码 StopDropInbox），⚡（InterruptKeepInbox）
+    /// 在 submit→TurnStarted 窗口的打断会错误清空未注入的排队 steer。
     ///
     /// 携带 arming 时的 [`turn_epoch`]：并发取消请求（C1/C2）中，排队较晚的
     /// C2 在恢复后读到的是「当前 lifecycle」（可能已是新轮）。`take_pending_cancel`
@@ -120,7 +123,7 @@ struct TurnLifecycleState {
     /// [`arm_pending_cancel`]: TurnLifecycle::arm_pending_cancel_and_cancel
     /// [`take_pending_cancel`]: TurnLifecycle::take_pending_cancel
     /// [`turn_epoch`]: TurnLifecycleState::turn_epoch
-    pending_cancel: Option<u64>,
+    pending_cancel: Option<(u64, deepseek_tui::core::engine::CancelMode)>,
 }
 
 /// The durable, user-visible meaning of a submitted engine operation.
@@ -1077,7 +1080,7 @@ impl TurnLifecycle {
     ///
     /// 仅当 turn 处于 active、已 `submitted`、且 `turn_id` 仍为 None（TurnStarted
     /// 未抵达）、且 `turn_epoch == epoch`（仍是发起 cancel 的那一轮）时设置
-    /// `pending_cancel = Some(epoch)`：
+    /// `pending_cancel = Some((epoch, mode))`：
     /// - 必须 `submitted`：未提交的 reservation（消息尚未入队 engine）应由 cancel
     ///   走未提交认领终态路径（`emit_unsubmitted_interrupted_terminal`）立即发
     ///   `chat:done` 使 reservation 失效，而不是挂成 pending——否则空闲 engine 仍
@@ -1142,8 +1145,18 @@ impl TurnLifecycle {
     /// 满足时）并执行 `cancel` 后返回 `true`；epoch 不匹配返回 `false` 且
     /// **不执行** `cancel`，调用方必须整体 no-op。
     ///
+    /// pending 记录 `(epoch, mode)`：转发器重放时按 arming 时调用方传入的
+    /// steer 处置模式（`InterruptKeepInbox`/`StopDropInbox`）重新
+    /// `cancel_with_mode`，而不是无 mode 的 `cancel()`（硬编码
+    /// StopDropInbox）——否则 ⚡ 的 keepInbox 语义在重放路径丢失。
+    ///
     /// [`arm_pending_cancel`]: Self::arm_pending_cancel_and_cancel
-    pub(crate) fn arm_pending_cancel_and_cancel<F>(&self, epoch: u64, cancel: F) -> bool
+    pub(crate) fn arm_pending_cancel_and_cancel<F>(
+        &self,
+        epoch: u64,
+        mode: deepseek_tui::core::engine::CancelMode,
+        cancel: F,
+    ) -> bool
     where
         F: FnOnce(),
     {
@@ -1161,7 +1174,7 @@ impl TurnLifecycle {
             return true;
         }
         if state.submitted && state.turn_id.is_none() && state.active {
-            state.pending_cancel = Some(epoch);
+            state.pending_cancel = Some((epoch, mode));
         }
         // 持锁执行同步取消：reserve_turn 需要同一把 state 锁，无法在
         // 「校验/arm」与「取消」之间插入轮次切换，旧 cancel 不可能命中新轮。
@@ -1173,20 +1186,20 @@ impl TurnLifecycle {
     ///
     /// 由事件转发器在收到 `TurnStarted` 后调用：此时 CodeWhale 的
     /// `reset_cancel_token()` 已执行完毕（它在 `TurnStarted` 之前），
-    /// 重新 `cancel_current()` 命中的正是本轮的活跃 token。
+    /// 按取出的 mode 重新 `cancel_with_mode` 命中的正是本轮的活跃 token。
     ///
     /// 仅当记录的 epoch 仍是 `current_epoch`（仍是 arming 时的那一轮）时才取出
     /// 并返回 `Some`，否则清空并返回 `None`：跨轮泄漏的 stale pending（cancel
     /// arm 到旧轮后，新一轮 TurnStarted 先抵达）被丢弃，不误取消新轮。空闲时
     /// `current_epoch` 由调用方传 0（epoch 自增从 1 起，恒不匹配）。
-    pub(crate) fn take_pending_cancel(&self, current_epoch: u64) -> Option<u64> {
+    pub(crate) fn take_pending_cancel(
+        &self,
+        current_epoch: u64,
+    ) -> Option<(u64, deepseek_tui::core::engine::CancelMode)> {
         let mut state = self.state.lock();
-        match state.pending_cancel {
-            Some(epoch) if epoch == current_epoch => state.pending_cancel.take(),
-            _ => {
-                state.pending_cancel = None;
-                None
-            }
+        match state.pending_cancel.take() {
+            Some((epoch, mode)) if epoch == current_epoch => Some((epoch, mode)),
+            _ => None,
         }
     }
 }
@@ -2069,7 +2082,11 @@ mod turn_lifecycle_tests {
         // reserve 后 active=true 但 submitted=false → arm 不得置位。
         let reservation = lifecycle.reserve().expect("reserve");
         let epoch = lifecycle.current_turn_generation().expect("active epoch");
-        lifecycle.arm_pending_cancel_and_cancel(epoch, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
         assert!(
             lifecycle.take_pending_cancel(epoch).is_none(),
             "must not arm pending_cancel for an unsubmitted reservation"
@@ -2078,7 +2095,11 @@ mod turn_lifecycle_tests {
         // 走真实 send 路径：handle.send 成功后 mark_submitted → submitted=true。
         lifecycle.mark_reservation_submitted(reservation.reservation_id);
         // 已 submitted + active + turn_id=None（TurnStarted 未抵达）→ arm 置位。
-        lifecycle.arm_pending_cancel_and_cancel(epoch, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
         assert!(
             lifecycle.take_pending_cancel(epoch).is_some(),
             "pending_cancel must be armed after submission, before TurnStarted"
@@ -2128,7 +2149,11 @@ mod turn_lifecycle_tests {
         // --- 场景 A：submit 后、TurnStarted 前 arm → take 返回 Some ---
         lifecycle.on_submitted();
         let epoch_a = lifecycle.current_turn_generation().expect("active epoch");
-        lifecycle.arm_pending_cancel_and_cancel(epoch_a, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch_a,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
         assert!(
             lifecycle.take_pending_cancel(epoch_a).is_some(),
             "pending_cancel must be armed before TurnStarted"
@@ -2142,7 +2167,11 @@ mod turn_lifecycle_tests {
         // --- 场景 B：TurnStarted 后 arm → 不置标记 ---
         lifecycle.on_started("turn-1".to_string());
         let epoch_b = lifecycle.current_turn_generation().expect("active epoch");
-        lifecycle.arm_pending_cancel_and_cancel(epoch_b, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch_b,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
         assert!(
             lifecycle.take_pending_cancel(epoch_b).is_none(),
             "must not arm pending_cancel after TurnStarted"
@@ -2175,14 +2204,22 @@ mod turn_lifecycle_tests {
         assert_eq!(epoch2, target + 1, "turn2 must bump the epoch past target");
 
         // stale target：拒绝 + pending 不落到新轮。
-        assert!(!lifecycle.arm_pending_cancel_and_cancel(target, || {}));
+        assert!(!lifecycle.arm_pending_cancel_and_cancel(
+            target,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {}
+        ));
         assert!(
             lifecycle.take_pending_cancel(epoch2).is_none(),
             "rejected arm must not set pending on the new turn"
         );
 
         // 当前 epoch：接受 + pending 置位（turn2 仍 submitted 未 started）。
-        assert!(lifecycle.arm_pending_cancel_and_cancel(epoch2, || {}));
+        assert!(lifecycle.arm_pending_cancel_and_cancel(
+            epoch2,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {}
+        ));
         assert!(
             lifecycle.take_pending_cancel(epoch2).is_some(),
             "accepted arm must set pending for the current turn"
@@ -2215,10 +2252,14 @@ mod turn_lifecycle_tests {
         // 闭包通知「已进入临界区」后阻塞，模拟取消副作用执行中。
         let lc_for_cancel = lifecycle.clone();
         let cancel_thread = std::thread::spawn(move || {
-            let ok = lc_for_cancel.arm_pending_cancel_and_cancel(target, || {
-                entered_tx.send(()).expect("entered");
-                release_rx.recv().expect("release");
-            });
+            let ok = lc_for_cancel.arm_pending_cancel_and_cancel(
+                target,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
+                || {
+                    entered_tx.send(()).expect("entered");
+                    release_rx.recv().expect("release");
+                },
+            );
             assert!(ok, "epoch must match when the cancel side effect runs");
         });
 
@@ -2276,9 +2317,13 @@ mod turn_lifecycle_tests {
         let cancel_ran = Arc::new(AtomicBool::new(false));
         let probe = cancel_ran.clone();
         assert!(
-            !lifecycle.arm_pending_cancel_and_cancel(target, move || {
-                probe.store(true, Ordering::Release);
-            }),
+            !lifecycle.arm_pending_cancel_and_cancel(
+                target,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
+                move || {
+                    probe.store(true, Ordering::Release);
+                }
+            ),
             "stale epoch must be rejected and the cancel closure skipped"
         );
         assert!(
@@ -2316,9 +2361,13 @@ mod turn_lifecycle_tests {
         // 不执行 cancel 闭包、返回 true（调用方按 armed 路径继续，只清遗留
         // 子代理，不误伤尚未启动的定时轮）。
         assert!(
-            lifecycle.arm_pending_cancel_and_cancel(0, move || {
-                probe.store(true, Ordering::Release);
-            }),
+            lifecycle.arm_pending_cancel_and_cancel(
+                0,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
+                move || {
+                    probe.store(true, Ordering::Release);
+                }
+            ),
             "idle must report success so the caller can continue (cascade only)"
         );
         assert!(
@@ -2390,7 +2439,11 @@ mod turn_lifecycle_tests {
 
         // cancel 路径：arm_pending_cancel（turn_id 仍为 None → 置标记）。
         let epoch = lifecycle.current_turn_generation().expect("active epoch");
-        lifecycle.arm_pending_cancel_and_cancel(epoch, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
 
         // Engine 执行 reset_cancel_token + 发 TurnStarted → 转发器先
         // on_started_transition（设 turn_id），再 take_pending_cancel。
@@ -2404,6 +2457,29 @@ mod turn_lifecycle_tests {
 
         // 消费后标记清除，下一轮不受影响。
         assert!(lifecycle.take_pending_cancel(epoch).is_none());
+        assert!(lifecycle.finish_once(|| {}).is_some());
+    }
+
+    #[test]
+    fn pending_cancel_round_trips_steering_mode_for_replay() {
+        // 重放路径的处置模式回归：⚡ 以 InterruptKeepInbox arm 的 pending_cancel，
+        // 转发器 take 出来必须原样带回该 mode——重放若退化为无 mode 的
+        // cancel()（硬编码 StopDropInbox），submit→TurnStarted 窗口的打断
+        // 会错误清空未注入的排队 steer（PR #308 五轮复审 MAJOR）。
+        let lifecycle = Arc::new(TurnLifecycle::default());
+        lifecycle.on_submitted();
+        let epoch = lifecycle.current_turn_generation().expect("active epoch");
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch,
+            deepseek_tui::core::engine::CancelMode::InterruptKeepInbox,
+            || {},
+        );
+        lifecycle.on_started("turn-zap".to_string());
+        assert_eq!(
+            lifecycle.take_pending_cancel(epoch),
+            Some((epoch, deepseek_tui::core::engine::CancelMode::InterruptKeepInbox)),
+            "pending_cancel replay must carry the arming-time CancelMode, not a hardcoded stop-drop"
+        );
         assert!(lifecycle.finish_once(|| {}).is_some());
     }
 
@@ -2462,7 +2538,11 @@ mod turn_lifecycle_tests {
         // 旧轮：submit（epoch=1），arm pending_cancel 绑定到 epoch=1。
         lifecycle.on_submitted();
         let epoch_old = lifecycle.current_turn_generation().expect("old epoch");
-        lifecycle.arm_pending_cancel_and_cancel(epoch_old, || {});
+        lifecycle.arm_pending_cancel_and_cancel(
+            epoch_old,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
+            || {},
+        );
 
         // 结束旧轮，新一轮 reserve（epoch=2）。
         assert!(lifecycle.finish_once(|| {}).is_some());
@@ -2472,9 +2552,8 @@ mod turn_lifecycle_tests {
 
         // forwarder 在新轮 TurnStarted 后用新轮 epoch 取 pending_cancel：
         // C2 留下的 stale pending（epoch_old）必须被丢弃，不重放 cancel。
-        assert_eq!(
-            lifecycle.take_pending_cancel(epoch_new),
-            None,
+        assert!(
+            lifecycle.take_pending_cancel(epoch_new).is_none(),
             "stale pending_cancel bound to a previous epoch must be dropped, not replayed onto the new turn"
         );
     }

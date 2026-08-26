@@ -478,6 +478,7 @@ async fn cancel_turn_with_gates<G, E, EFut, X, F, FFut, C>(
     turn_lifecycles: &SessionTurnLifecycles,
     turn_shell_tasks: &SessionTurnShellTasks,
     session_id: &str,
+    steer_mode: deepseek_tui::core::engine::CancelMode,
     mut get_engine: E,
     mut cancel_current: X,
     mut cascade_cancel: F,
@@ -516,8 +517,9 @@ where
             // （reviewer 点 8）。epoch 不匹配时返回 false 且不执行取消闭包，
             // 阶段二持锁复查 generation 会整体 no-op（reviewer 点 6）。
             if let Some(lifecycle) = turn_lifecycles.get(session_id) {
-                lifecycle
-                    .arm_pending_cancel_and_cancel(target.unwrap_or(0), || cancel_current(&engine));
+                lifecycle.arm_pending_cancel_and_cancel(target.unwrap_or(0), steer_mode, || {
+                    cancel_current(&engine)
+                });
             } else {
                 cancel_current(&engine);
             }
@@ -581,10 +583,11 @@ where
                     // 需要同一把 state 锁，无法在「校验/arm」与「取消」之间插入
                     // 轮次切换。返回 false = 复查通过后轮次已切换：跳过 cancel
                     // 及级联副作用，避免命中新轮活跃 token（reviewer 点 6）。
-                    let armed = lifecycle
-                        .arm_pending_cancel_and_cancel(target.unwrap_or(0), || {
-                            cancel_current(&engine)
-                        });
+                    let armed = lifecycle.arm_pending_cancel_and_cancel(
+                        target.unwrap_or(0),
+                        steer_mode,
+                        || cancel_current(&engine),
+                    );
                     if armed {
                         // 级联取消必须在释放 turn gate 前完成入队（reviewer 点 4）：
                         // 下一轮 SendMessage 需等同一把 turn_lock，级联取消必先入队，
@@ -1943,6 +1946,10 @@ impl EnginePool {
             &self.turn_lifecycles,
             &self.turn_shell_tasks,
             session_id,
+            // steer_mode 一并传给 cancel_turn_with_gates：submit→TurnStarted
+            // 窗口 arm 的 pending_cancel 必须携带同一处置模式，转发器重放时
+            // 才不会退化为无 mode 的 StopDropInbox。
+            steer_mode,
             // get_engine：取在场 engine 句柄（不取消，epoch 校验由
             // cancel_turn_with_gates 在 await 之后、cancel 之前执行，消除
             // handle_for 取 entries 锁期间的 TOCTOU 窗口）。
@@ -3455,6 +3462,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 // get_engine：engine 在场（阶段一与阶段二复查都返回 Some）。
                 || async { Some(()) },
                 // cancel_current：阶段一与阶段二复查都走这里：用计数区分。
@@ -3538,6 +3546,7 @@ mod scheduled_model_tests {
             &lifecycles,
             &shell_tasks,
             sid,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
             // get_engine：engine 在场。
             || async { Some(()) },
             // cancel_current：记录触发。
@@ -3600,6 +3609,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 // get_engine：engine 在场（阶段一与补发复查都返回 Some）。
                 || async { Some(()) },
                 // cancel_current：阶段一执行一次（取消旧轮）。
@@ -3674,6 +3684,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 || async { Some(()) },
                 move |_engine: &()| {
                     probe_cancel.store(true, Ordering::Release);
@@ -3754,6 +3765,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 move || {
                     let entered = entered.clone();
                     let release = release.clone();
@@ -3841,6 +3853,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 // engine 不在场 → get_engine 返回 None → 不取消，走 claim_unsubmitted 分支。
                 || async { None::<()> },
                 // cancel_current：engine 不在场时不应被调用。
@@ -3902,6 +3915,7 @@ mod scheduled_model_tests {
             &lifecycles,
             &shell_tasks,
             sid,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
             // engine 不在场 → get_engine 返回 None → 不 cancel，走 claim_unsubmitted。
             || async { None::<()> },
             // cancel_current：engine 不在场，不应被调用。
@@ -3976,6 +3990,7 @@ mod scheduled_model_tests {
                 &lifecycles,
                 &shell_tasks,
                 sid,
+                deepseek_tui::core::engine::CancelMode::StopDropInbox,
                 // get_engine：第一次调用（阶段一）通知已进入后挂起（模拟
                 // handle_for 取 entries 锁的 await），放行后返回「engine 在场」。
                 // 若实现退化（阶段二缺 generation 守护，即 #205 原始 bug），
@@ -4064,6 +4079,7 @@ mod scheduled_model_tests {
             &lifecycles,
             &shell_tasks,
             sid,
+            deepseek_tui::core::engine::CancelMode::StopDropInbox,
             // get_engine：engine 在场。
             || async { Some(()) },
             // cancel_current 探针：仅计数。cancel 在 state 锁内执行，探针不能

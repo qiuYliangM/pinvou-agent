@@ -937,13 +937,17 @@ const ToolWelcomeCard = ({ toolId, _theme, t, onSend }) => {
       }, [busy, useUnifiedConversationUi, bs && bs.thinking && bs.thinking.startedAt]);
 
       // 外部入口可预填输入框并把焦点移到末尾。
+      // 非空时追加到现有草稿末尾(prefill 现存消费者 handleSend 的失败恢复
+      // 依赖此语义:await 期间用户可能已开始打下一条,整体替换会砸掉新输入
+      // ——与「不打断打字」的恢复注释承诺一致)。
       useEffect(() => {
         if (prefill) {
-          setInputText(prefill);
+          const merged = inputTextRef.current ? inputTextRef.current + prefill : prefill;
+          setInputText(merged);
           setTimeout(() => {
             if (composerRef.current) {
               composerRef.current.focus();
-              composerRef.current.setSelectionRange(prefill.length, prefill.length);
+              composerRef.current.setSelectionRange(merged.length, merged.length);
             }
           }, 80);
           if (onPrefillConsumed) onPrefillConsumed();

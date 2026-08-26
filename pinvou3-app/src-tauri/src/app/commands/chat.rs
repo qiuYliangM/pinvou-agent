@@ -387,6 +387,12 @@ pub async fn steer_chat(
     pool: State<'_, EnginePool>,
     store: State<'_, SessionStore>,
 ) -> Result<String, String> {
+    // 空内容前置校验对齐 chat():否则空 steer 会完整走一轮引擎 round-trip
+    // (分配 permit → 底座 trim 后判空 Drop),前端先建 chip 再收到误导性的
+    // steer_dropped 提示。
+    if content.trim().is_empty() {
+        return Err("empty steer content".to_string());
+    }
     let sid = require_active_sid(session_id, &store)?;
     pool.steer(&sid, content)
         .await

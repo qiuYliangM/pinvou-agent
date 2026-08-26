@@ -387,7 +387,13 @@
     // 计数差 = 新增的 message 数,精确消耗 state.queued 队首对应条数。
     // 只有在增长 > 0 且包含 user-role 新消息时才 drain,避免对其他 commit
     // (subagent 完成、runtime 续轮等)误触发。
-    if (!state.queued || state.queued.length === 0) return;
+    // 守卫必须按事件 sid 路由(后台会话的 chip 在 sessionStates[sid].queued,
+    // 不在活跃工作集):若读活跃会话队列,steer 后切走会话的 legacy chip 会在
+    // 活跃队列为空时整体跳过兜底,后台 chip 悬挂并阻塞 flushQueued 队头。
+    const fallbackQueued = sid === state.activeSessionId
+      ? state.queued
+      : (sessionStates[sid] && sessionStates[sid].queued);
+    if (!fallbackQueued || fallbackQueued.length === 0) return;
     invoke("load_session", { id: sid, setActive: false }).then(function (saved) {
       if (!saved || !Array.isArray(saved.messages)) return;
       // 懒初始化基线=快照长度(无更早可信用数)。配对不用 slice(preCount)
@@ -419,14 +425,14 @@
         const userAdditions = additions.filter(function (m) { return m && m.role === "user"; });
         const tailCandidates = [];
         for (let i = newMessages.length - 1;
-             i >= 0 && tailCandidates.length < Math.max(state.queued.length, 1) && i >= newMessages.length - 16;
-             i--) {
+             i >= 0 && tailCandidates.length < Math.max(fallbackQueued.length, 1) && i >= newMessages.length - 16;
+             i++) {
           if (newMessages[i] && newMessages[i].role === "user") tailCandidates.unshift(newMessages[i]);
         }
         const scanList = userAdditions.length > 0 ? [...userAdditions, ...tailCandidates.slice(userAdditions.length)] : tailCandidates;
         for (let i = 0; i < scanList.length && state.queued.length > 0; i++) {
           const message = scanList[i];
-          const item = state.queued[0];
+          const item = fallbackQueued[0];
           // 只结算 legacy steer chip(steered 且无 steerId):带 id 的由
           // chat:steer_committed 权威结算,普通排队 chip 归 flushQueued,
           // 兜底都不碰,避免误配对。
@@ -446,7 +452,7 @@
           // 精确匹配:旧的双向 indexOf 包含会把前缀相似的不同消息误配对。
           // 不匹配则继续扫描后续新增(基线为 0 时历史 user 消息排在新增前面)。
           if (firstText && firstText === itemText) {
-            state.queued.shift();
+            fallbackQueued.shift();
             addChatItem({ type: "user", text: itemText, time: timeStr() });
           }
         }
