@@ -399,11 +399,15 @@ pub async fn steer_chat(
         .map_err(|e| format!("steer_chat: {e:#}"))
 }
 
-/// 撤回一条尚未注入的 steer（前端排队 chip 的 ✕）。
+/// 撤回一条尚未注入的 steer（前端排队 chip 的 ✕ / ⚡ 瞬发前置）。
 ///
 /// 引擎保证被撤回的 steer_id 永不注入 transcript，并在丢弃时补发一条
-/// `chat:steer_dropped`（幂等）。已 committed 的 id 无副作用、无事件——
-/// 前端乐观移除 chip，不依赖本命令的返回值区分「撤回成功/已注入」。
+/// `chat:steer_dropped`（幂等）。
+///
+/// 返回明确 outcome（评审 P1-1）：`"retired"` = 撤回生效、永不注入，
+/// 前端可安全经其他路径重发；`"not_pending"` = 已 committed/已结算/
+/// 未知 id——注入可能已完成，前端不得重发（气泡由 steer_committed 渲染）。
+/// 底座 `EngineHandle::withdraw_steer` 的 `SteerWithdrawal` 枚举的字符串投影。
 ///
 /// 失败模式：session 不存在 / engine 没起 → 返回 Err（消息未进引擎，
 /// 前端纯本地移除排队 chip 即可）。
@@ -413,7 +417,7 @@ pub async fn withdraw_steer(
     steer_id: String,
     pool: State<'_, EnginePool>,
     store: State<'_, SessionStore>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let sid = require_active_sid(session_id, &store)?;
     pool.withdraw_steer(&sid, steer_id)
         .await

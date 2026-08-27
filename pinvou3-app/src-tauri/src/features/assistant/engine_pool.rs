@@ -2210,10 +2210,17 @@ impl EnginePool {
     ///
     /// engine 不在场 → 返回 Err：消息根本没进引擎，前端纯本地移除即可，
     /// 不需要等任何事件。
-    pub async fn withdraw_steer(&self, session_id: &str, steer_id: String) -> Result<()> {
+    /// 撤回一条尚未注入的 steer，返回明确 outcome（评审 P1-1）：
+    /// `"retired"` = 引擎副本已标记撤回、永不注入（宿主可安全改走其他
+    /// 路径重发同一条消息）；`"not_pending"` = 已 committed/已结算/未知
+    /// （注入可能已完成，宿主不得重发，等 steer_committed 补气泡）。
+    pub async fn withdraw_steer(&self, session_id: &str, steer_id: String) -> Result<&'static str> {
         let engine = require_live_engine_for_steer(self.handle_for(session_id).await, session_id)?;
-        engine.handle.withdraw_steer(&steer_id);
-        Ok(())
+        let outcome = engine.handle.withdraw_steer(&steer_id);
+        Ok(match outcome {
+            deepseek_tui::core::engine::SteerWithdrawal::Retired => "retired",
+            deepseek_tui::core::engine::SteerWithdrawal::NotPending => "not_pending",
+        })
     }
 
     /// super permission 改动后调用。**无需热刷静态 prompt**——sudo 的开/关状态
