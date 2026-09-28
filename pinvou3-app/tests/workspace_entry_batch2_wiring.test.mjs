@@ -23,7 +23,13 @@ test('project-row new-session channel wiring (F4)', () => {
   assert.match(main, /onNewSession: bridge\.projects && pickerProjectRoots\(group\)\.length > 0 \? \(\) => handleProjectNewSession\(group\.projectId\) : undefined/, '侧栏接线(桌面守门+无根门控)');
   // 授权告知同重量(§9.4):不经选择器的直达通道也要在授权一刻给出分模式告知。
   // Round-8 M5:codex 车道 + 第三方 ACP 时改用 recorded-only 文案(§6 stage-gate)。
-  assert.match(main, /handleProjectNewSession[\s\S]*?setSettingsToast\(workspaceGrantNotice\(\s*activeLaneMode\(\),\s*roots\.length,\s*currentView === 'codex' && codexLaneDeliveryLimited,?\s*\)\)/, '项目行新对话的授权告知');
+  // Round-11 M6: the chat lane resolves the notice mode through the bridge's
+  // bound-draft query (the posture the draft takes once the pick binds); the
+  // codex lane keeps the draft agent's own mode via activeLaneMode().
+  assert.match(main, /handleProjectNewSession[\s\S]*?setSettingsToast\(workspaceGrantNotice\(\s*currentView === 'codex' \? activeLaneMode\(\) : chatLaneGrantMode\(\),\s*roots\.length,\s*currentView === 'codex' && codexLaneDeliveryLimited,?\s*\)\)/, '项目行新对话的授权告知');
+  // The chat-lane mode must come from the bridge's post-binding resolution,
+  // not the unbound render-scope snapshot (review #484 round-11 M6).
+  assert.match(main, /chatLaneGrantMode = \(\) => \(\s*bridge\.sessions && typeof bridge\.sessions\.boundDraftMode === 'function'\s*\? bridge\.sessions\.boundDraftMode\(\)/, 'chat 车道授权告知读取绑定后模式');
   // Round-5 M2:chat 车道有活动会话时,桥层 setDraftWorkspace 是静默 no-op
   // (activeSessionId 非空直接 return false),项目行「+」曾经点击无任何反馈。
   // 修法:applyWorkspaceTarget 的 chat 分支先进草稿(与 handleNewChat 同路
@@ -142,8 +148,12 @@ test('manage-folders panel wiring (F6)', () => {
   // recorded 变体(此处无计数门控:加入的文件夹恒为附加根,录而不达总是
   // 成立)。
   assert.match(main, /deliveryLimited=\{currentView === 'codex' && codexLaneDeliveryLimited\}/, '宿主把 codex 送达限制传给面板');
-  assert.match(dialog, /deliveryLimited \? copy\.addNoticeRestrictedRecorded : copy\.addNoticeRestricted/, '受限语气带仅记录变体');
-  assert.match(dialog, /deliveryLimited \? copy\.addNoticeVisibilityRecorded : copy\.addNoticeVisibility/, '可见语气带仅记录变体');
+  // Round-11 m12: the recorded variants are additionally gated on the
+  // project already having a root — a tag-only project's first folder IS the
+  // primary and IS delivered, so the recorded copy would be false there.
+  assert.match(dialog, /deliveryLimited && projectRootCount > 0 \? copy\.addNoticeRestrictedRecorded : copy\.addNoticeRestricted/, '受限语气带仅记录变体');
+  assert.match(dialog, /projectRootCount = Array\.isArray\(project && project\.roots\) \? project\.roots\.length : 0/, '记录变体的根数门控来源');
+  assert.match(dialog, /deliveryLimited && projectRootCount > 0 \? copy\.addNoticeVisibilityRecorded : copy\.addNoticeVisibility/, '可见语气带仅记录变体');
 });
 
 test('composer recents grant notice parity (§9.4)', () => {
