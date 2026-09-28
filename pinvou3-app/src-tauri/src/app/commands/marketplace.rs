@@ -191,6 +191,36 @@ pub async fn install_marketplace_tool(
     .await
     .map_err(|e| format!("任务执行失败: {e}"))??;
 
+    install_marketplace_tool_post_install(tool_id).await?;
+    // 联动安装的 companion 技能影响两个 scope 的启用集：重写在线会话组合目录
+    // （下一轮 prompt 即生效，与 uninstall_marketplace_tool 对称，skill 双 scope
+    // 治理事件驱动时机 §2.3.2）。
+    // mcp.json 可能新增了 server：递增修订号让在线引擎下一轮 get_or_spawn
+    // 安全重建并重新发现工具（mark_mcp_config_updated 契约）。plain 会话的
+    // 引擎读按会话派生的 mcp 配置（仅 spawn 时从全局 mcp.json 重写），不递增
+    // 则中途安装的 server 对活跃引擎永不可见（PPT 场景实测：自动装完 pptx 后
+    // 同会话 mcp_pptx_make_pptx 仍不可见）。code 会话读全局文件、底座每轮
+    // mtime+hash 自愈，此时重建是冗余但无害的一次性开销（与 mark_model_updated
+    // 同粒度的取舍）。
+    pool.mark_mcp_config_updated();
+    // Install state flows into the deny snapshot in both directions (the
+    // NATIVE_PACKAGE_TOOLS ownership gate and the DenyAll scope syncs above
+    // read it): without this refresh live engines keep the pre-install
+    // admission — a package's native tool stays denied, and a newly installed
+    // connector's tools stay admitted — until respawn.
+    hot_refresh(&pool, true).await;
+    Ok(())
+}
+
+/// Post-install legs of `install_marketplace_tool`, extracted verbatim so the
+/// consent-sync / validation ordering and its rollback semantics are
+/// regression-testable without a Tauri harness (review #455 round-23 MAJOR 1c:
+/// the behavior shipped in merge `de04d54a9` had zero test pins). Order is
+/// load-bearing: the consent sync runs BEFORE the network validation; the
+/// rollback uninstall's teardown removes the rows the sync wrote.
+pub(super) async fn install_marketplace_tool_post_install(
+    tool_id: String,
+) -> Result<(), String> {
     // Round-21 MAJOR 2: the consent sync must run IMMEDIATELY after the
     // install commit, BEFORE the network validation — for initialized scopes
     // the stored list is the consent store, and a crash during the network
@@ -286,23 +316,6 @@ pub async fn install_marketplace_tool(
     })
     .await
     .map_err(|e| format!("任务执行失败: {e}"))??;
-    // 联动安装的 companion 技能影响两个 scope 的启用集：重写在线会话组合目录
-    // （下一轮 prompt 即生效，与 uninstall_marketplace_tool 对称，skill 双 scope
-    // 治理事件驱动时机 §2.3.2）。
-    // mcp.json 可能新增了 server：递增修订号让在线引擎下一轮 get_or_spawn
-    // 安全重建并重新发现工具（mark_mcp_config_updated 契约）。plain 会话的
-    // 引擎读按会话派生的 mcp 配置（仅 spawn 时从全局 mcp.json 重写），不递增
-    // 则中途安装的 server 对活跃引擎永不可见（PPT 场景实测：自动装完 pptx 后
-    // 同会话 mcp_pptx_make_pptx 仍不可见）。code 会话读全局文件、底座每轮
-    // mtime+hash 自愈，此时重建是冗余但无害的一次性开销（与 mark_model_updated
-    // 同粒度的取舍）。
-    pool.mark_mcp_config_updated();
-    // Install state flows into the deny snapshot in both directions (the
-    // NATIVE_PACKAGE_TOOLS ownership gate and the DenyAll scope syncs above
-    // read it): without this refresh live engines keep the pre-install
-    // admission — a package's native tool stays denied, and a newly installed
-    // connector's tools stay admitted — until respawn.
-    hot_refresh(&pool, true).await;
     Ok(())
 }
 
