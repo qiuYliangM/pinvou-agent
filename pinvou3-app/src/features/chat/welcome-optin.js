@@ -28,8 +28,12 @@ async function consumeWelcomeOptIn({ getToolId, consume, invoke }) {
     }
     // Round-13 m3: not_applied non-empty = the id matched nothing in the
     // DenyAll expansion (e.g. the install had not committed yet) — nothing
-    // was enabled. Fail-visible like a rejected invoke instead of reporting
-    // success for an opt-in that never happened.
+    // was enabled. Surfaced as a failure instead of reporting success for an
+    // opt-in that never happened. Scope note (round-24 minor 11): this
+    // matches "fail-visible like a rejected invoke" for the UNINITIALIZED
+    // expansion arm only — an initialized scope treats an unknown id as
+    // already-on with an empty not_applied (backend-disclosed round-20
+    // minor 2), where no failure can be reported.
     const notApplied = Array.isArray(outcome && outcome.not_applied) ? outcome.not_applied : [];
     if (notApplied.length) {
       return {

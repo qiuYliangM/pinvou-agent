@@ -48,7 +48,10 @@ async function listHiddenBundles(invoke) {
 // must surface them (round-10 Major 2). not_applied non-empty = those ids
 // matched no entry in the DenyAll expansion (concurrent install not yet
 // committed, or unknown id) — nothing was applied for them; the caller must
-// not present their opt-in as done. Install-default offs lift freely
+// not present their opt-in as done. Scope note (round-24 minor 11): that
+// failure surface exists for the UNINITIALIZED expansion arm only — an
+// initialized scope reports an unknown id as already-on with empty
+// not_applied (backend-disclosed round-20 minor 2). Install-default offs lift freely
 // (round-11 B2); a deliberate opt-out is never silently overridden.
 async function enablePackagesInPlainScope(invoke, packageIds) {
   const outcome = await invoke('enable_marketplace_packages', { packageIds, scope: 'plain' });
