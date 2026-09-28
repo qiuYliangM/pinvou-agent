@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# CodeWhale v0.9.12 clean re-fork guard: 100 commits, eight maintained themes (r3 closed on main without this topic; this PR keeps the transition layering).
+# CodeWhale v0.9.12 clean re-fork guard: 101 commits, eight maintained themes (r3 closed on main without this topic; this PR keeps the transition layering).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEWHALE="$REPO/CodeWhale"
 APP="$REPO/pinvou3-app/src-tauri"
 EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
-EXPECTED_HEAD="18c50a3f651cb74626785c643bd8d9864d8cfc89"
-EXPECTED_COMMITS=100
+EXPECTED_HEAD="faa1190b83bd493af54523a845ff15b9e46767b9"
+EXPECTED_COMMITS=101
 # 过渡期锚点：不可变 r1 tag 的收口 commit。层 0 断言它是当前 head 的祖先，
 # 即 gitlink 沿主题分支领先 tag 而非另起分叉；#54 合入后随登记回收重钉到维护分支头。
 R1_CLOSURE="1fafee7e26b60a59457a43bce50c63aa2ad9dbaf"
