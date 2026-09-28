@@ -1654,7 +1654,10 @@ mod tests {
             .expect("isolated home");
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        let outcome = align_session_keychain(
+        // CodeQL cleartext-logging hygiene (the repo convention): the
+        // outcome carries session ids and user-shaped paths, so the failure
+        // messages assert on fields without interpolating the struct.
+        let outcome = match align_session_keychain(
             "s-converge",
             AlignStores {
                 projects: &store,
@@ -1662,12 +1665,14 @@ mod tests {
                 agents: &agents,
             },
             false,
-        )
-        .expect("align proceeds (the index is the authoritative write)");
-        assert!(outcome.applied, "{outcome:?}");
+        ) {
+            Ok(outcome) => outcome,
+            Err(_) => panic!("align failed before reporting an outcome"),
+        };
+        assert!(outcome.applied);
         assert!(
             outcome.sidecar_stale,
-            "the failed acp-state convergence must surface as sidecar_stale: {outcome:?}"
+            "the failed acp-state convergence must surface as sidecar_stale"
         );
     }
 
