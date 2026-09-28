@@ -210,8 +210,13 @@ const NAV_PREFETCH = {
     // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical
     // evolution; splitting requires a dedicated refactor task (involving a hundred-plus closure handlers and test contracts);
     // only lint fixes here, no behavior change.
+const EMPTY_PICKER_ROWS = [];
+
+    // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical
+    // evolution; splitting requires a dedicated refactor task (involving a hundred-plus closure handlers and test contracts);
+    // only lint fixes here, no behavior change.
     // eslint-disable-next-line sonarjs/cognitive-complexity -- due to the App root component's size; behavior preservation takes priority, split needs a dedicated refactor
-    const App = () => {
+const App = () => {
       if (!appFirstRenderMarked) {
         // One-shot startup marker: module-level boolean set on first render, unrelated to component state (no rerender needed).
         appFirstRenderMarked = true;
@@ -1979,7 +1984,6 @@ const NAV_PREFETCH = {
       // UI thread with the picker closed. Compute only while the picker is
       // open; closed re-runs short-circuit to the shared empty array before
       // any grouping work.
-      const EMPTY_PICKER_ROWS = [];
       const workspacePickerRows = useMemo(() => (
         workspacePicker
           ? computePickerRows({

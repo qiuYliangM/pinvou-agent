@@ -1971,7 +1971,9 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             // conversation still starts at the picked folder, as a plain one.
             console.warn('ensure folder project failed', error);
             if (bridge.sessions.setDraftWorkspace(path) === false) {
-              throw new Error(t.uiProjects.opFailed);
+              // The staging no-op rides an IPC failure; keep the original as
+              // the cause instead of discarding it (preserve-caught-error).
+              throw new Error(t.uiProjects.opFailed, { cause: error });
             }
             return;
           }
