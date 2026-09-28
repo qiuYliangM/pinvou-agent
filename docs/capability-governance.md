@@ -101,9 +101,11 @@ R11-B2）记录 `scopes` 中由**安装默认**写入（非用户显式关闭）
 的 id——安装默认的关可被用户动作（欢迎卡/场景 opt-in）移除，显式 opt-out
 不可。首个版本读取时把旧的
 `disabled_connectors.json`（连接器 id）与 `disabled_skills.json`（技能 id）迁移合并：
-连接器 id 原样进包 id（连接器 id 即包 id），技能 id 经 `bundle::skill_owner_package`
-映射到所属包（companion → MCP/CLI 包，独立技能 → 自身），`skill:` 前缀跨文件借道
-残留统一剥除。旧文件本版本内保留为惰性历史（只读新文件），下个版本周期随旧布局退役。
+连接器 id 原样进包 id（连接器 id 即包 id），技能 id 经 scope 侧的包 id 归一
+（`to_package_id` → `skill_gating_owner`：manifest 认领优先，物理嵌套回退；
+已知包 id 由盾牌直通——评审 #455 round-23 MINOR 1，避免同名技能目录劫持
+stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 → 自身），
+`skill:` 前缀跨文件借道残留统一剥除。旧文件本版本内保留为惰性历史（只读新文件），下个版本周期随旧布局退役。
 
 `hidden_scopes`（可见性）与 `scopes`（disabled，开关）是两套**正交**门控
 （`marketplace/scope.rs`）：
@@ -127,7 +129,14 @@ R11-B2）记录 `scopes` 中由**安装默认**写入（非用户显式关闭）
   批量开启入口（`enable_packages_in_scope`，欢迎卡/场景的
   `enable_marketplace_packages`）例外：未初始化 scope 物化「现算扩集 − 请求
   id」，已初始化 scope 从落盘列表移除，并连带清 hidden（隐藏包即使开关打开也
-  看不到工具）；用户显式关掉的 id（非安装默认）整批拒绝、不改状态。
+  看不到工具）；用户显式关掉的 id（非安装默认）整批拒绝、不改状态；
+- 回收站恢复过**恢复同意门**：恢复的包在已初始化 scope 重新落回默认禁用
+  （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；声明凭据的组合包在
+  未初始化 scope 走强制变体物化同一门（防供给面零同意上线）；门持久化失败
+  在消费回收站条目之前报错，恢复可重试。注意 `enable_packages_in_scope` 的
+  `not_applied` 批判拒只对**已初始化** scope 的落盘 opt-out 有定义——未初始化
+  scope 物化的是现算扩集、无落盘行可对抗，也就没有 `not_applied` 信号
+  （initialized-arm caveat，round-23 MAJOR 2 文档对齐）。
 
 每个模式的默认策略显式声明为**模式身份**（`core/session_mode.rs` 的
 `SessionMode::pack_default_policy()`），不再是存储层的硬编码分支：
