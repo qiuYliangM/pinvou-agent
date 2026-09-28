@@ -2617,8 +2617,10 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                   t={t}
                   onSend={(q) => {
                     // opt-in is unified inside sendChatMessage (R8-2: chip and
-                    // free input share one path); this handler only sends, with
-                    // failure handling matching handleSend.
+                    // free input share one path); this handler only sends. Note
+                    // (round-25 minor 7): unlike handleSend, the chip path does
+                    // NOT restore the blocked-abort draft — that gap is the
+                    // registered chip-prefill item, not an intended match.
                     Promise.resolve(sendChatMessage(q)).catch((err) => {
                       console.warn("[pinvou3][chat-ui] welcome-card send failed", err);
                     });
