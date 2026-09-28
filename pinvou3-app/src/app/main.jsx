@@ -207,9 +207,6 @@ const NAV_PREFETCH = {
   cardpool: () => prefetchView('cardpool'),
 };
 
-    // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical
-    // evolution; splitting requires a dedicated refactor task (involving a hundred-plus closure handlers and test contracts);
-    // only lint fixes here, no behavior change.
 const EMPTY_PICKER_ROWS = [];
 
     // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical

@@ -8,7 +8,6 @@ import {
   computePickerRows,
   pickerPrimaryRoot,
   pickerProjectRoots,
-  projectLastActivity,
   workspaceNoticeTone,
 } from '../src/features/projects/workspacePickerState.js';
 
@@ -82,22 +81,25 @@ test('computePickerRows treats unparseable timestamps as active', () => {
   assert.equal(rows.length, 1, '时间解析失败宁可显示');
 });
 
-test('projectLastActivity falls back to project updated_at without members', () => {
-  const p = project('p1', 'A', ['/w/a'], 0, { updated_at: '2026-09-05T08:00:00Z' });
-  assert.equal(projectLastActivity(p, [], {}), '2026-09-05T08:00:00Z');
+test('picker rows fall back to project updated_at without members', () => {
   // 显式移出的会话不算成员(tier-① null 条目)。
+  const p = project('p1', 'A', ['/w/a'], 0, { updated_at: '2026-09-05T08:00:00Z' });
   const movedOut = item('s1', '/w/a', '2026-09-09T08:00:00Z');
-  assert.equal(projectLastActivity(p, [movedOut], { s1: null }), '2026-09-05T08:00:00Z');
+  const rows = computePickerRows({ projects: [p], items: [movedOut], assignments: { s1: null }, now: Date.now() });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lastActivity, '2026-09-05T08:00:00Z',
+    'the moved-out session must not warm the project past its own updated_at');
 });
 
-test('projectLastActivity resolves membership against the full project list', () => {
+test('picker rows resolve membership against the full project list', () => {
   // 显式归入 B 但物理位于 A root 下的会话不算 A 的成员(否则 A 永远 warm)。
   const a = project('a', 'A', ['/w/a'], 0, { updated_at: '2026-09-05T08:00:00Z' });
   const b = project('b', 'B', ['/w/b'], 1, { updated_at: '2026-09-05T08:00:00Z' });
   const s = item('s1', '/w/a/sub', '2026-09-09T08:00:00Z');
-  const assignments = { s1: 'b' };
-  assert.equal(projectLastActivity(a, [s], assignments, [a, b]), '2026-09-05T08:00:00Z', 'A must not stay warm');
-  assert.equal(projectLastActivity(b, [s], assignments, [a, b]), '2026-09-09T08:00:00Z', 'B is the real member owner');
+  const rows = computePickerRows({ projects: [a, b], items: [s], assignments: { s1: 'b' }, now: Date.now() });
+  assert.equal(rows[0].project.id, 'b', 'B is the real member owner and sorts first');
+  const rowA = rows.find(row => row.project.id === 'a');
+  assert.equal(rowA.lastActivity, '2026-09-05T08:00:00Z', 'A must not stay warm');
 });
 
 test('computePickerRows drops tag-only projects (count/render consistency)', () => {

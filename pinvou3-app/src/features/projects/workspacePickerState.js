@@ -14,25 +14,6 @@ function itemTime(item) {
   return String((item && (item.updatedAt || item.pinnedAt)) || '');
 }
 
-// A project's last activity time: the latest updatedAt of member sessions
-// (explicit assignment + tier-2 auto-grouping), falling back to the project's
-// own updated_at (materialization/edit time) when it has no members.
-// Membership must be resolved against the FULL project list: with only this
-// project passed, a session explicitly filed into project B but physically
-// under A's root would still resolve to A (tier-2 path match) and keep A
-// warm — the membership criterion must match the sidebar grouping exactly.
-export function projectLastActivity(project, items, assignments, projects) {
-  const projectList = Array.isArray(projects) ? projects.filter(Boolean) : [project];
-  let latest = String((project && project.updated_at) || '');
-  (Array.isArray(items) ? items : []).forEach((item) => {
-    if (!item) return;
-    if (resolveSessionProjectId(item, projectList, assignments) !== project.id) return;
-    const time = itemTime(item);
-    if (time > latest) latest = time;
-  });
-  return latest;
-}
-
 // Picker rows (hot view): sorted by most recent use descending; cold
 // projects (materialized projects idle for a long time or whose members all
 // moved out) are hidden. `now` is injected for testability.
@@ -54,8 +35,10 @@ export function computePickerRows({ projects, items, assignments, now }) {
   const projectList = (Array.isArray(projects) ? projects : []).filter(Boolean);
   const ordered = orderedProjectsByPosition(projectList);
   // One pass over the bound items: latest member activity per project.
-  // Membership must be resolved against the FULL project list (see
-  // projectLastActivity) with the same tiers the sidebar grouping uses.
+  // Membership must be resolved against the FULL project list: with only the
+  // row's own project passed, a session explicitly filed into project B but
+  // physically under A's root would still resolve to A (tier-2 path match)
+  // and keep A warm — the criterion must match the sidebar grouping exactly.
   const activityByProject = new Map();
   (Array.isArray(items) ? items : []).forEach((item) => {
     if (!item) return;
