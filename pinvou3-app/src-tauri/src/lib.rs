@@ -59,12 +59,11 @@ const RELEASE_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS", "280"),
 ];
 
-/// 为 release 安装包（.deb 双击启动场景）注入 run-dev.sh 里集中处理的运行时 env。
-/// dev 启动走 run-dev.sh 已经 export 过的不会被覆盖（var_os().is_none() 守门）。
-/// §6 钥匙串快照组合解析(评审 #484 round-13 M4 提取并钉死):code/ACP
-/// 会话读 session-agents 记录(权威),记录为空回落纯绑定 sidecar,两边都空
-/// = 单根(底座按 cwd 归一)。此前是内联闭包,审计变异(删掉 agents 优先
-/// 分支)时全部宿主测试仍然绿;提成自由函数让交付优先级可被行为测试钉住。
+/// §6 钥匙串快照组合解析(评审 #484 round-13 M4 提取并钉死;round-14 修正
+/// 文档错位):code/ACP 会话读 session-agents 记录(权威),记录为空回落纯
+/// 绑定 sidecar,两边都空 = 单根(底座按 cwd 归一)。此前是内联闭包,审计
+/// 变异(删掉 agents 优先分支)时全部宿主测试仍然绿;提成自由函数让交付
+/// 优先级可被行为测试钉住。
 pub(crate) fn compose_workspace_roots(
     agents: &crate::features::codex_acp::SessionAgentStore,
     bindings: &crate::features::sessions::SessionStore,
@@ -77,6 +76,8 @@ pub(crate) fn compose_workspace_roots(
     bindings.session_workspace_roots(session_id)
 }
 
+/// 为 release 安装包（.deb 双击启动场景）注入 run-dev.sh 里集中处理的运行时 env。
+/// dev 启动走 run-dev.sh 已经 export 过的不会被覆盖（var_os().is_none() 守门）。
 fn ensure_release_env() {
     use std::env;
     crate::platform::ui_cache::configure_runtime_environment();

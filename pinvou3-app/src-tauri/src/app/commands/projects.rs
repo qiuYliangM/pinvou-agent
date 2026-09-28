@@ -191,9 +191,13 @@ pub async fn update_project(
     sessions: State<'_, SessionStore>,
     acp_pool: State<'_, AcpPool>,
 ) -> Result<ProjectListItem, String> {
-    // Gated only when roots can change: a rename cannot re-add a from-prefixed
-    // root, and fencing it would reject a harmless rename for the whole rebind.
-    let _fence = if roots.is_some() {
+    // Gated whenever translation-domain state can change: the roots
+    // replacement AND the standalone primary-root patch (review #484
+    // round-14 MAJOR 1 — the frontend's setPrimaryRoot sends only
+    // lastPrimaryRoot, so gating on `roots.is_some()` left the shape
+    // everybody sends unfenced while fencing a shape nobody sends). A pure
+    // rename cannot re-add a from-prefixed root and stays fence-free.
+    let _fence = if roots.is_some() || last_primary_root.is_some() {
         Some(store.rebind_fence()?)
     } else {
         None
@@ -212,10 +216,11 @@ pub async fn update_project(
             .map_err(|e| format!("update_project({project_id}): {e:#}"))?,
     };
     // 记住的主文件夹(§9.2):显式补丁,必须是 roots 成员(由 store 校验)。
-    // Inside the same fence as the roots replacement above (review #484
-    // round-13 minor 2): last_primary_root memory is translated by the
-    // rebind, so committing it after releasing the fence would let it land
-    // under a stale `from` spelling. The guard drops at scope end.
+    // Inside the fence (review #484 round-13 minor 2, gate widened by
+    // round-14 MAJOR 1 to cover this standalone patch): last_primary_root
+    // memory is translated by the rebind, so committing it unfenced would
+    // let it land under a stale `from` spelling. The guard drops at scope
+    // end.
     let project = match last_primary_root {
         Some(root) => match store.set_last_primary_root(&project_id, &root) {
             Ok(updated) => updated,
@@ -1607,6 +1612,63 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&project_root);
         let _ = std::fs::remove_dir_all(&extra);
+    }
+
+    /// Round-14 MAJOR 2: the store-level `state_committed = Some(false)` is
+    /// only half the M3 closure — this pins the flag reaching the align
+    /// OUTCOME through the kernel (deleting the
+    /// `|| write.state_committed == Some(false)` leg reds here, restoring
+    /// the exact swallowed-failure behavior the round-11 M8 convergence
+    /// closed). The acp-state artifact is pre-created as an unwritable
+    /// directory under the isolated home; spawn owns its creation, so a
+    /// pre-existing-but-unusable copy is the convergence-failure shape.
+    #[test]
+    fn align_surfaces_a_failed_acp_state_convergence() {
+        let (sessions, _g) = isolated_home_session_store();
+        let project_root = unique_dir("converge-proj");
+        let extra = unique_dir("converge-extra");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let store = project_store_in(&unique_dir("converge-store"));
+        store
+            .create_project("p".to_string(), vec![project_root.clone(), extra.clone()])
+            .expect("create project");
+        let agents = SessionAgentStore::for_test(unique_dir("converge-agents").join("agents.json"));
+        agents
+            .set_acp_workspace(
+                "s-converge",
+                crate::features::codex_acp::AgentBackend::CodexAcp,
+                crate::features::codex_acp::CodexWorkspaceKind::Project,
+                Some(project_root.clone()),
+                vec![project_root.clone()],
+            )
+            .expect("seed agents record");
+        // The unwritable durable artifact: acp-state.json as a directory.
+        let state_dir = std::env::var("PINVOU3_HOME")
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join("sessions")
+                    .join("s-converge")
+                    .join("acp-state.json")
+            })
+            .expect("isolated home");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let outcome = align_session_keychain(
+            "s-converge",
+            AlignStores {
+                projects: &store,
+                sessions: &sessions,
+                agents: &agents,
+            },
+            false,
+        )
+        .expect("align proceeds (the index is the authoritative write)");
+        assert!(outcome.applied, "{outcome:?}");
+        assert!(
+            outcome.sidecar_stale,
+            "the failed acp-state convergence must surface as sidecar_stale: {outcome:?}"
+        );
     }
 
     /// Plain binding channel: align writes the sidecar, preserving the
