@@ -3534,7 +3534,7 @@ export function CodexAcpView({
                   // gate the align entry on the desktop capability, not the
                   // raw isWeb flag, so the two lanes cannot drift if the
                   // capability and the platform kind ever diverge.
-                  canAlign={can('desktopChrome') && !!resolveSessionProjectId(
+                  canAlign={can('desktopChrome') && typeof alignAcpSession === 'function' && !!resolveSessionProjectId(
                     { id: activeId, workspaceKind: 'project', workspacePath: activeSession.workspace_path },
                     (bs && bs.projectsList && bs.projectsList.projects) || [],
                     (bs && bs.projectsList && bs.projectsList.assignments) || {},
