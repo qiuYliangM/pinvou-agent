@@ -378,7 +378,17 @@ pub async fn ima_logout() -> Result<Value, String> {
         let store = SystemCredentialStore::new();
         let client_result = store.delete(&client_id_ref());
         let api_key_result = store.delete(&api_key_ref());
-        let _ = SkillMarketplaceManager::new().uninstall(IMA_SKILL_ID);
+        // Round-25 MAJOR 4: a swallowed uninstall failure must NOT reach the
+        // consent cleanup — with `bundles/ima/` still on disk, stripping its
+        // consent rows would set ima-skills live with zero consent in every
+        // initialized scope while logout reported success. Surface the
+        // uninstall failure instead; the logout stays retryable (the consent
+        // rows and the pack dir are both intact).
+        if let Err(e) = SkillMarketplaceManager::new().uninstall(IMA_SKILL_ID) {
+            return Err(format!(
+                "ima 登出：技能卸载失败，包保持安装且同意行不变，可重试: {e}"
+            ));
+        }
         // 已卸载技能从各 scope 禁用集清除残留；在线会话组合目录由命令层
         // （connectors::ima_logout）重写。引用 marketplace::scope 避免
         // connectors → assistant 依赖环。

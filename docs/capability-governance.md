@@ -1,8 +1,9 @@
 # 能力治理（Capability Governance）
 
 本文档描述 pinvou3 当前的能力治理架构：哪些能力存在、谁决定它们在某个会话
-中可用、运行时如何生效。取代已删除的 `tool-governance.md`（v0.9.0 blocklist
-时代）与 `skill-scope-governance-改动说明.md`（PR 验收记录，内容已沉淀于此）。
+中可用、运行时如何生效。取代 `tool-governance.md`（v0.9.0 blocklist 时代；
+该文件内容尚未全部并入本文，迁移完成前以其为准的部分仍按原文件执行）与
+`skill-scope-governance-改动说明.md`（PR 验收记录，内容已沉淀于此）。
 
 > **落地状态**（2026-09-18）：§1、§2 为现状（能力档案已退役，模式能力差量
 > 已收敛为静态表 `MODE_TABLE`）；§3 的存储已收敛为**单一 `disabled_bundles.json`**
@@ -133,10 +134,12 @@ stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 �
 - 回收站恢复过**恢复同意门**：恢复的包在已初始化 scope 重新落回默认禁用
   （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；声明凭据的组合包在
   未初始化 scope 走强制变体物化同一门（防供给面零同意上线）；门持久化失败
-  在消费回收站条目之前报错，恢复可重试。注意 `enable_packages_in_scope` 的
-  `not_applied` 批判拒只对**已初始化** scope 的落盘 opt-out 有定义——未初始化
-  scope 物化的是现算扩集、无落盘行可对抗，也就没有 `not_applied` 信号
-  （initialized-arm caveat，round-23 MAJOR 2 文档对齐）。
+  在消费回收站条目之前报错，恢复可重试。注意两个上报信号的方向（round-24
+  MAJOR 5 文档勘误，此前一句写反）：`blocked` 整批判拒只对**已初始化** scope
+  的落盘 opt-out 有定义（未初始化 scope 物化的是现算扩集，不存在可对抗的
+  落盘行）；`not_applied` 则**只由未初始化的现算扩集臂产生**——请求 id 不在
+  扩集中即上报；**已初始化** scope 没有等价信号，恒返回空（未知 id 视为
+  已开启且不上报——空 `not_applied` 在该状态下不是覆盖证明）。
 
 每个模式的默认策略显式声明为**模式身份**（`core/session_mode.rs` 的
 `SessionMode::pack_default_policy()`），不再是存储层的硬编码分支：

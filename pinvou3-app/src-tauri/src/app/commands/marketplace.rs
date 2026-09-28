@@ -311,7 +311,13 @@ pub(super) async fn install_marketplace_tool_post_install(tool_id: String) -> Re
             // companion's owner pack is this tool, whose consent state the sync
             // above already covered, so a failure here is logged and the loop
             // continues (it must not block the remaining companions, nor fail
-            // the whole command).
+            // the whole command). Scope note (round-25 minor 4): this is a
+            // no-op in the normal case, but NOT provably one — via the
+            // known-pack-shield edge (a standalone pack dir named exactly like
+            // the companion) the normalized id can differ from the tool id and
+            // the sync becomes a real write whose failure is swallowed here;
+            // renaming such a companion or failing loud is a follow-up
+            // candidate, not the steady state.
             if let Err(e) = crate::features::marketplace::scope::sync_deny_all_scopes_after_install(&sid)
             {
                 eprintln!(

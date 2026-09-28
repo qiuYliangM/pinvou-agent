@@ -517,9 +517,30 @@ pub(crate) fn recycle_upload_package(
 /// is named there too — round-21 minor 4). Only this function's internal
 /// order is claimed here, not global consistency with the uninstall path.
 pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
+    // Round-25 minor 9: mirror take_back's doomed-restore guards BEFORE the
+    // consent gate — a restore onto a live same-id reinstall (or a missing
+    // bin dir) would otherwise write the gate row + install-default marker
+    // (silently switching the user's enabled pack OFF, mis-attributed as
+    // liftable) before take_back refuses; a malformed id would write phantom
+    // rows persistently.
+    if !super::skill_marketplace::is_safe_skill_name(pkg_id) {
+        return Err(format!("非法包 id '{pkg_id}'"));
+    }
     let import_lock = super::plugin_import::import_lock_for(pkg_id);
     let _import_guard = import_lock.lock().unwrap_or_else(|p| p.into_inner());
     let bin = RecycleBin::new();
+    if !bin.root.join(pkg_id).is_dir() {
+        return Err(format!(
+            "回收站包目录 {} 缺失，无法恢复（可选择彻底删除清理条目）",
+            bin.root.join(pkg_id).display()
+        ));
+    }
+    if paths::bundles_root().join(pkg_id).exists() {
+        return Err(format!(
+            "恢复目标 {} 已存在，拒绝覆盖",
+            paths::bundles_root().join(pkg_id).display()
+        ));
+    }
     // 恢复碰撞 preflight（fail-closed，先于任何搬移）：回收期间市场状态可能已
     // 变（例如导入了把同名技能作为 companion 的包），碰撞状态下恢复会造出同
     // 技能双份物理副本，后续技能卸载的候选目录清理会连唯一副本一起删。检查
