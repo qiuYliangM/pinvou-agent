@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::core::session_mode::{PackDefaultPolicy, SessionMode};
-use crate::features::marketplace::bundle::{builtin_cli_bundle_ids, skill_owner_package};
+use crate::features::marketplace::bundle::{builtin_cli_bundle_ids, skill_owner_package_with};
 use crate::features::marketplace::skill_marketplace::SkillMarketplaceManager;
 use crate::features::marketplace::{ConnectorScope, MarketplaceManager};
 use crate::platform::paths;
@@ -132,8 +132,9 @@ static UNREADABLE_ORIGINAL: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Clears the verdict memos. Test-only hygiene: the statics are process-global
 /// and keyed by home path, so a memo left behind by an aborted earlier case
 /// (or by a harness that recreates the same path) must not bleed into the
-/// next one; production never clears (the file is the truth; a memo only
-/// briefly carries state after a write failure).
+/// next one; production never clears (the file is the truth; after a write
+/// failure a memo carries state for the rest of the process lifetime, until a
+/// later writer's save succeeds).
 #[cfg(test)]
 pub(crate) fn clear_unpersisted_verdict_for_test() {
     *UNPERSISTED_VERDICT
@@ -463,8 +464,27 @@ fn normalize_stored_lists(file: &mut DisabledBundlesFile) -> bool {
 /// its physical owner pack — otherwise it enters every scope with zero
 /// consent and no composer row to turn it off.
 fn to_package_id(raw: &str) -> String {
+    to_package_id_with(&MarketplaceManager::new().available_tools(), raw)
+}
+
+/// [`to_package_id`] over a pre-walked tool snapshot (round-23 MINOR 3
+/// hoist): one `available_tools()` walk serves the whole id list instead of
+/// one per entry.
+fn to_package_id_with(tools: &[super::ToolManifest], raw: &str) -> String {
     let stripped = raw.strip_prefix("skill:").unwrap_or(raw);
-    crate::features::marketplace::bundle::skill_gating_owner(stripped)
+    // Known-pack shield (review #455 round-23 MINOR 1): a stored entry that
+    // names a physically present pack dir IS that pack and must not be
+    // re-routed through the gating owner's physical fallback — with a skill
+    // dir nested under another pack sharing the name (`bundles/<a>/skills/pptx`
+    // vs a real `pptx` pack, sorted-first), the fallback hijacked the stored
+    // opt-out onto `<a>` and silently persisted the remap (P re-enabled, Q
+    // disabled). The fallback stays available for skill-gated inputs below —
+    // its purpose is mapping undeclared nested skill names, never renaming
+    // stored pack rows.
+    if paths::bundles_root().join(stripped).is_dir() {
+        return stripped.to_string();
+    }
+    crate::features::marketplace::bundle::skill_gating_owner_with(tools, stripped)
 }
 
 /// 读时归一：存储条目按**当前**认领状态重映射为包 id 并去重（保序）。
@@ -472,9 +492,13 @@ fn to_package_id(raw: &str) -> String {
 /// 按独立技能 id 落库，MCP 后装则认领翻转到包 id——只在写时归一会让用户的
 /// 「关/隐藏」在认领翻转后静默失效（F4）；读时归一让门控跟随技能本体。
 fn normalize_stored_pkg_ids(ids: &[String]) -> Vec<String> {
+    // Round-23 MINOR 3 hoist: one manifest walk for the whole list — the per
+    // entry mapping consults the claim snapshot, and each walk parses every
+    // manifest under `bundles_root` (O(entries × packs) per read before this).
+    let tools = MarketplaceManager::new().available_tools();
     let mut out: Vec<String> = Vec::with_capacity(ids.len());
     for id in ids {
-        let pkg = to_package_id(id);
+        let pkg = to_package_id_with(&tools, id);
         if !out.iter().any(|x| x == &pkg) {
             out.push(pkg);
         }
@@ -807,17 +831,19 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
             // harmless: packs installed later are still off by default,
             // consistent with this branch's semantics.
             let manager = MarketplaceManager::new();
+            // Round-23 MINOR 3 hoist: one manifest walk per resolution pass —
+            // `skill_owner_package`/`skill_gating_owner` each parse every
+            // manifest under `bundles_root`, so the skill arms below were
+            // O(skills × packs) manifest reads per expansion before this.
+            let tools = manager.available_tools();
             let mut ids: Vec<String> = match manager.try_installed_ids() {
                 Ok(ids) => ids,
                 Err(error) => {
                     eprintln!(
                         "[scope] {error}; DenyAll expansion falls back to the full available catalog (fail-closed)"
                     );
-                    let mut catalog: Vec<String> = manager
-                        .available_tools()
-                        .into_iter()
-                        .map(|manifest| manifest.id)
-                        .collect();
+                    let mut catalog: Vec<String> =
+                        tools.iter().map(|manifest| manifest.id.clone()).collect();
                     // The two record arms deliberately use the claim mapping
                     // (`skill_owner_package`): their inputs are ids the registry itself claims —
                     // identical to the gating mapping whenever a claim exists, and standalone
@@ -827,7 +853,7 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
                     // materialization's directory scan (round-20 minor 3: the asymmetry vs the
                     // record arms is annotated here deliberately, not an oversight).
                     for info in SkillMarketplaceManager::new().list_skills() {
-                        let pkg = skill_owner_package(&info.id);
+                        let pkg = skill_owner_package_with(&tools, &info.id);
                         if !catalog.iter().any(|id| id == &pkg) {
                             catalog.push(pkg);
                         }
@@ -864,14 +890,14 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
                     SkillMarketplaceManager::preset_skill_ids().collect();
                 blanket.extend(skill_market.uploaded_skill_ids());
                 for skill_id in blanket {
-                    let pkg = skill_owner_package(&skill_id);
+                    let pkg = skill_owner_package_with(&tools, &skill_id);
                     if !ids.iter().any(|id| id == &pkg) {
                         ids.push(pkg);
                     }
                 }
             }
             for skill_id in skill_ids {
-                let pkg = skill_owner_package(&skill_id);
+                let pkg = skill_owner_package_with(&tools, &skill_id);
                 if !ids.iter().any(|id| id == &pkg) {
                     ids.push(pkg);
                 }
@@ -891,11 +917,19 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
                         continue;
                     };
                     for skill in skills_dir.flatten() {
+                        // Same walk, one truth (round-23 MINOR 2): skip stray
+                        // non-directory entries exactly like materialization's
+                        // scan — a `skills/README.md` file would otherwise
+                        // become a junk owner id that the seeding below then
+                        // persists with an install-default marker (over-deny).
+                        if !skill.path().is_dir() {
+                            continue;
+                        }
                         let name = skill.file_name().to_string_lossy().into_owned();
                         if name.is_empty() {
                             continue;
                         }
-                        let pkg = crate::features::marketplace::bundle::skill_gating_owner(&name);
+                        let pkg = crate::features::marketplace::bundle::skill_gating_owner_with(&tools, &name);
                         if !ids.iter().any(|id| id == &pkg) {
                             ids.push(pkg);
                         }
@@ -916,7 +950,9 @@ pub fn save_disabled_bundles_for(scope: ConnectorScope, ids: &[String]) -> Resul
     let _guard = DISABLED_BUNDLES_FILE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let normalized: Vec<String> = ids.iter().map(|id| to_package_id(id)).collect();
+    // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
+    let tools = MarketplaceManager::new().available_tools();
+    let normalized: Vec<String> = ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
     let mut file = load_disabled_bundles_file_locked();
     let key = scope.as_str().to_string();
     let was_uninitialized = !file.initialized.contains(&key);
@@ -979,6 +1015,15 @@ pub fn save_disabled_bundles_for(scope: ConnectorScope, ids: &[String]) -> Resul
     } else {
         file.default_off_scopes.insert(key.clone(), retained);
     }
+    // Round-23 MINOR 4 honesty note: when this write lands over an
+    // unreadable/recovered store (the `UNREADABLE_ORIGINAL` /
+    // `PENDING_CORRUPT_RECOVERY` paths), the in-memory file has no marker
+    // rows for the trapped entries — the bytes of the original are preserved
+    // rename-aside, but this save persists the entries WITHOUT their
+    // install-default markers, silently downgrading trapped user opt-outs to
+    // liftable defaults on the next composer save. Attribution is lost, not
+    // the verdicts; recovering the original's markers is the corrupt-recovery
+    // rebuild's job, not this writer's.
     // The persist is fail-loud (round-19 MAJOR 1): main's #563 made this
     // writer's failure a user-visible command error (the frontend rolls the
     // toggle back and alerts), and with #563 now in this PR's merge base,
@@ -1017,7 +1062,9 @@ pub fn save_hidden_bundles_for(scope: ConnectorScope, ids: &[String]) -> Result<
     let _guard = DISABLED_BUNDLES_FILE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let normalized: Vec<String> = ids.iter().map(|id| to_package_id(id)).collect();
+    // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
+    let tools = MarketplaceManager::new().available_tools();
+    let normalized: Vec<String> = ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
     let mut file = load_disabled_bundles_file_locked();
     file.hidden_scopes
         .insert(scope.as_str().to_string(), normalized);
@@ -1193,7 +1240,9 @@ pub fn enable_packages_in_scope(
     scope: ConnectorScope,
     raw_ids: &[String],
 ) -> Result<EnablePackagesOutcome, String> {
-    let mut ids: Vec<String> = raw_ids.iter().map(|id| to_package_id(id)).collect();
+    // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
+    let tools = MarketplaceManager::new().available_tools();
+    let mut ids: Vec<String> = raw_ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
     // Sort-then-dedup (round-20 minor 1): bare `dedup` removes consecutive
     // duplicates only, so e.g. ["a","b","a"] leaked a duplicate into the
     // blocked/not_applied reporting; sorting also makes the reported order
@@ -1332,7 +1381,9 @@ fn apply_restore_consent_gate_impl(
     raw_ids: &[String],
     force_uninitialized: bool,
 ) -> Result<(), String> {
-    let ids: Vec<String> = raw_ids.iter().map(|id| to_package_id(id)).collect();
+    // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
+    let tools = MarketplaceManager::new().available_tools();
+    let ids: Vec<String> = raw_ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
     if ids.is_empty() {
         return Ok(());
     }

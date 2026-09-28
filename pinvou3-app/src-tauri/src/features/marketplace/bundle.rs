@@ -121,20 +121,28 @@ pub(crate) fn cli_bundle_of_skill(skill_dir: &str) -> Option<&'static str> {
 /// make the physical lens misread a self-collision as a cross-pack conflict
 /// (the pitfall the first R17-MAJOR1 fix cut itself on).
 pub(crate) fn skill_owner_package(skill_name: &str) -> String {
+    skill_owner_package_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_owner_package`] over a pre-walked tool snapshot — the hoisted form
+/// resolution passes use so one `available_tools()` walk (every manifest under
+/// `bundles_root` parsed once) serves the whole id list instead of one walk
+/// per id (review #455 round-23 MINOR 3). Semantics identical to the wrapper.
+pub(crate) fn skill_owner_package_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
     if skill_name == "ima-skills" {
         return "ima".to_string();
     }
     if let Some(cli) = cli_bundle_of_skill(skill_name) {
         return cli.to_string();
     }
-    for tool in MarketplaceManager::new().available_tools() {
+    for tool in tools {
         if tool.companion_skills.iter().any(|s| s == skill_name) {
             // V5「随包」认领：包本体已装才把技能归属到包（与 list_bundles 的认领
             // 条件一致）；未装时技能保留独立纯技能包形态（owner = 技能名自身）。
             // 保证 save 归一与物化排除跟 UI 展示的包形态对齐（二轮评审：scope
             // save 归一与 V5 条件认领冲突）。
             if bundle_installed(&tool.id) {
-                return tool.id;
+                return tool.id.clone();
             }
             break;
         }
@@ -155,7 +163,13 @@ pub(crate) fn skill_owner_package(skill_name: &str) -> String {
 /// order keeps the outcome deterministic when several packs nest the same
 /// name; no hit → the skill is its own pack.
 pub(crate) fn skill_gating_owner(skill_name: &str) -> String {
-    let claimed = skill_owner_package(skill_name);
+    skill_gating_owner_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_gating_owner`] over a pre-walked tool snapshot (round-23 MINOR 3
+/// hoist; see [`skill_owner_package_with`]).
+pub(crate) fn skill_gating_owner_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
+    let claimed = skill_owner_package_with(tools, skill_name);
     if claimed != skill_name {
         return claimed;
     }
