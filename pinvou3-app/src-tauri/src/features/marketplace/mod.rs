@@ -625,9 +625,11 @@ pub(crate) const NATIVE_PACKAGE_TOOLS: &[(&str, &str)] = &[("ima_openapi", "ima-
 /// owner is resolved through the GATING mapping (`skill_gating_owner`) — the
 /// disabled/hidden sets carry normalized owner pack ids (`to_package_id`), so
 /// the check must use the same mapping the writers normalized with.
-fn native_unavailable_tool_names_for(scope: ConnectorScope) -> Vec<String> {
+fn native_unavailable_tool_names_for(
+    _scope: ConnectorScope,
+    unavailable: &[String],
+) -> Vec<String> {
     let installed = skill_marketplace::SkillMarketplaceManager::new().installed_skill_ids();
-    let unavailable = unavailable_bundles_for(scope);
     NATIVE_PACKAGE_TOOLS
         .iter()
         .filter(|(_, package)| {
@@ -639,8 +641,12 @@ fn native_unavailable_tool_names_for(scope: ConnectorScope) -> Vec<String> {
 }
 
 pub fn unavailable_tool_names_for(scope: ConnectorScope) -> Vec<String> {
-    let mut names = MarketplaceManager::new().model_tool_names(&unavailable_bundles_for(scope));
-    names.extend(native_unavailable_tool_names_for(scope));
+    // Round-24 MAJOR 3 (related cheaper hoist): one resolution serves both the
+    // model-tool filter and the native check — the second call re-ran the
+    // whole DenyAll expansion.
+    let unavailable = unavailable_bundles_for(scope);
+    let mut names = MarketplaceManager::new().model_tool_names(&unavailable);
+    names.extend(native_unavailable_tool_names_for(scope, &unavailable));
     names
 }
 
@@ -1363,10 +1369,17 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         // re-reading the just-committed registry, so the writer variant
         // applies (no re-acquisition).
         let installed = self.try_installed_ids_for_writer()?;
+        // Round-24 minor 12: one registry read serves every installed id —
+        // the per-id provenance probe re-read bundles.json once per pack on
+        // every uninstall/startup-repair before this.
+        let records = store::BundleStore::new()
+            .records()
+            .map_err(|error| format!("dependency provenance registry is unavailable: {error}"))?;
         let mut locks = Vec::new();
-        for installed_id in installed {
+        for installed_id in &installed {
+            let record = records.iter().find(|record| record.id == *installed_id);
             let manifest = self
-                .trusted_dependency_manifest(&installed_id, None)
+                .trusted_dependency_manifest_with(installed_id, None, record, Some(&installed))
                 .map_err(|error| error.message().to_string())?;
             if let Some(lock) = manifest.and_then(|manifest| manifest.python_dependencies) {
                 locks.push(lock);
@@ -2154,6 +2167,25 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         tool_id: &str,
         install_source: Option<&store::BundleSource>,
     ) -> Result<Option<ToolManifest>, ManagedDependencyError> {
+        let record = store::BundleStore::new().get(tool_id).map_err(|error| {
+            ManagedDependencyError::Untrusted(format!(
+                "dependency provenance for '{tool_id}' is unavailable: {error}"
+            ))
+        })?;
+        self.trusted_dependency_manifest_with(tool_id, install_source, record.as_ref(), None)
+    }
+
+    /// [`Self::trusted_dependency_manifest`] with the provenance record and
+    /// the committed installed set supplied by the caller (round-24 minor
+    /// 12): batch consumers read the registry once instead of once per id.
+    /// `installed_ids: None` falls back to the writer read, exactly as before.
+    fn trusted_dependency_manifest_with(
+        &self,
+        tool_id: &str,
+        install_source: Option<&store::BundleSource>,
+        record: Option<&store::BundleRecord>,
+        installed_ids: Option<&[String]>,
+    ) -> Result<Option<ToolManifest>, ManagedDependencyError> {
         let Some(manifest) = self.embedded_dependency_manifest(tool_id)? else {
             return Ok(None);
         };
@@ -2165,34 +2197,34 @@ impl<S: CredentialStore> MarketplaceManager<S> {
             return Ok(None);
         }
 
-        let record = store::BundleStore::new().get(tool_id).map_err(|error| {
-            ManagedDependencyError::Untrusted(format!(
-                "dependency provenance for '{tool_id}' is unavailable: {error}"
-            ))
-        })?;
-        match record {
-            Some(record)
-                if record.installed && matches!(record.source, store::BundleSource::Preset) =>
-            {
-                Ok(Some(manifest))
-            }
-            Some(record) => Err(ManagedDependencyError::Untrusted(format!(
-                "dependency provenance for '{tool_id}' is not a live preset ({})",
-                record.source
-            ))),
-            None if install_source.is_some()
-                && !self
+        let Some(record) = record else {
+            // An install-in-progress call (install_source = the source being
+            // installed) legitimately has no committed provenance yet — the
+            // manifest is trusted for that lane, exactly as the pre-round-24
+            // match guard read.
+            let known_installed = match installed_ids {
+                Some(ids) => ids.iter().any(|id| id == tool_id),
+                None => self
                     .try_installed_ids_for_writer()
                     .map_err(ManagedDependencyError::Integrity)?
                     .iter()
-                    .any(|id| id == tool_id) =>
-            {
+                    .any(|id| id == tool_id),
+            };
+            return if install_source.is_some() && !known_installed {
                 Ok(Some(manifest))
-            }
-            None => Err(ManagedDependencyError::Untrusted(format!(
-                "dependency provenance for installed preset '{tool_id}' is missing"
-            ))),
+            } else {
+                Err(ManagedDependencyError::Untrusted(format!(
+                    "dependency provenance for installed preset '{tool_id}' is missing"
+                )))
+            };
+        };
+        if record.installed && matches!(record.source, store::BundleSource::Preset) {
+            return Ok(Some(manifest));
         }
+        Err(ManagedDependencyError::Untrusted(format!(
+            "dependency provenance for '{tool_id}' is not a live preset ({})",
+            record.source
+        )))
     }
 
     #[cfg(test)]

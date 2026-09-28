@@ -146,18 +146,24 @@ pub async fn enable_marketplace_packages(
     // The inner `?` is the persist failure (round-12 review): the command must
     // fail rather than report `enabled: true` for state that never reached
     // disk — the frontend renders its failure notice from the rejected invoke.
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome: EnablePackagesOutcome = tokio::task::spawn_blocking(move || {
         crate::features::marketplace::scope::enable_packages_in_scope(scope, &package_ids)
     })
     .await
-    .map_err(|e| format!("enable_marketplace_packages join: {e}"))??;
-    if outcome.blocked.is_empty() {
+    .map_err(|e| format!("enable_marketplace_packages join: {e}"))??
+    .into();
+    // Round-24 minor 11: `enabled` is false for a refused batch OR a batch
+    // whose every id matched nothing (not_applied-only) — in both, no scope
+    // state changed and the full hot refresh is pure overhead. Previously
+    // gated on `blocked.is_empty()` alone, which still refreshed for the
+    // not_applied-only case.
+    if outcome.enabled {
         // Identical finalization to the other switch writers (round-16 minor
         // 9: previously re-inlined the same seven statements). Skipped only
         // when the batch was refused (round-10 Major 2) and no state changed.
         refresh_tools_and_broadcast(&app, pool.inner()).await;
     }
-    Ok(outcome.into())
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------

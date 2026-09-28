@@ -141,6 +141,18 @@ impl Default for RecycleBin {
 }
 
 impl RecycleBin {
+    /// The staged pack dir for `id` while it sits in the recycle bin — the
+    /// read-path pack-row shield (round-24 MAJOR 1) needs to recognize a
+    /// binned pack the same way the round-23 MINOR 1 shield recognizes an
+    /// installed one, so its consent row is not re-owned while it awaits
+    /// restore.
+    pub(crate) fn held_dir(id: &str) -> PathBuf {
+        paths::pinvou3_home()
+            .join("marketplace")
+            .join("recycle-bin")
+            .join(id)
+    }
+
     pub fn new() -> Self {
         let marketplace = paths::pinvou3_home().join("marketplace");
         Self {
@@ -575,10 +587,19 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
     } else {
         false
     };
+    // consent_ids[0] is the pack id itself; it is passed separately and lands
+    // in the gate verbatim (round-24 MAJOR 1 — a pack row is never re-owned).
+    // Skill dir names equal to the pack id (pure single-skill packs) are not
+    // re-normalized either — the pack row already covers them.
+    let consent_skill_ids: Vec<String> = consent_ids[1..]
+        .iter()
+        .filter(|id| id.as_str() != pkg_id)
+        .cloned()
+        .collect();
     let gate = if secrets_declared {
-        super::scope::apply_restore_consent_gate_secrets_pack(&consent_ids)
+        super::scope::apply_restore_consent_gate_secrets_pack(pkg_id, &consent_skill_ids)
     } else {
-        super::scope::apply_restore_consent_gate(&consent_ids)
+        super::scope::apply_restore_consent_gate(pkg_id, &consent_skill_ids)
     };
     gate.map_err(|save_error| {
         format!(
@@ -2038,6 +2059,77 @@ mod tests {
     /// is explicitly off with install-default markers.
     #[cfg(unix)]
     #[test]
+    /// Round-24 MAJOR 1 (review #455): a recycled pack id that a FOREIGN
+    /// installed pack claims (companion_skills, or physical `skills/<id>/`
+    /// nesting) must not be re-owned by the consent gate. At gate time the
+    /// pack dir is still in the bin, so the known-pack shield cannot see it;
+    /// the pre-fix normalization remapped the id onto the foreign pack and
+    /// wrote the deny row for the wrong pack — the restored pack went live
+    /// with zero consent in every initialized scope. The gate now lands the
+    /// pack id verbatim, and the bin-side pack-row shield keeps the row
+    /// stable across reads.
+    #[test]
+    fn restore_consent_gate_never_reowns_collided_pack_id() {
+        let _g = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("PINVOU3_HOME").ok();
+        let tmp = fresh_dir("restore-gate-collision");
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        // Foreign installed pack claiming the recycled id as a companion
+        // skill AND physically nesting skills/combo-pack/ (both remap legs).
+        let shadow = paths::bundles_root().join("shadow-pack");
+        std::fs::create_dir_all(shadow.join("mcp")).unwrap();
+        std::fs::write(
+            shadow.join("mcp").join("manifest.json"),
+            r#"{"id":"shadow-pack","name":"shadow","description":"d","version":"1","icon":"x","category":"c","mcp_tools":[],"command":"python","args":["s.py"],"companion_skills":["combo-pack"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(shadow.join("skills/combo-pack")).unwrap();
+        std::fs::write(
+            shadow.join("skills/combo-pack/SKILL.md"),
+            "---\nname: combo-pack\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths::pinvou3_home().join("marketplace")).unwrap();
+        std::fs::write(
+            paths::pinvou3_home()
+                .join("marketplace")
+                .join("installed.json"),
+            serde_json::json!(["shadow-pack"]).to_string(),
+        )
+        .unwrap();
+
+        // The recycled pack is staged in the bin (gate-time state: the gate
+        // runs before take_back), NOT at bundles_root. Plain is initialized
+        // so the gate writes rows.
+        std::fs::create_dir_all(RecycleBin::held_dir("combo-pack").join("mcp")).unwrap();
+        crate::features::marketplace::scope::save_disabled_bundles_for(
+            crate::features::marketplace::ConnectorScope::Plain,
+            &[],
+        )
+        .unwrap();
+
+        super::super::scope::apply_restore_consent_gate("combo-pack", &[]).unwrap();
+
+        let file = crate::features::marketplace::scope::load_disabled_bundles_file();
+        let plain = file.scopes.get("plain").cloned().unwrap_or_default();
+        assert!(
+            plain.iter().any(|id| id == "combo-pack"),
+            "the collided pack id must land verbatim in the deny set: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|id| id == "shadow-pack"),
+            "the foreign pack must not receive the recycled pack's deny row: {plain:?}"
+        );
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("PINVOU3_HOME", &prev) };
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn restore_secrets_pack_into_uninitialized_scope_persists_consent() {
         let _g = crate::platform::paths::tests::ENV_LOCK
             .lock()

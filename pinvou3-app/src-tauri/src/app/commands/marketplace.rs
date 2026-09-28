@@ -236,7 +236,16 @@ pub(super) async fn install_marketplace_tool_post_install(tool_id: String) -> Re
         crate::features::marketplace::sync_deny_all_scopes_after_install(&consent_tool_id)
     })
     .await
-    .map_err(|e| format!("task join failed: {e}"))?
+    .map_err(|e| {
+        // Round-24 minor 6: a join failure leaves the same terminal state as
+        // a persist failure — the pack stays installed with zero consent
+        // rows — so the honest sibling wording applies here too (skill path
+        // :640-645; review #455 round-22 MAJOR 1). No rollback runs on this
+        // arm.
+        format!(
+            "connector '{tool_id}' installed, but its consent state could not be applied (background task failed): new sessions will enable it by default — turn it off in the tools list: {e}"
+        )
+    })?
     .map_err(|e| {
         // Honest sibling wording (skill path :640-645): no rollback runs on
         // this arm — the pack stays installed with zero consent rows, so the

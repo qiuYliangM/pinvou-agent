@@ -46,6 +46,14 @@ fn skill_source_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![paths::user_skills_dir()];
     if let Ok(rd) = std::fs::read_dir(paths::bundles_root()) {
         for entry in rd.flatten() {
+            // Round-24 minor 3: import staging (`<id>.tmp`) and landing
+            // backup (`<id>.old`) dirs are not packs — admitting their skills
+            // under the suffix owner id would render ungated content into
+            // initialized scopes during the import window.
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") || name.ends_with(".old") {
+                continue;
+            }
             let skills = entry.path().join("skills");
             if skills.is_dir() {
                 dirs.push(skills);
@@ -164,6 +172,16 @@ pub(crate) fn disabled_skill_names_for(scope: ConnectorScope) -> HashSet<String>
             .into_iter()
             .collect();
     let mut names: HashSet<String> = HashSet::new();
+    // Round-24 MAJOR 3: nothing can be excluded against an empty deny set —
+    // skip the per-entry owner resolution entirely (this runs ~2x per session
+    // spawn and per toggle/hot-refresh).
+    if disabled_packages.is_empty() {
+        return names;
+    }
+    // Round-24 MAJOR 3: one manifest walk for the whole pass —
+    // `skill_gating_owner` parses every manifest under bundles_root per call,
+    // so the per-entry resolution was O(dirs × packs) per invocation.
+    let tools = crate::features::marketplace::MarketplaceManager::new().available_tools();
     for src in skill_source_dirs() {
         let Ok(rd) = std::fs::read_dir(&src) else {
             continue;
@@ -175,7 +193,8 @@ pub(crate) fn disabled_skill_names_for(scope: ConnectorScope) -> HashSet<String>
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            let owner = crate::features::marketplace::bundle::skill_gating_owner(&name);
+            let owner =
+                crate::features::marketplace::bundle::skill_gating_owner_with(&tools, &name);
             if disabled_packages.contains(&owner) {
                 names.insert(name);
             }

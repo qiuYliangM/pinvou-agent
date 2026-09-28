@@ -655,8 +655,13 @@ fn now_iso8601() -> String {
 /// 本次导入且不落 `legacy_imported` 闸，避免把不完整镜像永久烘焙进 bundles.json。
 fn collect_legacy_records() -> Result<Vec<BundleRecord>, String> {
     let mut out = legacy_mcp_records()?;
-    out.extend(legacy_skill_records());
-    out.extend(legacy_cli_records());
+    // Round-24 minor 2: the skill/CLI scan legs propagate a scan-root read
+    // error the same way the registry leg does — a degraded scan latching the
+    // one-shot gate would bake an incomplete mirror in permanently (the same
+    // class the registry conversion closed). A missing legacy dir stays the
+    // common Ok(empty) case; only an existing-but-unreadable root errors.
+    out.extend(legacy_skill_records()?);
+    out.extend(legacy_cli_records()?);
     // id 去重（保序留先）：MCP 包与其同名 companion 技能（pptx↔pptx）会各扫到一次，
     // 终态模型里它们是同一个包（§5.2「一个包 = 一张卡」），MCP 侧记录含凭据声明，
     // 信息更全，故排在前面的 MCP 记录优先。
@@ -691,10 +696,15 @@ fn legacy_mcp_records() -> Result<Vec<BundleRecord>, String> {
 /// `pinvou3-marketplace:<id>` → 预置技能包；`upload:<zip名>` → 上传技能包。
 /// 无标记目录（内置 visual-design、CLI companion 技能）不在此登记 —— CLI
 /// companion 由 [`legacy_cli_records`] 归并到所属 CLI 包。
-fn legacy_skill_records() -> Vec<BundleRecord> {
+fn legacy_skill_records() -> Result<Vec<BundleRecord>, String> {
     let skills_dir = paths::bundle_skills_dir();
-    let Ok(rd) = std::fs::read_dir(&skills_dir) else {
-        return Vec::new();
+    // Round-24 minor 2: a missing legacy dir is the common fresh case; an
+    // existing-but-unreadable root propagates so the import aborts before the
+    // gate latches (same fail-closed as the registry leg).
+    let rd = match std::fs::read_dir(&skills_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("读取旧布局技能目录失败: {e}")),
     };
     let now = now_iso8601();
     let mut out = Vec::new();
@@ -729,14 +739,16 @@ fn legacy_skill_records() -> Vec<BundleRecord> {
             extra: serde_json::Map::new(),
         });
     }
-    out
+    Ok(out)
 }
 
 /// 内置 CLI 连接器 → Builtin 包记录。安装态判定：companion 技能目录在盘
 /// （连接时才解包）或 CLI 二进制在盘。存量二进制对照 lock 表验 SHA-256：
 /// 匹配 → 正常登记；不匹配/无法校验 → 记 `degraded`（§9.3，
 /// 修复动作 = 重新下载，物理搬移 `assets/cli/` 在后续 PR）。
-fn legacy_cli_records() -> Vec<BundleRecord> {
+/// CLI 腿只做 `is_file` 存在性探测（无 read_dir 根可失败），Result 仅为与
+/// 另两腿的签名对称（round-24 minor 2）。
+fn legacy_cli_records() -> Result<Vec<BundleRecord>, String> {
     let skills_dir = paths::bundle_skills_dir();
     let now = now_iso8601();
     let mut out = Vec::new();
@@ -767,7 +779,7 @@ fn legacy_cli_records() -> Vec<BundleRecord> {
             extra: serde_json::Map::new(),
         });
     }
-    out
+    Ok(out)
 }
 
 enum CliAssetState {

@@ -11,8 +11,8 @@
 //! project_skills_enabled, plain_defaults_migrated}`. Scope keys use `SessionMode`
 //! kebab-case names. `plain_defaults_migrated`: marks files written while plain
 //! was still AllowAll; migrate-on-read initializes plain to the persisted list
-//! and lands the marker on disk. First read merges the two legacy files in:
-//! migrates the two legacy files into this file on read (migrate-on-read):
+//! and lands the marker on disk. First read migrates the two legacy files
+//! into this file (migrate-on-read):
 //! Legacy connector ids pass through as pack ids (connector id = pack id); legacy
 //! skill ids map to their owner via `to_package_id` (the gating mapping `skill_gating_owner` since R17-MAJOR1);
 //! `skill:` prefix residue is stripped. Migration is idempotent; failure falls back to defaults (safe).
@@ -439,6 +439,10 @@ fn quarantine_and_recover_disabled_bundles(raw: &[u8], error: &str) -> DisabledB
 /// through `load_disabled_bundles_file_locked` → save, so persisting here
 /// converges the whole file.
 fn normalize_stored_lists(file: &mut DisabledBundlesFile) -> bool {
+    // Round-24 MAJOR 3 (related cheaper hoist): one manifest walk serves every
+    // non-empty list on the file — the per-list normalize re-parsed all
+    // manifests once per list on every load.
+    let tools = MarketplaceManager::new().available_tools();
     let mut changed = false;
     for ids in file
         .scopes
@@ -446,7 +450,7 @@ fn normalize_stored_lists(file: &mut DisabledBundlesFile) -> bool {
         .chain(file.hidden_scopes.values_mut())
         .chain(file.default_off_scopes.values_mut())
     {
-        let normalized = normalize_stored_pkg_ids(ids);
+        let normalized = normalize_stored_pkg_ids_with(&tools, ids);
         if normalized.len() != ids.len() || normalized.iter().zip(ids.iter()).any(|(a, b)| a != b) {
             *ids = normalized;
             changed = true;
@@ -481,7 +485,13 @@ fn to_package_id_with(tools: &[super::ToolManifest], raw: &str) -> String {
     // disabled). The fallback stays available for skill-gated inputs below —
     // its purpose is mapping undeclared nested skill names, never renaming
     // stored pack rows.
-    if paths::bundles_root().join(stripped).is_dir() {
+    let pack_row = paths::bundles_root().join(stripped).is_dir()
+        // Round-24 MAJOR 1: a pack staged in the recycle bin is equally a
+        // pack row — while it awaits restore, its consent row (written
+        // verbatim by the gate) must not be re-owned on read through a
+        // foreign claim or nesting.
+        || super::recycle_bin::RecycleBin::held_dir(stripped).is_dir();
+    if pack_row {
         return stripped.to_string();
     }
     crate::features::marketplace::bundle::skill_gating_owner_with(tools, stripped)
@@ -492,13 +502,16 @@ fn to_package_id_with(tools: &[super::ToolManifest], raw: &str) -> String {
 /// 按独立技能 id 落库，MCP 后装则认领翻转到包 id——只在写时归一会让用户的
 /// 「关/隐藏」在认领翻转后静默失效（F4）；读时归一让门控跟随技能本体。
 fn normalize_stored_pkg_ids(ids: &[String]) -> Vec<String> {
-    // Round-23 MINOR 3 hoist: one manifest walk for the whole list — the per
-    // entry mapping consults the claim snapshot, and each walk parses every
-    // manifest under `bundles_root` (O(entries × packs) per read before this).
     let tools = MarketplaceManager::new().available_tools();
+    normalize_stored_pkg_ids_with(&tools, ids)
+}
+
+/// [`normalize_stored_pkg_ids`] over a pre-walked tool snapshot (round-24
+/// MAJOR 3: callers hoisting across several lists share one walk).
+fn normalize_stored_pkg_ids_with(tools: &[super::ToolManifest], ids: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(ids.len());
     for id in ids {
-        let pkg = to_package_id_with(&tools, id);
+        let pkg = to_package_id_with(tools, id);
         if !out.iter().any(|x| x == &pkg) {
             out.push(pkg);
         }
@@ -1020,13 +1033,17 @@ pub fn save_disabled_bundles_for(scope: ConnectorScope, ids: &[String]) -> Resul
     } else {
         file.default_off_scopes.insert(key.clone(), retained);
     }
-    // Round-23 MINOR 4 honesty note: when this write lands over an
-    // unreadable/recovered store (the `UNREADABLE_ORIGINAL` /
-    // `PENDING_CORRUPT_RECOVERY` paths), the in-memory file has no marker
-    // rows for the trapped entries — the bytes of the original are preserved
-    // rename-aside, but this save persists the entries WITHOUT their
-    // install-default markers, silently downgrading trapped user opt-outs to
-    // liftable defaults on the next composer save. Attribution is lost, not
+    // Round-23 MINOR 4 honesty note (direction corrected in round-24 minor
+    // 9): when this write lands over an unreadable/recovered store (the
+    // `UNREADABLE_ORIGINAL` / `PENDING_CORRUPT_RECOVERY` paths), the
+    // in-memory file's scopes are uninitialized — the next composer save
+    // takes the seeding arm above, which ADDS install-default markers to the
+    // re-seeded entries. The original bytes are preserved rename-aside, but
+    // attribution is lost in the opposite direction the round-23 wording
+    // claimed: trapped user opt-outs are re-persisted as liftable
+    // install-defaults, not as explicit verdicts — persisting entries
+    // without markers would have made them MORE explicit, not less.
+    // Attribution is lost, not
     // the verdicts; recovering the original's markers is the corrupt-recovery
     // rebuild's job, not this writer's.
     // The persist is fail-loud (round-19 MAJOR 1): main's #563 made this
@@ -1367,8 +1384,8 @@ pub fn enable_packages_in_scope(
 /// (conservative convergence), uninitialized scopes are not written (the
 /// DenyAll on-the-fly expansion already covers them), and the hidden set is
 /// only cleared, never written (restored packs must stay visible to the user).
-pub fn apply_restore_consent_gate(raw_ids: &[String]) -> Result<(), String> {
-    apply_restore_consent_gate_impl(raw_ids, false)
+pub fn apply_restore_consent_gate(pack_id: &str, skill_ids: &[String]) -> Result<(), String> {
+    apply_restore_consent_gate_impl(pack_id, skill_ids, false)
 }
 
 /// Force variant for the supply-skipped restore cohort (review #455 R16-MAJOR1):
@@ -1384,20 +1401,35 @@ pub fn apply_restore_consent_gate(raw_ids: &[String]) -> Result<(), String> {
 /// explicitly off, untouched defaults stay liftable, and the freeze trade-off
 /// (later added builtins default on in this scope) is accepted exactly as for
 /// the enable path's materialization arm.
-pub fn apply_restore_consent_gate_secrets_pack(raw_ids: &[String]) -> Result<(), String> {
-    apply_restore_consent_gate_impl(raw_ids, true)
+pub fn apply_restore_consent_gate_secrets_pack(
+    pack_id: &str,
+    skill_ids: &[String],
+) -> Result<(), String> {
+    apply_restore_consent_gate_impl(pack_id, skill_ids, true)
 }
 
 fn apply_restore_consent_gate_impl(
-    raw_ids: &[String],
+    pack_id: &str,
+    skill_ids: &[String],
     force_uninitialized: bool,
 ) -> Result<(), String> {
     // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
     let tools = MarketplaceManager::new().available_tools();
-    let ids: Vec<String> = raw_ids
+    let mut ids: Vec<String> = skill_ids
         .iter()
         .map(|id| to_package_id_with(&tools, id))
         .collect();
+    // Round-24 MAJOR 1: the pack's own row is never re-owned. At gate time the
+    // pack dir is still in the recycle bin, so the known-pack shield cannot see
+    // it, and a foreign installed pack claiming the id as a companion skill (or
+    // physically nesting `skills/<pkg_id>/`) would remap it onto that pack —
+    // the deny row lands on the wrong id and the restored pack goes live with
+    // zero consent once the restore completes and its own claims resolve. The
+    // pack id lands verbatim, like the round-23 MINOR 1 shield guarantees for
+    // physically present packs.
+    if !ids.iter().any(|id| id == pack_id) {
+        ids.push(pack_id.to_string());
+    }
     if ids.is_empty() {
         return Ok(());
     }
@@ -1718,6 +1750,42 @@ mod tests {
         });
     }
 
+    /// Round-24 minor 1: the NotFound sidecar-evidence rule covers BOTH
+    /// namespaces — quarantine's `.corrupt.<ts>` AND the rename-aside
+    /// `.unreadable.<ts>` half. This twin of
+    /// `not_found_read_with_corrupt_sidecar_fails_closed` seeds only an
+    /// `.unreadable.<ts>` sibling: a regression to corrupt-only prefixes
+    /// would stay green while reopening the round-20 MAJOR-B crash window
+    /// (the wide upgrade signal judging a lost store as fresh).
+    #[test]
+    fn not_found_read_with_unreadable_sidecar_fails_closed() {
+        with_temp_home("pinvou3-scope", || {
+            let home = paths::pinvou3_home();
+            // Both wide-signal legs present: without the sibling-evidence arm
+            // this home judges "upgraded" and initializes plain empty.
+            let installed = home.join("marketplace").join("installed.json");
+            std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+            std::fs::write(&installed, "[\"weather\"]").unwrap();
+            std::fs::create_dir_all(home.join("sessions").join("default")).unwrap();
+            std::fs::write(home.join("sessions").join("default").join("t.json"), "{}").unwrap();
+            std::fs::write(home.join("disabled_bundles.json.unreadable.456"), b"lost").unwrap();
+
+            let file = load_disabled_bundles_file();
+            assert!(
+                file.plain_defaults_migrated,
+                "the lost-store recovery is frozen: {file:?}"
+            );
+            assert!(
+                !file.initialized.contains("plain"),
+                "plain must NOT initialize — DenyAll fallback keeps the stranded opt-outs off: {file:?}"
+            );
+            // The freeze persisted: a second read is stable (no re-evaluation).
+            let again = load_disabled_bundles_file();
+            assert_eq!(again.initialized, file.initialized);
+            assert!(again.plain_defaults_migrated);
+        });
+    }
+
     #[test]
     fn bundles_roundtrip_per_scope() {
         with_temp_home("pinvou3-scope", || {
@@ -1746,8 +1814,7 @@ mod tests {
             // Hidden starts empty; disabled does not — after the DenyAll
             // convergence an uninitialized plain scope falls back to the
             // on-the-fly expansion, so pin an explicitly initialized empty
-            // baseline first (same shape as
-            // `hidden_bundles_are_orthogonal_to_disabled`).
+            // baseline first.
             save_disabled_bundles_for(ConnectorScope::Plain, &[]).unwrap();
             assert!(load_disabled_bundles_for(ConnectorScope::Plain).is_empty());
             assert!(load_hidden_bundles_for(ConnectorScope::Plain).is_empty());

@@ -382,7 +382,14 @@ pub async fn ima_logout() -> Result<Value, String> {
         // 已卸载技能从各 scope 禁用集清除残留；在线会话组合目录由命令层
         // （connectors::ima_logout）重写。引用 marketplace::scope 避免
         // connectors → assistant 依赖环。
-        crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(IMA_SKILL_ID)?;
+        // Round-24 minor 4：凭据删除结果先行返回；同意清理的瞬时持久失败只
+        // 告警降级（stale-deny 方向本就 fail-safe）——否则清理在凭据已删后
+        // 失败会让登出永久报错（每次重试都在同一步失败）。
+        let cleanup_result =
+            crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(IMA_SKILL_ID);
+        if let Err(e) = &cleanup_result {
+            log::warn!("[ima] 登出同意清理持久化失败（残留为 stale-deny，fail-safe）: {e}");
+        }
         client_result.map_err(|e| e.user_message())?;
         api_key_result.map_err(|e| e.user_message())?;
         Ok::<Value, String>(json!({ "ok": true, "connected": false }))

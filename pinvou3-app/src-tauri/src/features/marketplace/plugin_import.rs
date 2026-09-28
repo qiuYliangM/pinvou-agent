@@ -1029,9 +1029,12 @@ pub fn import_plugin_package(
         let _ = std::fs::remove_dir_all(&staged);
         return Err(format!("落盘: {e}"));
     }
-    if moved_old {
-        let _ = std::fs::remove_dir_all(&backup);
-    }
+    // Round-24 MAJOR 2: the backup is retained until supply resolves. A
+    // supply failure after landing must not leave the new dir behind — its
+    // skills materialize into every initialized scope with zero consent (the
+    // consent sync never runs on this error path) and self_heal_skills skips
+    // plugin dirs, so the half-state would persist across boots. The backup
+    // is deleted only once supply has succeeded.
 
     // 导入即重基线：包内容整体替换后，旧包的 SKILL.md 说明备份（存于 extra，
     // upsert_preserving 原样保留）随之失效——不清掉会让「清覆盖恢复」把**旧包**
@@ -1064,8 +1067,27 @@ pub fn import_plugin_package(
             &id,
             super::store::BundleSource::Upload(display_name.to_string()),
         ) {
+            // Round-24 MAJOR 2: mirror the restore path's supply-failure
+            // rollback — restore the previous version (or remove the
+            // first-install landing) instead of leaving the recordless dir
+            // live. Rollback failure is logged loudly; the caller's error
+            // stays the supply error either way.
+            let rolled_back = if moved_old {
+                let _ = std::fs::remove_dir_all(&pkg_dir);
+                rename_dir_with_retry(&backup, &pkg_dir).is_ok()
+            } else {
+                std::fs::remove_dir_all(&pkg_dir).is_ok()
+            };
+            if !rolled_back {
+                log::error!(
+                    "[plugin-import] 供给失败且目录回滚失败（{id}）: 残留目录的技能将以零同意进入已初始化 scope，请检查 {pkg_dir:?}"
+                );
+            }
             return Err(format!("MCP 供给失败（{id}）: {e}"));
         }
+    }
+    if moved_old {
+        let _ = std::fs::remove_dir_all(&backup);
     }
 
     // 登记 BundleStore（上传 source=Upload(zip 展示名)，installed=true）。
@@ -1598,10 +1620,34 @@ mod tests {
             None,
             "供给失败时重基线必须已发生（否则清覆盖会把旧包描述写进新包）"
         );
+        // Round-24 MAJOR 2：供给失败不得残留已落地的无登记目录——其技能会以
+        // 零同意进入每个已初始化 scope（本次为首次安装路径，无旧版本可还原，
+        // 回滚 = 移除落盘目录）。
+        assert!(
+            !dir.join("bundles/greet").exists(),
+            "供给失败后落盘目录必须回滚移除"
+        );
+
+        // Round-24 MAJOR 2 换版路径（moved_old=true）：旧版本在盘时同一包重导、
+        // 供给失败（同一 zip 过碰撞检查→落盘→供给必败）→ 回滚 = 还原旧版本目录
+        // （旧包继续可用，新包不入），备份清理。
+        std::fs::write(&mcp_path, r#"{"servers": {}}"#).unwrap();
+        make_zip(&dir.join("v1m.zip"), "orig1-again", true);
+        let report =
+            import_plugin_package(&dir.join("v1m.zip").to_string_lossy(), "v1m.zip").unwrap();
+        assert_eq!(report.id, "greet");
+        std::fs::write(&mcp_path, r#"{"servers": "broken"}"#).unwrap();
+        let err = import_plugin_package(&dir.join("v1m.zip").to_string_lossy(), "v1m.zip")
+            .expect_err("同包重导的供给必须失败");
+        assert!(err.contains("MCP 供给失败"), "失败须来自供给步骤: {err}");
         let md = std::fs::read_to_string(dir.join("bundles/greet/skills/greet/SKILL.md")).unwrap();
         assert!(
-            md.contains("description: orig2"),
-            "磁盘包目录应为 v2 内容: {md}"
+            md.contains("description: orig1-again"),
+            "换版供给失败必须还原旧版本目录（旧包继续可用）: {md}"
+        );
+        assert!(
+            !dir.join("bundles/greet.old").exists(),
+            "回滚成功后备份目录必须清理"
         );
 
         match prev {
