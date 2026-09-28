@@ -3530,7 +3530,11 @@ export function CodexAcpView({
                   // additional roots are recorded, only the primary is
                   // delivered — the chip copy must not promise access.
                   deliveryLimited={!isNativeAgent}
-                  canAlign={!isWeb && !!resolveSessionProjectId(
+                  // Consistency with the chat lane (review #484 round-10 m7):
+                  // gate the align entry on the desktop capability, not the
+                  // raw isWeb flag, so the two lanes cannot drift if the
+                  // capability and the platform kind ever diverge.
+                  canAlign={can('desktopChrome') && !!resolveSessionProjectId(
                     { id: activeId, workspaceKind: 'project', workspacePath: activeSession.workspace_path },
                     (bs && bs.projectsList && bs.projectsList.projects) || [],
                     (bs && bs.projectsList && bs.projectsList.assignments) || {},

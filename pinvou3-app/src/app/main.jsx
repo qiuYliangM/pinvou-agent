@@ -1990,6 +1990,15 @@ const NAV_PREFETCH = {
           : EMPTY_PICKER_ROWS
       ), [workspacePicker, projectsListEntries, projectsListAssignments, boundWorkspaceItems]);
       const closeWorkspacePicker = () => { setWorkspacePicker(null); setPickerExcluded(null); };
+      // Dismissal without a staged target (Escape / backdrop / close button):
+      // an unconsumed codex picker request from an earlier interaction must
+      // not survive it — the consuming view's epoch ref resets to 0 on
+      // remount, so any stored request would replay onto the next
+      // CodexAcpView mount (review #484 round-11 m8). Chat-lane stages clear
+      // it too (a chat pick invalidates a lingering codex request); the codex
+      // branch of applyWorkspaceTarget intentionally closes WITHOUT clearing
+      // — the request it just set is the payload the view will consume.
+      const dismissWorkspacePicker = () => { closeWorkspacePicker(); setPickerCodexRequest(null); };
       // Returns whether the draft actually staged (the codex lane's request
       // object always lands); callers surface grant notices only on a real
       // staging. Async: the chat lane may need to enter a fresh draft first.
@@ -2001,6 +2010,9 @@ const NAV_PREFETCH = {
           setPickerCodexRequest({ epoch: Date.now(), path: path || null, projectId: projectId || null, roots: roots || [] });
           applied = true;
         } else if (bridge.sessions && bridge.sessions.setDraftWorkspace) {
+          // A chat-lane stage invalidates a lingering unconsumed codex
+          // request (review #484 round-11 m8).
+          setPickerCodexRequest(null);
           // The bridge stages a draft workspace only in draft state — with an
           // active session the call is a documented silent no-op, so the
           // project row "+" used to dead-end without any feedback on the most
@@ -2064,11 +2076,21 @@ const NAV_PREFETCH = {
       // Project channel (§9.3): cwd = the picked root, keychain = the project's
       // full root set at that moment; the backend writes last_primary_root
       // inside create_session.
+      // The picker closes inside applyWorkspaceTarget, so a rejected create
+      // would otherwise be console-only: closed picker, nothing staged, no
+      // toast — on the most common entry path (row click). Surfaced with the
+      // shared project-operations failure copy (review #484 round-10 m5).
+      const reportPickerApplyFailure = (error) => {
+        console.warn('workspace target failed', error);
+        setSettingsToast(t.uiProjects.opFailed);
+      };
       const handlePickerSelectProject = (project, root) => {
-        applyWorkspaceTarget({ lane: pickerLane(), path: root, projectId: project.id, roots: pickerProjectRoots(project) });
+        applyWorkspaceTarget({ lane: pickerLane(), path: root, projectId: project.id, roots: pickerProjectRoots(project) })
+          .catch(reportPickerApplyFailure);
       };
       const handlePickerTemporary = () => {
-        applyWorkspaceTarget({ lane: pickerLane(), path: null, projectId: null, roots: [] });
+        applyWorkspaceTarget({ lane: pickerLane(), path: null, projectId: null, roots: [] })
+          .catch(reportPickerApplyFailure);
       };
       // Browse channel (§9.9 folder channel): system folder picker → ensure
       // (anchor reuse / materialize; the exclusion list skips) → start at the
@@ -3526,11 +3548,16 @@ const NAV_PREFETCH = {
             mode={workspacePicker.mode}
             language={language}
             busy={pickerBusy}
-            webOnly={!can('desktopChrome') || !bridge.projects}
+            // Browse must also degrade when its channel is missing —
+            // rendering the row while handlePickerBrowse would silently
+            // no-op is a dead entry (review #484 round-10 m6; the AGENTS.md
+            // convention asks for an explicit unsupported signal, and the
+            // typed degrade lives in the picker's webOnly surface).
+            webOnly={!can('desktopChrome') || !bridge.projects || !bridge.files || !bridge.files.pickFolders}
             excludedFolder={pickerExcluded}
             deliveryLimited={!!workspacePicker.deliveryLimited}
             t={t}
-            onClose={closeWorkspacePicker}
+            onClose={dismissWorkspacePicker}
             onSelectProject={handlePickerSelectProject}
             onTemporary={handlePickerTemporary}
             onBrowse={handlePickerBrowse}

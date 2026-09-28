@@ -117,7 +117,7 @@ function resolveSessionProjectId(item, projects, assignments, orderedProjects) {
   const projectList = Array.isArray(projects) ? projects.filter(Boolean) : [];
   const assignmentMap = assignments && typeof assignments === 'object' ? assignments : {};
   if (!item) return null;
-  if (Object.prototype.hasOwnProperty.call(assignmentMap, item.id)) {
+  if (Object.hasOwn(assignmentMap, item.id)) {
     const assigned = assignmentMap[item.id];
     if (assigned && projectList.some(project => project.id === assigned)) return assigned;
     if (assigned === null) return null;
@@ -173,7 +173,7 @@ function groupSessionsWithProjects(items, projects, assignments) {
     if (!item) return;
     let target = null;
     let autoGroupBlocked = false;
-    if (Object.prototype.hasOwnProperty.call(assignmentMap, item.id)) {
+    if (Object.hasOwn(assignmentMap, item.id)) {
       const assigned = assignmentMap[item.id];
       if (assigned && byId.has(assigned)) {
         // Tier 1: explicit id resolves.
@@ -262,4 +262,4 @@ function capUnavailableRootsForDisplay(roots, expanded) {
   return { visibleRoots: list.slice(0, 1), hiddenCount: Math.max(0, list.length - 1) };
 }
 
-export { TEMPORARY_GROUP_KEY, PROJECT_SESSION_DRAG_TYPE, groupSessionsWithProjects, projectCoversPath, resolveSessionProjectId, orderedProjectsByPosition, rootPath, needsAddFolderConfirm, hasProjectWorkspace, capUnavailableRootsForDisplay, isUnderRoot };
+export { capUnavailableRootsForDisplay, groupSessionsWithProjects, hasProjectWorkspace, isUnderRoot, needsAddFolderConfirm, orderedProjectsByPosition, PROJECT_SESSION_DRAG_TYPE, projectCoversPath, resolveSessionProjectId, rootPath, TEMPORARY_GROUP_KEY };

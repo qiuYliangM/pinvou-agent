@@ -7,9 +7,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, FolderOpen, FolderPlus, PinIcon, Trash2, X } from '../../components/icons.jsx';
-import { isImeComposing } from '../../shared/ime-guard.mjs';
 import { useDialogFocusRestore } from '../../hooks/useDialogFocusRestore.js';
 import { useDialogFocusTrap } from '../../hooks/useDialogFocusTrap.js';
+import { isImeComposing } from '../../shared/ime-guard.mjs';
 import { manageFolderRows } from './manageFoldersState.js';
 import { workspaceNoticeTone } from './workspacePickerState.js';
 
@@ -30,6 +30,12 @@ const ManageProjectFoldersDialog = ({
   onRevokeExclusion,
 }) => {
   const copy = t.uiManageFolders;
+  // The recorded add-notice variants are gated on the project already having
+  // a root (review #484 round-11 m12): a tag-only project regaining its first
+  // folder makes that folder the primary, which IS delivered on the wire —
+  // "recorded, only the primary takes effect" would be false there. The
+  // count-gating mirrors the picker/toast/chip surfaces (round-9 N3).
+  const projectRootCount = Array.isArray(project && project.roots) ? project.roots.length : 0;
   // Confirm states: pendingRemove = the root row awaiting removal;
   // removingPrimary = the primary-removal interception hint.
   const [pendingRemove, setPendingRemove] = useState(null);
@@ -254,8 +260,8 @@ const ManageProjectFoldersDialog = ({
               <span className="block truncate">{copy.addAction}</span>
               <span className="block truncate text-[11px] text-[#8A8F94] dark:text-[#9AA0A6]">
                 {workspaceNoticeTone(mode) === 'restricted'
-                  ? (deliveryLimited ? copy.addNoticeRestrictedRecorded : copy.addNoticeRestricted)
-                  : (deliveryLimited ? copy.addNoticeVisibilityRecorded : copy.addNoticeVisibility)}
+                  ? (deliveryLimited && projectRootCount > 0 ? copy.addNoticeRestrictedRecorded : copy.addNoticeRestricted)
+                  : (deliveryLimited && projectRootCount > 0 ? copy.addNoticeVisibilityRecorded : copy.addNoticeVisibility)}
               </span>
             </span>
           </button>

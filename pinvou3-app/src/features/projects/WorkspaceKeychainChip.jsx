@@ -20,7 +20,10 @@ export function WorkspaceKeychainChip({ copy, primary, additionalCount, roots, c
   const [open, setOpen] = useState(false);
   const triggerRef = useRef(null);
   const panelRef = useRef(null);
-  useOutsidePointerClose(open, () => setOpen(false), [panelRef, triggerRef]);
+  // Escape closes like every sibling surface (review #484 round-11 m10):
+  // the shared hook supports it; the chip panel was the one surface that
+  // did not wire it.
+  useOutsidePointerClose(open, () => setOpen(false), [panelRef, triggerRef], { escape: true });
 
   const label = workspaceName(primary, copy.unknownDirectory);
   const list = Array.isArray(roots) ? roots : [];

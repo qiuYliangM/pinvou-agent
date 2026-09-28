@@ -1304,7 +1304,10 @@ fn update_project_and_expel_keeps_sessions_still_resolving_into_another_project(
     let resolved = store
         .resolve_session_project("s-shared", &cwd)
         .expect("session keeps resolving after the edit");
-    assert_eq!(resolved.id, first.id, "tier-② lands in the position-0 project");
+    assert_eq!(
+        resolved.id, first.id,
+        "tier-② lands in the position-0 project"
+    );
 }
 
 /// review #484 M3: update_project_and_expel persists BEFORE committing the
@@ -1330,10 +1333,7 @@ fn update_project_and_expel_rolls_back_memory_when_persist_fails() {
             &project.id,
             Some("新名".to_string()),
             vec![abs("e-new")],
-            &[(
-                "s1".to_string(),
-                abs("e-old").join("session"),
-            )],
+            &[("s1".to_string(), abs("e-old").join("session"))],
         )
         .expect_err("persist failure surfaces as an error");
     assert!(!error.to_string().is_empty());
@@ -1354,10 +1354,7 @@ fn update_project_and_expel_rolls_back_memory_when_persist_fails() {
             &project.id,
             Some("新名".to_string()),
             vec![abs("e-new")],
-            &[(
-                "s1".to_string(),
-                abs("e-old").join("session"),
-            )],
+            &[("s1".to_string(), abs("e-old").join("session"))],
         )
         .expect("retry persists");
     assert_eq!(updated.roots, vec![display(&abs("e-new"))]);

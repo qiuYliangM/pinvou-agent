@@ -1970,7 +1970,9 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             // IPC-level failure: same promise as the browse channel — the
             // conversation still starts at the picked folder, as a plain one.
             console.warn('ensure folder project failed', error);
-            bridge.sessions.setDraftWorkspace(path);
+            if (bridge.sessions.setDraftWorkspace(path) === false) {
+              throw new Error(t.uiProjects.opFailed);
+            }
             return;
           }
           if (!interpreted.materialized && interpreted.failed) {
@@ -1981,10 +1983,17 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             throw new Error(t.uiProjects.opFailed);
           }
           // Excluded folders (no outcome) stage plain with projectId null.
-          bridge.sessions.setDraftWorkspace(path, { projectId: interpreted.projectId, workspaceRoots: [path] });
+          // The boolean return is honored on every staging site (review #484
+          // round-10 m12): false = an active session owns the composer and
+          // nothing was staged — surfacing beats a silently ignored pick.
+          if (bridge.sessions.setDraftWorkspace(path, { projectId: interpreted.projectId, workspaceRoots: [path] }) === false) {
+            throw new Error(t.uiProjects.opFailed);
+          }
           return;
         }
-        bridge.sessions.setDraftWorkspace(path);
+        if (bridge.sessions.setDraftWorkspace(path) === false) {
+          throw new Error(t.uiProjects.opFailed);
+        }
       }
       // Grant-notice mode for the chat lane's workspace surfaces (review #484
       // round-11 M6): the notice must describe the posture the draft takes

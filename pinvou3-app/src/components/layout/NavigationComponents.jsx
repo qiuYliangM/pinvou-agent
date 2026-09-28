@@ -198,13 +198,17 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
       function save() { const tx = val.trim(); setEditing(false); if (tx && tx !== chat.title) onRename(chat.id, tx); }
       // Portal "more" menu placement/close lives in the shared hook (same
       // plumbing as the project-group header menu). Height covers the tallest
-      // variant actually rendered — 7 menu items at h-9 (36px) + 9px divider +
-      // 8px vertical padding ≈ 269: the view-workspace entry is desktop-gated,
-      // codex rows render move-to-project, other rows render export-archive,
-      // and the two are taskKind-exclusive. It only drives the bottom-edge
-      // flip decision and the portal clips (per-menu height convention, see
+      // variant actually rendered — 8 enabled entries on a desktop bound row
+      // at h-9 (36px) + 9px divider + 8px vertical padding ≈ 305: toggle-pin,
+      // rename, the desktop-gated view-workspace entry, move-to-project,
+      // delete, open-folder, export-archive, archive. (The old 269 estimate
+      // assumed move-to-project and export-archive were taskKind-exclusive —
+      // they are gated on independent props and co-exist on bound rows, so
+      // the flip decision missed by one row near the viewport bottom;
+      // review #484 round-11 m7.) It only drives the bottom-edge flip
+      // decision and the portal clips (per-menu height convention, see
       // ProjectGroupHeader).
-      const { menuOpen, menuStyle, closeMenu, toggleMenu, openMenuAt } = usePortalMenu({ height: 269 });
+      const { menuOpen, menuStyle, closeMenu, toggleMenu, openMenuAt } = usePortalMenu({ height: 305 });
       // 移动菜单项把流程移交给 App 级弹窗:菜单门户与弹窗在同一次提交里
       // 卸载/挂载,被聚焦的菜单项随门户消失,弹窗的焦点还原来不及捕获它;
       // 且此刻行的 :hover/focus-within 都已失效,hover 显隐的按钮容器是

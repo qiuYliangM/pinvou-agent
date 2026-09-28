@@ -1,14 +1,23 @@
-// ensure_folder_projects 结果解释(§9.9 文件夹通道):选择器浏览通道与两条
-// 车道的"最近目录"通道共用同一份判定,避免各处重复实现而漂移。
-// - created/covered:所选文件夹已拥有锚定项目(新建或复用),提取其项目 id
-//   (created 带 project 对象,covered 带 project_id);会话必须归属到该项目,
-//   否则 tier-2 嵌套归组会把子目录会话收养进根覆盖它的宽项目(如 Desktop)。
-// - 无 outcome(真正空列表):命中反物化排除表(§3),如实按普通文件夹处理。
-// - failed:后端对该根明确拒绝(嵌套冲突等)——不是排除表,调用方应告知用户
-//   而不是静默继续。IPC 级异常不进此函数,由调用方 catch。
-// round-8 m14:排除表解读只属于真正空列表。created/covered 缺项目 id 时
-// tier-① 归属无从携带,按 materialized=true 放行会静默跳过归属、让 tier-②
-// 收养;未知 status 同理——两者都按 failed 上抛,绝不冒充排除表。
+// Interpretation of ensure_folder_projects outcomes (§9.9 folder channel):
+// shared by the picker's browse channel and both lanes' "recent directories"
+// channels so the interpretation lives in one place instead of drifting apart.
+// - created/covered: the picked folder owns an anchored project (created or
+//   reused); extract its project id (created carries the project object,
+//   covered a project_id). The session must be assigned to THAT project, or
+//   tier-2 nested grouping adopts it into a broader project whose root
+//   covers the folder (e.g. a Desktop-rooted project).
+// - no outcome (a genuinely empty list): the folder hit the
+//   never-materialize exclusion table (§3) — honestly treated as a plain
+//   folder.
+// - failed: the backend explicitly refused the root (nesting conflict etc.)
+//   — NOT the exclusion table; the caller should tell the user instead of
+//   silently continuing. IPC-level exceptions never reach this function
+//   (callers catch).
+// round-8 m14: exclusion-table interpretation belongs to a genuinely empty
+// list only. created/covered without a project id leaves tier-1 assignment
+// nothing to carry — passing materialized=true would silently skip the
+// assignment and let tier-2 adopt; unknown status is the same. Both surface
+// as failed and never masquerade as the exclusion table.
 export function interpretFolderEnsureOutcomes(outcomes) {
   const list = Array.isArray(outcomes) ? outcomes : [];
   const hit = list.find(o => o && (o.status === 'created' || o.status === 'covered'));

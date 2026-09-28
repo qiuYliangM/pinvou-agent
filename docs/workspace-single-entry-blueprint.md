@@ -203,8 +203,8 @@ tier-① id noted below:
   against project roots with component-aware "equal to or nested under"
   semantics on folded identity keys (Windows folds case/separators; POSIX
   is case-sensitive and verbatim — the known macOS APFS case-folding
-  residue is documented in `store.rs` `root_key`). Multiple hits are
-  adopted by the **smallest position** (sidebar order is the
+  residue is documented in `store.rs` `identity_key_of_display`). Multiple
+  hits are adopted by the **smallest position** (sidebar order is the
   user-controllable knob; `id` breaks residual ties) — *not* by longest
   root. This is the §9.9 overlap ruling's resolution rule.
 
@@ -238,8 +238,10 @@ key.
   metadata stays empty, so the agent-side sandbox materializes `[cwd]`
   only. The direction is fail-safe (the agent never gets more access
   than the notice promises for the primary root); the gap is the
-  additional roots being promised-but-not-enforced on this lane.
-  Delivering roots on `session/new` (protocol extension or fork
+  additional roots being promised-but-not-enforced on this lane. The same
+  holds for ACP **resume** (`LoadSession`): it also carries only the single
+  workspace, so a restored ACP session re-materializes `[cwd]` too.
+  Delivering roots on `session/new`/resume (protocol extension or fork
   adapter) is the follow-up that closes the gap.
 - **Rebind migration** (§7): roots under the rebound prefix are translated
   `from → to`; roots outside the prefix are untouched.
@@ -424,6 +426,12 @@ its owning project's **full root set at that moment**.
   `applied=false, reason=write_skipped`. On every non-applied outcome the
   command layer skips both the live-engine push and the
   `session:list_changed` event, so runtime state cannot diverge from disk.
+- Over-grant windows surface instead of staying silent: a live push that
+  fails (or is refused by the post-`handle_for` busy recheck,
+  round-10/11 M1) sets `live_push_failed` on the applied outcome; a failed
+  sidecar rewrite (index committed, disk copy stale, round-10 M2) sets
+  `sidecar_stale`. The engine keeps the previous set until the next
+  spawn/resume; a later index loss can briefly resurrect the pre-align set.
 - Desktop-only (§9.8).
 
 ### §9.8 Web host stance
@@ -438,7 +446,9 @@ absent there:
   sessions. The `webOnly` temporary-session-only form in the picker dialog
   is defensive code for a future web surface.
 - No keychain snapshot, no project memory writes: web sessions are
-  temporary/single-root only; `align to project` rejects as desktop-only.
+  temporary/single-root only; `align to project` is desktop-only by
+  absence — the entry never renders on web (the web bridge exposes no
+  align surface), rather than a typed rejection.
 - The projects domain is absent from the web bridge, and project events are
   not forwarded through the remote-control relay (§8).
 

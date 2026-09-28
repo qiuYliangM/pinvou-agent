@@ -677,7 +677,15 @@ pub(crate) fn align_session_keychain(
         });
     };
     let next = ProjectStore::keychain_for_workspace(&cwd, &project.roots);
-    let same = current.len() == next.len() && current.iter().zip(next.iter()).all(|(a, b)| a == b);
+    // Round-10 m3: a legacy empty snapshot is semantically [cwd] — the base
+    // normalizes empty to the cwd — so aligning it must report no_change
+    // instead of rewriting the sidecar, pushing the live engine, and firing
+    // session:list_changed for zero grant difference.
+    let same = (current.len() == next.len()
+        && current.iter().zip(next.iter()).all(|(a, b)| a == b))
+        || (current.is_empty()
+            && next.len() == 1
+            && next[0] == ProjectStore::keychain_for_workspace(&cwd, &[])[0]);
     if same {
         return Ok(AlignOutcome {
             session_id: session_id.to_string(),

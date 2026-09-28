@@ -1297,8 +1297,7 @@ mod tests {
             .expect("bind the acp session's plain sidecar with different roots");
         let projected = project_keychain_roots(&agents, &store, &acp);
         assert_eq!(
-            projected,
-            keychain,
+            projected, keychain,
             "the agents record wins over the plain sidecar when both carry non-empty sets"
         );
         assert!(

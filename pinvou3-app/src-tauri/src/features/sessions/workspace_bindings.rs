@@ -91,8 +91,9 @@ const SESSION_WORKSPACE_SIDECAR_FILE: &str = "workspace-binding.json";
 struct SessionWorkspaceSidecar {
     version: u32,
     path: PathBuf,
-    /// 创建时锁定的钥匙串快照(§6):全量可访问根(含主根)。旧 sidecar 缺该键
-    /// 或为空 = 单根语义(仅 `path` 目录)。
+    /// Keychain snapshot locked at creation (§6): the full accessible-root
+    /// set (primary included). Legacy sidecars missing the key, or an empty
+    /// set = single-root semantics (the `path` directory only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     workspace_roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,10 +224,12 @@ impl SessionStore {
         self.bind_session_workspace_with_roots(id, path, Vec::new())
     }
 
-    /// 绑定 + 钥匙串快照(§6):`workspace_roots` 是全量可访问根(空 = 单根
-    /// 语义,底座按 cwd 归一)。落盘前经 `cwd_first_workspace_roots` 归一为
-    /// cwd 居首去重,落盘序即底座生效序。落盘纪律与
-    /// `bind_session_workspace` 相同。
+    /// Binding + keychain snapshot (§6): `workspace_roots` is the full
+    /// accessible-root set (empty = single-root semantics; the base
+    /// normalizes against the cwd). Normalized through
+    /// `cwd_first_workspace_roots` before persisting — cwd first, deduped —
+    /// so the persisted order IS the base-effective order. Same persist
+    /// discipline as `bind_session_workspace`.
     pub fn bind_session_workspace_with_roots(
         &self,
         id: &str,
@@ -259,9 +262,14 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 创建时锁定的钥匙串快照(§6);无绑定/旧 sidecar/残留目录 = 空(单根
-    /// 语义)。冷路径直接读 sidecar(只在引擎 spawn/resume 调用),不填充
-    /// `session_workspaces` 路径缓存。
+    /// Creates-time keychain snapshot (§6); unbound / legacy sidecar / stale
+    /// directory = empty (single-root semantics). Cold path: reads the
+    /// sidecar directly without populating the `session_workspaces` path
+    /// cache. Callers: engine spawn/resume AND the chat lane's
+    /// `list_sessions` (per bound session per refresh, uncached — review
+    /// #484 round-10 m16; acceptable at today's list sizes, but the cost
+    /// recurs on every session event, so cache or piggyback the binding
+    /// cache before scaling the list).
     pub fn session_workspace_roots(&self, id: &str) -> Vec<PathBuf> {
         if validate_session_id(id).is_err()
             || !self
@@ -277,9 +285,10 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    /// 「对齐到项目」(§9.7)的钥匙串替换:整体重写 sidecar 快照(绑定路径与
-    /// bound_at 保留)。无绑定时返回 Ok(false)——临时会话已由命令层先行拒绝,
-    /// 这里是第二道防线。
+    /// Keychain replacement for "align to project" (§9.7): rewrites the
+    /// whole sidecar snapshot (binding path and bound_at preserved).
+    /// Ok(false) when unbound — temporary sessions are rejected at the
+    /// command layer first; this is the second line of defense.
     pub fn set_session_workspace_roots(
         &self,
         id: &str,
@@ -290,6 +299,11 @@ impl SessionStore {
         let Some(existing) = read_workspace_sidecar(&file) else {
             return Ok(false);
         };
+        // Structural normalization (review #484 round-10 m5 / round-11 m5):
+        // the persisted order must equal the base-effective order
+        // (cwd-first, deduped) by construction, not because the sole caller
+        // happens to pre-normalize.
+        let workspace_roots = cwd_first_workspace_roots(&existing.path, workspace_roots);
         let updated = SessionWorkspaceSidecar {
             version: SESSION_WORKSPACE_SIDECAR_VERSION,
             path: existing.path,
@@ -457,9 +471,10 @@ impl SessionStore {
         let sidecar = SessionWorkspaceSidecar {
             version: SESSION_WORKSPACE_SIDECAR_VERSION,
             path: next.clone(),
-            // 钥匙串快照随绑定一起平移:单个未覆盖前缀的根替换时,磁盘上已有
-            // 的快照原样保留(逐根平移由下方 rebind_workspace_bindings 的整批
-            // 通道处理)。
+            // The keychain snapshot translates together with the binding:
+            // a single uncovered-prefix root replacement leaves the existing
+            // on-disk snapshot untouched (per-root translation goes through
+            // the batch rebind_workspace_bindings channel below).
             workspace_roots: previous
                 .as_ref()
                 .map(|sidecar| sidecar.workspace_roots.clone())

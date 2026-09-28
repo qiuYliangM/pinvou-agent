@@ -4974,8 +4974,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.workspace_kind, CodexWorkspaceKind::Project);
-        assert_eq!(recovered.workspace_path, Some(project));
-        assert_eq!(recovered.workspace_roots, vec![extra]);
+        assert_eq!(recovered.workspace_path, Some(project.clone()));
+        // Verbatim durability: the snapshot round-trips the full set
+        // (primary included, spawn wrote it that way); the base normalizes
+        // cwd-first per turn. The relative entry is dropped.
+        assert_eq!(recovered.workspace_roots, vec![project, extra]);
     }
 
     #[test]
