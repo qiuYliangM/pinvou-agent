@@ -13,6 +13,8 @@
 //!   roundtrip，新 schema 字段在老版本二进制上不丢数据（前向兼容）。
 //! - 损坏 JSON fail loud：bundles.json 是唯一真相源，静默重建会掩盖数据损坏，
 //!   损坏时返回 Err 且绝不回写。
+//!
+// architecture-guard: allow-target-cfg -- the unix regression test in this file (the round-23 MAJOR 3 legacy-import gate latch) needs an unreadable (0o000) installed.json fixture; test-only inline cfg(unix)+PermissionsExt (same exemption precedent as scope.rs / package_export.rs, review #455); a real read() probe guards against running as root, Windows is covered by link checks.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -424,6 +426,10 @@ impl BundleStore {
     /// - **幂等**：`legacy_imported` 闸置位后直接跳过；闸未置位时也只补缺失 id，
     ///   已存在的记录永远保留（用户/新管线写入的赢）。
     /// - **非破坏性**：只读旧布局、只写 bundles.json；目录搬移与旧布局删除在后续 PR。
+    /// - **注册表不可读 = 不导入、不落闸**（review #455 round-23 MAJOR 3）：
+    ///   installed.json 存在但不可读时整体报错返回，`legacy_imported` 不置位——
+    ///   宁可下次启动重试，也不把一次吞错读取得来的不完整镜像永久烘焙进
+    ///   bundles.json（与 round-20 MAJOR A 的 reconcile 转换同类）。
     /// - 全程持 FILE_LOCK（"读到即迁移"必须持锁，§9.4 / #287 竞态教训前置）。
     pub fn import_legacy(&self) -> Result<LegacyImportReport, String> {
         let _guard = file_lock();
@@ -433,7 +439,7 @@ impl BundleStore {
             report.already_imported = true;
             return Ok(report);
         }
-        for candidate in collect_legacy_records() {
+        for candidate in collect_legacy_records()? {
             if file.records.iter().any(|r| r.id == candidate.id) {
                 report.kept_existing.push(candidate.id);
                 continue;
@@ -644,8 +650,11 @@ fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn collect_legacy_records() -> Vec<BundleRecord> {
-    let mut out = legacy_mcp_records();
+/// 旧布局扫描 → 预置包记录。MCP 安装态读走 `try_installed_ids`（review #455
+/// round-23 MAJOR 3）：installed.json 存在但不可读时整体报错，调用方据此跳过
+/// 本次导入且不落 `legacy_imported` 闸，避免把不完整镜像永久烘焙进 bundles.json。
+fn collect_legacy_records() -> Result<Vec<BundleRecord>, String> {
+    let mut out = legacy_mcp_records()?;
     out.extend(legacy_skill_records());
     out.extend(legacy_cli_records());
     // id 去重（保序留先）：MCP 包与其同名 companion 技能（pptx↔pptx）会各扫到一次，
@@ -653,18 +662,18 @@ fn collect_legacy_records() -> Vec<BundleRecord> {
     // 信息更全，故排在前面的 MCP 记录优先。
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.id.clone()));
-    out
+    Ok(out)
 }
 
-/// installed.json（MCP 安装态）→ 预置包记录。
-fn legacy_mcp_records() -> Vec<BundleRecord> {
+/// installed.json（MCP 安装态）→ 预置包记录。读失败报 Err（不塌缩为空集）。
+fn legacy_mcp_records() -> Result<Vec<BundleRecord>, String> {
     let manager = MarketplaceManager::new();
-    let installed = manager.installed_ids();
+    let installed = manager.try_installed_ids()?;
     if installed.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let now = now_iso8601();
-    installed
+    Ok(installed
         .into_iter()
         .map(|id| BundleRecord {
             id,
@@ -675,7 +684,7 @@ fn legacy_mcp_records() -> Vec<BundleRecord> {
             degraded: None,
             extra: serde_json::Map::new(),
         })
-        .collect()
+        .collect())
 }
 
 /// `bundle/skills/*/.installed-from` 标记 → 技能包记录：
@@ -940,6 +949,58 @@ mod tests {
         });
     }
 
+    /// Round-23 MAJOR 3: an unreadable installed.json must fail the legacy
+    /// import WITHOUT latching the one-shot `legacy_imported` gate and without
+    /// writing bundles.json — a swallowed read here would bake an incomplete
+    /// mirror into the store permanently (no later boot can repair it). After
+    /// the permissions are restored, the same call imports and latches.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_unreadable_registry_fails_without_latching_gate() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home("pinvou3-store-test", || {
+            let store = BundleStore::new();
+            let home = paths::pinvou3_home();
+            let installed_path = home.join("marketplace/installed.json");
+            std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+            std::fs::write(&installed_path, r#"["gongwen"]"#).unwrap();
+            std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            // Root probe (mode bits are no-ops for root): if the file is still
+            // readable, the unreadable-read branch never runs — skip loudly.
+            if std::fs::read(&installed_path).is_ok() {
+                std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                eprintln!(
+                    "ROOT-SKIP[legacy_import_unreadable_registry_fails_without_latching_gate]: running as root - the unreadable-file fixture stays readable; NOT exercised"
+                );
+                return;
+            }
+
+            assert!(
+                store.import_legacy().is_err(),
+                "an unreadable registry must fail the import (fail loud, not swallow)"
+            );
+            let file = store.load().unwrap();
+            assert!(
+                !file.legacy_imported,
+                "the one-shot gate must stay unset so a later boot retries the import"
+            );
+            assert!(
+                file.records.is_empty(),
+                "no incomplete mirror may be persisted off a failed read"
+            );
+
+            // Permissions restored: the same call now imports and latches.
+            std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let report = store.import_legacy().unwrap();
+            assert_eq!(report.imported, vec!["gongwen".to_string()]);
+            let file = store.load().unwrap();
+            assert!(file.legacy_imported, "the successful import latches the gate");
+        });
+    }
+
     /// 首启导入：MCP（installed.json + manifest 凭据）、预置/上传技能标记、
     /// CLI 连接器（companion 技能在盘 + 存量二进制对照 lock 表）全部归位。
     #[test]
@@ -952,8 +1013,9 @@ mod tests {
                 std::fs::write(p, content).unwrap();
             };
             write("marketplace/installed.json", r#"["gongwen"]"#);
-            // MCP manifest 已迁按包聚合新布局：`legacy_mcp_records` 经 installed_ids()
-            // 读登记 id（manifest 本体现在只影响 kind/凭据查询，不进记录）。
+            // MCP manifest 已迁按包聚合新布局：`legacy_mcp_records` 经
+            // try_installed_ids() 读登记 id（manifest 本体现在只影响 kind/凭据查询，
+            // 不进记录）。
             write(
                 "bundles/gongwen/mcp/manifest.json",
                 r#"{"id":"gongwen","name":"公文写作","description":"d","version":"1.0.0","icon":"","category":"office","mcp_tools":[],"command":"","args":[],"config_fields":[{"key":"GONGWEN_KEY","label":"k","required":true}]}"#,
