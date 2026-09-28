@@ -359,7 +359,8 @@ Parity rule: channels that grant access **without** the picker's expansion
 panel carry the same-weight notice through a different surface — picker
 single-root rows and the browse entry show it inline; the no-detour
 channels (project-row "new session", composer recents) surface it as a
-toast at grant time, while the picker's own rows render it inline in the
+inline notice at grant time (rendered in the selector, not a toast — the
+  recents channel's grant copy is inline by design), while the picker's own rows render it inline in the
 popover. The notice copy comes from one shared pure function so no
 channel drifts. On the ACP lane the notice describes the recorded
 keychain, while delivery is stage-gated (see §6) — the notice text
@@ -432,6 +433,16 @@ its owning project's **full root set at that moment**.
   sidecar rewrite (index committed, disk copy stale, round-10 M2) sets
   `sidecar_stale`. The engine keeps the previous set until the next
   spawn/resume; a later index loss can briefly resurrect the pre-align set.
+- Store scope: the native lane writes both binding stores (agent record +
+  code-session sidecar); the ACP lane writes the agent index and converges
+  the durable acp-state.json snapshot — the plain binding sidecar does not
+  apply on that lane.
+- Flow-level ruling (§9.4 parity at the click): the excluded panel's
+  "start with this folder anyway" and the recents channel's excluded-folder
+  staging grant without a dedicated mode-aware notice at the click itself —
+  the notice rides the selector's persistent grant copy one step earlier in
+  the same flow; this is the disclosed flow-level equivalence, not a
+  per-click notice.
 - Desktop-only (§9.8).
 
 ### §9.8 Web host stance

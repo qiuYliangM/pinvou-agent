@@ -422,9 +422,11 @@ pub async fn create_session(
         .map_err(|e| format!("create_session: invalid workspace_path: {e:#}"))?;
     // 钥匙串快照(§6):绝对路径硬拒;不存在的目录软警告保留(参照 rebind 的
     // 宽松语义,附加根可能稍后重建)。空/未传 = 单根(仅 cwd)。
-    let roots =
-        crate::features::sessions::validate_workspace_roots(workspace_roots.unwrap_or_default())
-            .map_err(|e| format!("create_session: invalid workspace_roots: {e:#}"))?;
+    let roots = crate::features::sessions::validate_workspace_roots(
+        workspace_roots.unwrap_or_default(),
+        workspace.as_deref(),
+    )
+    .map_err(|e| format!("create_session: invalid workspace_roots: {e:#}"))?;
     // 没有 workspace_path 时钥匙串/项目归属无处可落:硬校验完再静默丢弃会谎报
     // 授权范围(评审 #484 round-7 minor)——显式参数错误,让调用方重传。
     if workspace.is_none() && (!roots.is_empty() || project_id.is_some()) {
@@ -433,20 +435,23 @@ pub async fn create_session(
                 .to_string(),
         );
     }
-    let metadata =
-        create_session_record(set_active.unwrap_or(true), &store, &pool, workspace.clone())?;
     // Same rebind fence as every sibling root-accepting writer (review #484
     // round-11 M3): the binding write and the project-choice writes
     // (last_primary_root + tier-1 assignment) must not commit between the
     // rebind's candidate snapshot and its translation, or the fresh binding
     // keeps the dead `from` spelling and escapes translation entirely. Held
     // only for the binding window — the plain no-workspace create path stays
-    // fence-free.
+    // fence-free. Taken BEFORE create_session_record (review #484 round-13
+    // minor 1): a REBIND_IN_PROGRESS rejection after the session was created
+    // would leave a persisted orphan session behind — the exact state the
+    // adjacent bind-failure path rolls back by deleting.
     let _fence = if workspace.is_some() {
         Some(projects.rebind_fence()?)
     } else {
         None
     };
+    let metadata =
+        create_session_record(set_active.unwrap_or(true), &store, &pool, workspace.clone())?;
     if let Some(workspace) = workspace.clone() {
         // A failed binding persist must not leave behind a session that "looked
         // created but falls back to the private execution root after restart":

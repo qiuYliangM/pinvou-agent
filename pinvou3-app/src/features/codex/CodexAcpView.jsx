@@ -1038,7 +1038,11 @@ export function CodexAcpView({
   // own cached controls through composerModeValue instead.
   const laneNoticeMode = isNativeAgent
     ? (nativeDraftControls.mode || composerModeValue || null)
-    : (composerModeValue || nativeDraftControls.mode || null);
+    // Round-13 minor 5: a native-staged YOLO must not leak into a third-party
+    // ACP draft's grant notice (an agent switch does not clear the native
+    // controls); an unknown posture falls through to the restricted tone,
+    // which is the safe side of the §9.4 wording.
+    : (composerModeValue || null);
   // Same mirror for the root-delivery state (§6 stage-gate): a third-party
   // ACP agent only ever receives the primary root on the wire. Lives below
   // isNativeAgent's declaration — the lint gate rejects use-before-declaration.

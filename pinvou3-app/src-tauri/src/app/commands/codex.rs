@@ -823,11 +823,11 @@ pub(crate) async fn create_codex_acp_session_with_workspace_binding(
         .map_err(|error| format!("{error:#}"))?;
     // 钥匙串快照(§6):绝对路径硬拒,不存在的附加根软警告保留(与
     // sessions::create_session 同一条校验)。
-    let keychain =
-        crate::features::sessions::validate_workspace_roots(workspace_roots.unwrap_or_default())
-            .map_err(|error| {
-                format!("create_codex_acp_session: invalid workspace_roots: {error:#}")
-            })?;
+    let keychain = crate::features::sessions::validate_workspace_roots(
+        workspace_roots.unwrap_or_default(),
+        project_workspace.as_deref(),
+    )
+    .map_err(|error| format!("create_codex_acp_session: invalid workspace_roots: {error:#}"))?;
     // 临时会话(未提供 workspace_path)没有绑定工作区,钥匙串快照在 store 层
     // 会被强制清空(§9.1 单根语义)。携带非空 roots 是调用方契约错误——前端
     // 只在项目通道把 roots 与 path 一起下发——显式拒绝而不是静默丢弃

@@ -71,7 +71,13 @@ struct ProjectsFile {
     pub never_materialize_roots: Vec<String>,
 }
 
-const SCHEMA_VERSION: u32 = 1;
+// 2 (review #484 round-13 M1, requested in round 12): the persisted shape
+// gained `Project.origin`, `Project.last_primary_root`, and
+// `ProjectsFile.never_materialize_roots` under schema 1. Serde defaults make
+// the 1→2 read free; the bump makes a pre-PR binary (update rollback,
+// dual-version machine) refuse to write instead of silently stripping the
+// exclusion list / origin / primary-root memory on its next persist.
+const SCHEMA_VERSION: u32 = 2;
 
 /// 删除项目的结果汇报:受影响会话只被解绑(回落隐式分组),永不删除。
 /// `affected_session_ids` 目前无前端消费者(handleDeleteProject 丢弃返回值),

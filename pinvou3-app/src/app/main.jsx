@@ -1856,7 +1856,7 @@ const App = () => {
           path: primary,
           projectId: project.id,
           roots,
-        })) {
+        }).catch((error) => { reportPickerApplyFailure(error); return false; })) {
           setSettingsToast(workspaceGrantNotice(
             currentView === 'codex' ? activeLaneMode() : chatLaneGrantMode(),
             roots.length,
@@ -2160,7 +2160,8 @@ const App = () => {
           setPickerExcluded(folder);
           return;
         }
-        applyWorkspaceTarget({ lane, path: folder, projectId: ensuredProjectId, roots: [folder] });
+        applyWorkspaceTarget({ lane, path: folder, projectId: ensuredProjectId, roots: [folder] })
+          .catch(reportPickerApplyFailure);
       };
 
       const sidebarFolderGroups = useMemo(() => (sidebarCodeListActive
@@ -3562,7 +3563,7 @@ const App = () => {
             onSelectProject={handlePickerSelectProject}
             onTemporary={handlePickerTemporary}
             onBrowse={handlePickerBrowse}
-            onBrowseExcluded={(folder) => applyWorkspaceTarget({ lane: pickerLane(), path: folder, projectId: null, roots: [folder] })}
+            onBrowseExcluded={(folder) => applyWorkspaceTarget({ lane: pickerLane(), path: folder, projectId: null, roots: [folder] }).catch(reportPickerApplyFailure)}
             onDismissExcluded={() => setPickerExcluded(null)}
           />
           )}

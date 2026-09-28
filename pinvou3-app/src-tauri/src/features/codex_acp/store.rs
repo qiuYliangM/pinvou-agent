@@ -267,12 +267,16 @@ fn code_session_sidecar_path(store_path: &Path, session_id: &str) -> PathBuf {
 /// `set_session_workspace_roots` 的写入回执（评审 #484 round-10 M2）：
 /// `applied` = agent 记录已提交；`sidecar_committed` = 原生代码 sidecar 重写
 /// 回执——`None` = 非 code 会话无需 sidecar，`Some(false)` = 索引已提交但
-/// sidecar 重写失败（陈旧 sidecar 保留对齐前更宽的根集，索引丢失恢复时会
-/// 以 over-grant 方向复活），必须随 align outcome 透出而非静默。
+/// sidecar 重写失败；`state_committed` = acp-state.json 快照同步回执——
+/// `None` = 没有该文件可同步（原生车道/测试直构 store），`Some(false)` =
+/// 索引已提交但快照同步失败（陈旧快照保留对齐前更宽的根集，索引丢失恢复
+/// 时会以 over-grant 方向复活）。两类失败都必须随 align outcome
+/// （`sidecar_stale`）透出而非静默（评审 #484 round-13 M3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceRootsWrite {
     pub applied: bool,
     pub sidecar_committed: Option<bool>,
+    pub state_committed: Option<bool>,
 }
 
 impl WorkspaceRootsWrite {
@@ -280,6 +284,7 @@ impl WorkspaceRootsWrite {
         Self {
             applied: false,
             sidecar_committed: None,
+            state_committed: None,
         }
     }
 }
@@ -690,15 +695,16 @@ impl SessionAgentStore {
         // survives a session-agents.json loss (review #484 round-11 M8): keep
         // its roots snapshot convergent with the index, or a later index loss
         // lets the recovery path resurrect the pre-align (wider) root set.
-        // Failure here cannot roll the index back (it is already committed) —
-        // it is reported through `sidecar_committed`-class honesty by the
-        // caller's stale-sidecar surfacing, and the next respawn rewrites the
-        // whole state file anyway.
+        // Failure here cannot roll the index back (it is already committed),
+        // so it is reported through `state_committed` and surfaces as
+        // `sidecar_stale` on the align outcome — swallowing it would report a
+        // narrowing align as clean while the durable ACP copy keeps the wider
+        // pre-align set (review #484 round-13 M3). 同步而不创建:acp-state.json
+        // 的创建归 spawn 路径所有;没有该文件的会话(原生车道、测试直构
+        // store)跳过,恢复路径本就读不到。下一次 respawn 会整体重写该文件。
+        let mut state_committed: Option<bool> = None;
         if record.workspace_kind == CodexWorkspaceKind::Project {
             if let Some(workspace_path) = &state_workspace_path {
-                // 同步而不创建:acp-state.json 的创建归 spawn 路径所有;没有
-                // 该文件的会话(原生车道、测试直构 store)跳过,恢复路径本就
-                // 读不到。
                 if let Ok(state_path) = super::events::state_path(session_id) {
                     if state_path.exists() {
                         let patch = json!({
@@ -708,11 +714,17 @@ impl SessionAgentStore {
                                 "roots": workspace_roots,
                             }
                         });
-                        if let Err(error) = super::events::patch_acp_state(session_id, patch) {
-                            eprintln!(
-                                "[pinvou3-app] 同步 acp-state.json 钥匙串快照失败: {error:#}"
-                            );
-                        }
+                        state_committed = Some(
+                            match super::events::patch_acp_state(session_id, patch) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    eprintln!(
+                                        "[pinvou3-app] 同步 acp-state.json 钥匙串快照失败: {error:#}"
+                                    );
+                                    false
+                                }
+                            },
+                        );
                     }
                 }
             }
@@ -720,6 +732,7 @@ impl SessionAgentStore {
         Ok(WorkspaceRootsWrite {
             applied: true,
             sidecar_committed,
+            state_committed,
         })
     }
 
@@ -2465,6 +2478,75 @@ mod tests {
             .set_session_workspace_roots("temp", vec![workspace])
             .expect("temporary session has no keychain");
         assert!(!temporary.applied);
+
+        fs::remove_dir_all(&root).unwrap();
+        // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+        // environment.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                None => std::env::remove_var("PINVOU3_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_session_workspace_roots_reports_a_failed_acp_state_convergence() {
+        // Round-13 M3: a Project-kind ACP record with a pre-existing (here:
+        // deliberately unwritable) acp-state.json must surface the failed
+        // convergence as state_committed = Some(false). Swallowing it would
+        // report a narrowing align as clean while the durable ACP copy keeps
+        // the wider pre-align set that acp_recovery_record reads back after a
+        // session-agents.json loss. Hermetic under ENV_LOCK + PINVOU3_HOME:
+        // the state path resolves under the redirected home.
+        let _env_guard = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_home = std::env::var("PINVOU3_HOME").ok();
+        let hermetic_home = std::env::temp_dir().join(format!(
+            "pinvou3-codex-state-converge-home-{}",
+            std::process::id()
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &hermetic_home) };
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-codex-state-converge-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = SessionAgentStore {
+            path: root.join("session-agents.json"),
+            records: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        store
+            .set_acp_workspace(
+                "s-acp",
+                AgentBackend::CodexAcp,
+                CodexWorkspaceKind::Project,
+                Some(workspace.clone()),
+                vec![workspace.clone()],
+            )
+            .unwrap();
+        // The pre-existing state artifact as an unwritable directory: spawn
+        // owns its creation, so a pre-existing-but-unusable copy is exactly
+        // the convergence-failure shape.
+        let state_dir = hermetic_home
+            .join("sessions")
+            .join("s-acp")
+            .join("acp-state.json");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let write = store
+            .set_session_workspace_roots("s-acp", vec![workspace.clone(), extra.clone()])
+            .expect("the index commits");
+        assert!(write.applied);
+        assert_eq!(write.state_committed, Some(false), "{write:?}");
+        assert_eq!(write.sidecar_committed, None, "ACP records have no sidecar");
 
         fs::remove_dir_all(&root).unwrap();
         // SAFETY: ENV_LOCK held for the whole test; restoring the caller's

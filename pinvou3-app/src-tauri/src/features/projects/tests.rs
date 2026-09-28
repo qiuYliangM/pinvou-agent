@@ -404,7 +404,7 @@ fn persist_roundtrip_preserves_state_on_reopen() {
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("read persisted file"))
             .expect("parse persisted file");
-    assert_eq!(raw["schema_version"], 1);
+    assert_eq!(raw["schema_version"], 2);
     assert!(
         !path.with_extension("json.tmp").exists(),
         "tmp file cleaned up"

@@ -112,8 +112,13 @@ test('workspace picker i18n keys exist in all three languages', () => {
   for (const lang of ['zh', 'en', 'ja']) {
     const source = read('src', 'shared', 'i18n', `${lang}.js`);
     assert.match(source, /uiWorkspacePicker: \{/, `${lang} 缺 uiWorkspacePicker 段`);
+    // Scoped to the section (review #484 round-13 minor 10): a file-global
+    // includes() is satisfied by a same-named key in ANY section, so a key
+    // actually missing from uiWorkspacePicker slipped through. Slice the
+    // section before the key lookups.
+    const section = source.slice(source.indexOf('uiWorkspacePicker: {'));
     for (const key of ['title', 'temporary', 'browse', 'noticeRestricted', 'noticeVisibility', 'excludedTitle', 'excludedProceed', 'noMatch']) {
-      assert.ok(source.includes(`${key}:`), `${lang} 缺键 ${key}`);
+      assert.ok(section.includes(`${key}:`), `${lang} 缺键 ${key}`);
     }
   }
 });

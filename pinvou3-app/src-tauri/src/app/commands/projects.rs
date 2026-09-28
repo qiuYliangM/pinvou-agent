@@ -211,8 +211,11 @@ pub async fn update_project(
             .update_project(&project_id, name, None)
             .map_err(|e| format!("update_project({project_id}): {e:#}"))?,
     };
-    drop(_fence);
     // 记住的主文件夹(§9.2):显式补丁,必须是 roots 成员(由 store 校验)。
+    // Inside the same fence as the roots replacement above (review #484
+    // round-13 minor 2): last_primary_root memory is translated by the
+    // rebind, so committing it after releasing the fence would let it land
+    // under a stale `from` spelling. The guard drops at scope end.
     let project = match last_primary_root {
         Some(root) => match store.set_last_primary_root(&project_id, &root) {
             Ok(updated) => updated,
@@ -293,6 +296,11 @@ pub async fn delete_project(
     sessions: State<'_, SessionStore>,
     acp_pool: State<'_, AcpPool>,
 ) -> Result<DeleteProjectReport, String> {
+    // Same rebind fence as the sibling root-accepting writers (review #484
+    // round-13 minor 2): the delete's tombstone writes are translation-domain
+    // state, and committing them mid-rebind lets pre-translation spellings
+    // escape. Fail-fast: a concurrent rebind answers REBIND_IN_PROGRESS.
+    let _fence = store.rebind_fence()?;
     // 自动归组成员的枚举:两个绑定 store 中位于该项目任一 root 下的会话。已有
     // 归属条目的 id 由 store 侧按 tier-① 语义跳过(显式归属他处/已移出不算成员)。
     let roots = store
@@ -443,6 +451,11 @@ pub async fn projects_set_never_materialize(
     app: AppHandle,
     store: State<'_, ProjectStore>,
 ) -> Result<Vec<String>, String> {
+    // Same rebind fence as the sibling root-accepting writers (review #484
+    // round-13 minor 2): the exclusion list is translated by the rebind, so
+    // the write must not commit between the rebind's candidate snapshot and
+    // its translation.
+    let _fence = store.rebind_fence()?;
     let roots = store
         .set_never_materialize(&root, never)
         .map_err(|e| format!("projects_set_never_materialize: {e:#}"))?;
@@ -613,6 +626,9 @@ pub(crate) struct AlignStores<'a> {
 /// 经 SyncSession 生效,重试没有价值,故写入后不复核;但**引擎推送腿**不同:
 /// 转录快照进 busy 引擎会整体覆盖并发完成的回合,命令壳在 `handle_for`
 /// await 后复查一次,变忙即降级 `live_push_failed`(评审 #484 round-11 M1)。
+/// 推送范围仅及原生引擎:存活的第三方 ACP 进程不会收到这次推送(其钥匙串
+/// 是宿主侧投影,§6 stage-gate 披露其送达语义),下个 spawn/resume 从绑定
+/// store 回填同一份快照(评审 #484 round-13 M3 措辞校正)。
 pub(crate) fn align_session_keychain(
     session_id: &str,
     stores: AlignStores<'_>,
@@ -714,7 +730,14 @@ pub(crate) fn align_session_keychain(
             .agents
             .set_session_workspace_roots(session_id, next.clone())
             .map_err(|e| format!("align_session_to_project: {e:#}"))?;
-        (write.applied, write.sidecar_committed == Some(false))
+        (
+            write.applied,
+            // Round-13 M3: a failed acp-state.json convergence on the ACP lane
+            // surfaces through the same over-grant flag as a failed native
+            // sidecar rewrite — the durable ACP copy keeps the wider pre-align
+            // set either way.
+            write.sidecar_committed == Some(false) || write.state_committed == Some(false),
+        )
     } else {
         let written = stores
             .sessions

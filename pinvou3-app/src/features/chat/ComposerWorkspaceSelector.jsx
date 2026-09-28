@@ -37,7 +37,7 @@ export function ComposerWorkspaceSelector({ copy, draftWorkspacePath, onPickWork
       // command) must be visible — silently closing the menu would make the
       // user think the selection took effect (the code lane surfaces this
       // through the page error surface).
-      .catch(error => setPickError(String((error && error.message) || error || 'error')));
+      .catch(error => setPickError(String((error && error.message) || error || copy.pickFailed)));
   }
   function select(path) {
     setOpen(false);
@@ -46,7 +46,7 @@ export function ComposerWorkspaceSelector({ copy, draftWorkspacePath, onPickWork
     // a backend refusal rejects and must surface here instead of dying as an
     // unhandled rejection while the menu silently closes.
     Promise.resolve(onSelectWorkspace(path))
-      .catch(error => setPickError(String((error && error.message) || error || 'error')));
+      .catch(error => setPickError(String((error && error.message) || error || copy.pickFailed)));
   }
 
   return (

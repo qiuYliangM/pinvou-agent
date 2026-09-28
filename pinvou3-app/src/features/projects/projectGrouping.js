@@ -165,6 +165,11 @@ function groupSessionsWithProjects(items, projects, assignments) {
   const projectList = Array.isArray(projects) ? projects.filter(Boolean) : [];
   const assignmentMap = assignments && typeof assignments === 'object' ? assignments : {};
   const byId = new Map(projectList.map(project => [project.id, project]));
+  // The (position, id) order is materialized ONCE per pass and handed to
+  // every tier-2 resolution — the pre-round-13 shape re-cloned and re-sorted
+  // the project list per session via matchProjectByPath's fallback
+  // (review #484 round-13 minor 9, same fix as the picker path).
+  const ordered = orderedProjectsByPosition(projectList);
 
   const projectRows = new Map(projectList.map(project => [project.id, []]));
   const byFolder = new Map();
@@ -189,7 +194,7 @@ function groupSessionsWithProjects(items, projects, assignments) {
     // sessions participate — temporary sessions enter a project exclusively
     // through explicit assignment (the "adopt" flow), never implicitly.
     if (!target && !autoGroupBlocked && hasProjectWorkspace(item)) {
-      target = matchProjectByPath(projectList, item.workspacePath);
+      target = matchProjectByPath(projectList, item.workspacePath, ordered);
     }
     if (target) {
       projectRows.get(target.id).push(item);

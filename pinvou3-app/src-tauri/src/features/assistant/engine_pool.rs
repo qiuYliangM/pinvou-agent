@@ -6844,4 +6844,49 @@ mod probed_facts_wiring_tests {
         assert_eq!(bridge.probed_context_tokens, Some(262_144));
         assert_eq!(bridge.probed_output_tokens, Some(4_096));
     }
+    #[test]
+    fn spawn_config_carries_the_session_keychain_snapshot() {
+        // Round-13 M4: `build_engine_config_for_session_roots` must copy the
+        // bridge-resolved keychain snapshot into `EngineConfig.workspace_roots` —
+        // the line is the spawn-lane delivery of the feature; deleting it leaves
+        // the config default (empty) and this assertion red. The resolver here is
+        // the same injection the composition root installs.
+        let mut bridge = wiring_bridge(saved_model(
+            ModelPreset::OpenaiCompatible,
+            "spawn-keychain-model",
+            Some("custom"),
+        ));
+        let w = std::env::temp_dir().join("pinvou3-spawn-config-keychains");
+        let w_for_resolver = w.clone();
+        bridge.set_workspace_roots_resolver(std::sync::Arc::new(move |session_id: &str| {
+            if session_id == "s-keyed" {
+                vec![w_for_resolver.clone(), w_for_resolver.join("extra")]
+            } else {
+                Vec::new()
+            }
+        }));
+        let roots = crate::features::sessions::SessionRoots {
+            execution: w.join("execution"),
+            ledger: w.join("ledger"),
+            bound: true,
+        };
+        let cfg = bridge.build_engine_config_for_session_roots("s-keyed", roots);
+        assert_eq!(
+            cfg.workspace_roots,
+            vec![w.clone(), w.join("extra")],
+            "the spawn config must carry the resolver's snapshot verbatim"
+        );
+        let unkeyed = bridge.build_engine_config_for_session_roots(
+            "s-other",
+            crate::features::sessions::SessionRoots {
+                execution: w.join("execution"),
+                ledger: w.join("ledger"),
+                bound: false,
+            },
+        );
+        assert!(
+            unkeyed.workspace_roots.is_empty(),
+            "no snapshot = single-root semantics"
+        );
+    }
 }

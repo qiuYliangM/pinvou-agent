@@ -84,9 +84,29 @@ test('keychain chip + align wiring (F5)', () => {
   const trigger = chip.match(/data-testid="workspace-keychain-chip"[\s\S]{0,200}?onClick/);
   assert.ok(trigger && !/disabled=\{busy\}/.test(trigger[0]), 'chip 触发按钮不被 busy 锁');
   // codex 车道成功后刷新会话列表;chip 数据来自会话项 workspace_roots。
-  assert.match(codexView, /refreshSessions\(\)/, 'codex 对齐后刷新');
+  assert.match(
+    codexView,
+    /await refreshSessions\(\)\.catch\(\(\) => \{\}\);[\s\S]{0,420}?outcome\.sidecar_stale/,
+    'codex 对齐后刷新(钉住对齐流程内的那次调用,而非文件中任意 refreshSessions)',
+  );
   assert.match(chatView, /describeKeychain\(activeItem && activeItem\.workspace_roots\)/, 'chat chip 数据源');
   assert.match(codexView, /describeKeychain\(activeSession\.workspace_roots\)/, 'codex chip 数据源');
+  // Round-13 minor 10: the remove flow's needsNewPrimary must keep its
+  // "remaining folders exist" guard — dropping it turns "remove last folder"
+  // into a silent no-op primary promotion. Pinned at the pure state module.
+  assert.match(
+    read('src', 'features', 'projects', 'manageFoldersState.js'),
+    /needsNewPrimary: target\.isPrimary && remaining\.length > 0/,
+    'removeLastFolder 的主文件夹提升必须保留 remaining 守卫',
+  );
+  // And the bridge module itself must keep the plan fallback of
+  // boundDraftMode (the isomorphic test copy alone survives flipping it to
+  // "yolo" — review #484 round-13 minor 10).
+  assert.match(
+    read('src', 'platform', 'tauri', 'bridge.js'),
+    /function boundDraftMode\(\) \{[\s\S]{0,160}?return d \|\| "plan";/,
+    'boundDraftMode 的兜底必须是 plan',
+  );
   // The chat-lane chip's busy flag is the real in-turn flag (parity with the
   // codex lane), and align outcomes other than applied/no_change are not
   // silent. M4: the host must actually pass onNotify, or every guard in
@@ -170,7 +190,16 @@ test('composer recents grant notice parity (§9.4)', () => {
   // native selector's staged mode must not under-report a third-party ACP
   // draft, review #484 round-8 m4): native reads nativeDraftControls first,
   // external agents read their cached controls (composerModeValue) first.
-  assert.match(codexView, /const laneNoticeMode = isNativeAgent[\s\S]{0,200}?nativeDraftControls\.mode \|\| composerModeValue[\s\S]{0,200}?composerModeValue \|\| nativeDraftControls\.mode/, 'codex recents notice follows the draft agent mode');
+  // Round-13 minor 5: the third-party ACP arm no longer falls back to the
+  // native-staged controls (an agent switch does not clear them — a staged
+  // YOLO used to leak into the ACP grant notice); an unknown posture falls
+  // through to the restricted tone.
+  assert.match(codexView, /const laneNoticeMode = isNativeAgent\s*\? \(nativeDraftControls\.mode \|\| composerModeValue \|\| null\)[\s\S]{0,300}?: \(composerModeValue \|\| null\);/, 'codex recents notice follows the draft agent mode');
+  assert.doesNotMatch(
+    codexView,
+    /: \(composerModeValue \|\| nativeDraftControls\.mode/,
+    'ACP 姿势未知时不得回落原生 staged 模式(受限语气兜底)',
+  );
   assert.match(codexView, /workspaceNoticeTone\(laneNoticeMode\) === 'restricted'/, 'codex recents notice tone reads the agent-aware mode');
   // 正向条件(unicorn/no-negated-condition)。Round-9 N3:recents 恒为单根
   // 授权,单根即 cwd/主根、对第三方 ACP 同样送达——不掺 recorded 变体。

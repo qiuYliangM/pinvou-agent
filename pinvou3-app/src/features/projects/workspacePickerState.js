@@ -34,6 +34,11 @@ export function computePickerRows({ projects, items, assignments, now }) {
   const assignmentMap = assignments && typeof assignments === 'object' ? assignments : {};
   const projectList = (Array.isArray(projects) ? projects : []).filter(Boolean);
   const ordered = orderedProjectsByPosition(projectList);
+  // Explicit-member lookup as one Set build instead of an O(P×A) scan per
+  // project (review #484 round-13 minor 9).
+  const explicitMembers = new Set(
+    Object.values(assignmentMap).filter(value => typeof value === 'string'),
+  );
   // One pass over the bound items: latest member activity per project.
   // Membership must be resolved against the FULL project list: with only the
   // row's own project passed, a session explicitly filed into project B but
@@ -51,7 +56,7 @@ export function computePickerRows({ projects, items, assignments, now }) {
   return projectList
     .filter(project => pickerProjectRoots(project).length > 0)
     .map((project) => {
-      const hasExplicitMembers = Object.values(assignmentMap).includes(project.id);
+      const hasExplicitMembers = explicitMembers.has(project.id);
       const own = String((project && project.updated_at) || '');
       const member = activityByProject.get(project.id);
       const lastActivity = member !== undefined && member > own ? member : own;

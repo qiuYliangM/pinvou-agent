@@ -52,8 +52,13 @@ const ProjectGroupHeader = ({
   // Menu gating and edit-submit decisions live in
   // ./projectGroupHeaderState.js (pure functions, covered by unit tests).
   const hasMenu = groupHeaderHasMenu(kind, { onConvert, onRename, onDelete });
+  // Flip budget derived from the real menu: 3 items at h-9 (36px) + 8px
+  // vertical padding = 116 for project groups (the old 96 under-counted by
+  // one item and clipped the destructive "Delete project" row near the
+  // viewport bottom; review #484 round-13 minor 3). Non-project groups keep
+  // the single-item 48.
   const { menuOpen, menuStyle, closeMenu, toggleMenu } = usePortalMenu({
-    height: kind === 'project' ? 96 : 48,
+    height: kind === 'project' ? 116 : 48,
   });
 
   // HTML5 drop-target handlers for the sidebar session drag; kept out of the

@@ -25,7 +25,7 @@ bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
 fail=0
 
-bold "── 第 0 层：v0.9.12 clean re-fork 拓扑（r1 tag 之后 69 个登记提交；r3 已收口但不含本主题，本 PR 继续过渡期叠层）──"
+bold "── 第 0 层：v0.9.12 clean re-fork 拓扑（r1 tag 之后 85 个登记提交；r3 已收口但不含本主题，本 PR 继续过渡期叠层）──"
 actual_head="$(git -C "$CODEWHALE" rev-parse HEAD 2>/dev/null || true)"
 if [[ "$actual_head" == "$EXPECTED_HEAD" ]]; then
   green "  ✓ CodeWhale gitlink 指向登记 head ${EXPECTED_HEAD}（过渡期：gitlink 领先 r1 tag，见 fork-policy 第 0 节豁免）"
