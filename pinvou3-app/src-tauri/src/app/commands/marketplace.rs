@@ -180,7 +180,6 @@ fn marketplace_oauth_login_coordinator() -> &'static MarketplaceOAuthLoginCoordi
 pub async fn install_marketplace_tool(
     tool_id: String,
     config: Option<std::collections::HashMap<String, String>>,
-    app: tauri::AppHandle,
     pool: tauri::State<'_, crate::features::assistant::engine_pool::EnginePool>,
 ) -> Result<(), String> {
     let user_config = config.unwrap_or_default();
@@ -254,7 +253,6 @@ pub async fn install_marketplace_tool(
         }
     }
 
-    let companion_tool_id = tool_id.clone();
     tokio::task::spawn_blocking(move || {
         let mgr = crate::features::marketplace::MarketplaceManager::new();
         // 联动:装该 MCP 声明的配套技能(引擎+引导整体到位)。
@@ -262,7 +260,7 @@ pub async fn install_marketplace_tool(
         // The tool's own consent sync already ran right after the install
         // commit (round-21 MAJOR 2, before the network validation); only the
         // companion loop remains here.
-        for sid in mgr.companion_skills(&companion_tool_id) {
+        for sid in mgr.companion_skills(&tool_id) {
             if let Err(e) =
                 crate::features::marketplace::skill_marketplace::SkillMarketplaceManager::new()
                     .install(&sid)
@@ -305,12 +303,6 @@ pub async fn install_marketplace_tool(
     // admission — a package's native tool stays denied, and a newly installed
     // connector's tools stay admitted — until respawn.
     hot_refresh(&pool, true).await;
-    crate::features::behavior_telemetry::track(
-        &app,
-        crate::features::behavior_telemetry::BehaviorEvent::new("tool_install_completed")
-            .tool(&tool_id, &tool_id, "mcp")
-            .success(true),
-    );
     Ok(())
 }
 
@@ -630,11 +622,9 @@ pub fn list_marketplace_skills()
 #[tauri::command]
 pub async fn install_marketplace_skill(
     skill_id: String,
-    app: tauri::AppHandle,
     pool: tauri::State<'_, crate::features::assistant::engine_pool::EnginePool>,
 ) -> Result<(), String> {
-    let install_skill_id = skill_id.clone();
-    tokio::task::spawn_blocking(move || install_marketplace_skill_sync(&install_skill_id))
+    tokio::task::spawn_blocking(move || install_marketplace_skill_sync(&skill_id))
         .await
         .map_err(|e| format!("任务执行失败: {e}"))??;
     // The install affects both scopes' enabled sets: an initialized DenyAll
@@ -649,12 +639,6 @@ pub async fn install_marketplace_skill(
     // state: without this refresh a package owning a native tool (ima) stays
     // denied in live engines until respawn.
     hot_refresh(&pool, true).await;
-    crate::features::behavior_telemetry::track(
-        &app,
-        crate::features::behavior_telemetry::BehaviorEvent::new("tool_install_completed")
-            .tool(&skill_id, &skill_id, "skill")
-            .success(true),
-    );
     Ok(())
 }
 
