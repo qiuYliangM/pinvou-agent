@@ -336,14 +336,20 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
               // Double-check the real login state (unified readiness; the old tmeet_status call is retired)
               const status = await invokeTauri('bundle_readiness', { bundleId: cfg.readiness.bundleId });
               if (!(status && status.ready)) {
-                throw new Error(authIncomplete);
+                throw Object.assign(new Error(authIncomplete), { authIncomplete: true });
               }
             }
             await invokeTauri(cfg.commands.applySkills);
             conn.setFlow(f => ({ ...f, phase: 'done', steps: { ...(f && f.steps), qr: 'done' } }));
             setTimeout(() => conn.setFlow(null), 1800);
           } catch (e) {
-            conn.setFlow(f => ({ ...f, phase: 'error', err: cfg.applyErrorMessage(e, { skillsFailed, authIncomplete }), errStep: 'qr', steps: { ...(f && f.steps), qr: 'error' } }));
+            // Round-24 minor 5: a readiness authIncomplete passes through
+            // unwrapped — the skillsFailed template would misreport a
+            // mid-sign-in state as a skills-enable failure.
+            const err = e && e.authIncomplete
+              ? authIncomplete
+              : cfg.applyErrorMessage(e, { skillsFailed, authIncomplete });
+            conn.setFlow(f => ({ ...f, phase: 'error', err, errStep: 'qr', steps: { ...(f && f.steps), qr: 'error' } }));
           }
         });
         ev.listen(cfg.events.error, (e) => {
