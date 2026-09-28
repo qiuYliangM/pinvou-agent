@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# CodeWhale v0.9.12 clean re-fork guard: 84 commits, eight maintained themes (r3 closed on main without this topic; this PR keeps the transition layering).
+# CodeWhale v0.9.12 clean re-fork guard: 99 commits, eight maintained themes (r3 closed on main without this topic; this PR keeps the transition layering).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEWHALE="$REPO/CodeWhale"
 APP="$REPO/pinvou3-app/src-tauri"
 EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
-EXPECTED_HEAD="9f5f4d34af2cb982723181ea344364abef211b0b"
-EXPECTED_COMMITS=84
+EXPECTED_HEAD="841190215377b2fe786a715f8eec46bcd47a0bfe"
+EXPECTED_COMMITS=99
 # 过渡期锚点：不可变 r1 tag 的收口 commit。层 0 断言它是当前 head 的祖先，
 # 即 gitlink 沿主题分支领先 tag 而非另起分叉；#54 合入后随登记回收重钉到维护分支头。
 R1_CLOSURE="1fafee7e26b60a59457a43bce50c63aa2ad9dbaf"
@@ -105,6 +105,8 @@ fingerprints=(
   "T1|turn_meta 附加根披露回归                        |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_workspace_roots_turn_meta_lists_attached_roots"
   "T1|只读 Scout shell 不信任附加根程序回归          |CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_workspace_roots_readonly_shell_distrusts_attached_root_programs"
   "T1|只读 Scout shell 操作数/工作目录跨根回归       |CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_workspace_roots_readonly_shell_operands_span_attached_roots"
+  "T1|未修剪拼写的 carve-out 分支回归                  |CodeWhale/crates/tui/src/core/authority.rs|forkguard_workspace_roots_carve_out_branches_on_the_untrimmed_spelling"
+  "T1|相对目标按主根解析回归                           |CodeWhale/crates/tui/src/tools/spec/tests.rs|fn forkguard_workspace_roots_relative_target_resolves_against_primary_root"
 
   "T1|GLM-5.3 强制思考改写禁用 payload    |CodeWhale/crates/tui/src/client/chat.rs|fn apply_zai_forced_thinking_effort"
   "T1|BigModel host 纳入第一方 Chat 路由  |CodeWhale/crates/config/src/provider.rs|is_exact_https_route(base_url, \"open.bigmodel.cn\", \"api/paas/v4\")"
