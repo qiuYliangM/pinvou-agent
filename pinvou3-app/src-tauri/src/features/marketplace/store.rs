@@ -997,7 +997,10 @@ mod tests {
             let report = store.import_legacy().unwrap();
             assert_eq!(report.imported, vec!["gongwen".to_string()]);
             let file = store.load().unwrap();
-            assert!(file.legacy_imported, "the successful import latches the gate");
+            assert!(
+                file.legacy_imported,
+                "the successful import latches the gate"
+            );
         });
     }
 

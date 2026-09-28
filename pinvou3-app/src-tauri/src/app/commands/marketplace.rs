@@ -218,9 +218,7 @@ pub async fn install_marketplace_tool(
 /// the behavior shipped in merge `de04d54a9` had zero test pins). Order is
 /// load-bearing: the consent sync runs BEFORE the network validation; the
 /// rollback uninstall's teardown removes the rows the sync wrote.
-pub(super) async fn install_marketplace_tool_post_install(
-    tool_id: String,
-) -> Result<(), String> {
+pub(super) async fn install_marketplace_tool_post_install(tool_id: String) -> Result<(), String> {
     // Round-21 MAJOR 2: the consent sync must run IMMEDIATELY after the
     // install commit, BEFORE the network validation — for initialized scopes
     // the stored list is the consent store, and a crash during the network

@@ -2592,7 +2592,11 @@ fn disabled_file_ids() -> (Vec<String>, Vec<String>, Vec<String>) {
     (
         file.scopes.values().flatten().cloned().collect(),
         file.hidden_scopes.values().flatten().cloned().collect(),
-        file.default_off_scopes.values().flatten().cloned().collect(),
+        file.default_off_scopes
+            .values()
+            .flatten()
+            .cloned()
+            .collect(),
     )
 }
 

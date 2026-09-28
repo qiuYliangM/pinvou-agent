@@ -929,7 +929,9 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
                         if name.is_empty() {
                             continue;
                         }
-                        let pkg = crate::features::marketplace::bundle::skill_gating_owner_with(&tools, &name);
+                        let pkg = crate::features::marketplace::bundle::skill_gating_owner_with(
+                            &tools, &name,
+                        );
                         if !ids.iter().any(|id| id == &pkg) {
                             ids.push(pkg);
                         }
@@ -952,7 +954,10 @@ pub fn save_disabled_bundles_for(scope: ConnectorScope, ids: &[String]) -> Resul
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
     let tools = MarketplaceManager::new().available_tools();
-    let normalized: Vec<String> = ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
+    let normalized: Vec<String> = ids
+        .iter()
+        .map(|id| to_package_id_with(&tools, id))
+        .collect();
     let mut file = load_disabled_bundles_file_locked();
     let key = scope.as_str().to_string();
     let was_uninitialized = !file.initialized.contains(&key);
@@ -1064,7 +1069,10 @@ pub fn save_hidden_bundles_for(scope: ConnectorScope, ids: &[String]) -> Result<
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
     let tools = MarketplaceManager::new().available_tools();
-    let normalized: Vec<String> = ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
+    let normalized: Vec<String> = ids
+        .iter()
+        .map(|id| to_package_id_with(&tools, id))
+        .collect();
     let mut file = load_disabled_bundles_file_locked();
     file.hidden_scopes
         .insert(scope.as_str().to_string(), normalized);
@@ -1242,7 +1250,10 @@ pub fn enable_packages_in_scope(
 ) -> Result<EnablePackagesOutcome, String> {
     // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
     let tools = MarketplaceManager::new().available_tools();
-    let mut ids: Vec<String> = raw_ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
+    let mut ids: Vec<String> = raw_ids
+        .iter()
+        .map(|id| to_package_id_with(&tools, id))
+        .collect();
     // Sort-then-dedup (round-20 minor 1): bare `dedup` removes consecutive
     // duplicates only, so e.g. ["a","b","a"] leaked a duplicate into the
     // blocked/not_applied reporting; sorting also makes the reported order
@@ -1383,7 +1394,10 @@ fn apply_restore_consent_gate_impl(
 ) -> Result<(), String> {
     // Round-23 MINOR 3 hoist: one manifest walk for the whole list.
     let tools = MarketplaceManager::new().available_tools();
-    let ids: Vec<String> = raw_ids.iter().map(|id| to_package_id_with(&tools, id)).collect();
+    let ids: Vec<String> = raw_ids
+        .iter()
+        .map(|id| to_package_id_with(&tools, id))
+        .collect();
     if ids.is_empty() {
         return Ok(());
     }
