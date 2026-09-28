@@ -44,7 +44,7 @@ fi
 if git -C "$CODEWHALE" merge-base --is-ancestor "$R1_CLOSURE" HEAD 2>/dev/null; then
   green "  ✓ 过渡期领先成立：r1 收口是当前 head 的祖先（gitlink 沿维护分支领先 tag）"
 else
-  red "  ✗ r1 收口 $R1_CLOSURE 不是当前 head 的祖先，过渡期领先关系断裂"
+  red "  ✗ r1 收口 $R1_CLOSURE 不是当前 head 的祖先，线性前进关系断裂"
   fail=1
 fi
 
@@ -56,7 +56,7 @@ else
   fail=1
 fi
 
-bold "── 第 1 层：八主题与父仓适配指纹 ──"
+bold "── 第 1 层：登记主题与父仓适配指纹 ──"
 # 格式：主题|说明|文件（相对父仓根）|grep -F 固定串
 fingerprints=(
   "T2|Unix shell guidance preservation test|CodeWhale/crates/tui/src/tools/shell/guidance.rs|fn shell_guidance_preserves_unix_shell_contracts"
@@ -228,6 +228,10 @@ fingerprints=(
   "T7|Pre-provenance carrier restore regression|CodeWhale/crates/tui/src/compaction.rs|fn restore_replaces_a_pre_provenance_carrier"
   "T7|Checkpoint edit-target exclusion regression|CodeWhale/crates/tui/src/runtime_handoff.rs|fn compaction_checkpoint_is_never_the_edit_target"
 
+  "T8|roster 宿主 profiles 列表上限      |CodeWhale/crates/tui/src/tools/subagent/mod.rs|const ROSTER_HOST_PROFILE_LIMIT: usize = 48"
+  "T8|roster 载荷携带 host_profiles 键  |CodeWhale/crates/tui/src/tools/subagent/mod.rs|\"host_profiles_truncated\": host_profiles_truncated,"
+  "T8|roster profile_query 关键词发现通道 |CodeWhale/crates/tui/src/tools/subagent/mod.rs|fn roster_profile_query(input: &Value) -> Option<String>"
+
   "APP|spawn 前安装 Engine session id   |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|cfg.session_id = Some(session_id.to_string());"
   "APP|产品白名单复用原生 allowed_tools |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|allowed_tools: Some(crate::features::assistant::tool_policy::allowed_tool_names())"
   "APP|会话工具开关走动态禁用整形        |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|pub fn shape_disallowed_tools("
@@ -313,7 +317,7 @@ bold "── 第 3 层：pinvou3-app forkguard 回归 ──"
 
 echo
 if [[ $fail -eq 0 ]]; then
-  green "✅ fork-guard 全过：CodeWhale v0.9.12 r1 的 7 个 Pinvou 主题完好。"
+  green "✅ fork-guard 全过：CodeWhale v0.9.12 r1 的登记主题完好。"
 else
   red "❌ fork-guard 失败：请对照 docs/fork-modifications.md 排查。"
 fi
