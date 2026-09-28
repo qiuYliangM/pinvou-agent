@@ -1986,6 +1986,19 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         }
         bridge.sessions.setDraftWorkspace(path);
       }
+      // Grant-notice mode for the chat lane's workspace surfaces (review #484
+      // round-11 M6): the notice must describe the posture the draft takes
+      // ONCE the pick binds it — the bridge resolves a bound draft to the
+      // code lane's default (fallback plan), matching the composer chip that
+      // flips to exactly that mode when the pick lands. The snapshot still
+      // shows the unbound draft's mode at notice time. Older hosts without
+      // the query keep the previous snapshot read.
+      function boundDraftNoticeMode() {
+        if (bridge.sessions && typeof bridge.sessions.boundDraftMode === 'function') {
+          return bridge.sessions.boundDraftMode();
+        }
+        return (bs && bs.modeState && bs.modeState.mode) || null;
+      }
       async function handleModeChipSwitch(target, { isPlan }) {
         if (!bridge.available || !bridge.interaction) return;
         if (target === 'plan' && !isPlan) {
@@ -2971,7 +2984,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                         // promise — the selector refreshes recents from the
                         // resolved path (review #484 round-6).
                         if (onOpenWorkspacePicker) {
-                          onOpenWorkspacePicker({ lane: 'chat', mode: (bs && bs.modeState && bs.modeState.mode) || null });
+                          onOpenWorkspacePicker({ lane: 'chat', mode: boundDraftNoticeMode() });
                           return Promise.resolve(null);
                         }
                         return bridge.sessions.pickDraftWorkspace();
@@ -2980,7 +2993,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                       // Grant notice parity (§9.4): the recents channel grants
                       // the picked folder directly (single root), the same
                       // notice weight as the in-app picker rows.
-                      grantNotice={workspaceNoticeTone((bs && bs.modeState && bs.modeState.mode) || null) === 'restricted'
+                      grantNotice={workspaceNoticeTone(boundDraftNoticeMode()) === 'restricted'
                         ? t.uiWorkspacePicker.noticeRestricted(1)
                         : t.uiWorkspacePicker.noticeVisibility(1)}
                     />
@@ -3008,7 +3021,11 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                         // live engine kept the previous (possibly wider) root
                         // set — over-grant must not be silent (review #484
                         // round-9 N2).
-                        if (outcome && outcome.applied) onNotify && onNotify(outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone);
+                        // Round-10 M2: surface a stale sidecar copy like the
+                        // deferred live push (over-grant window, not success).
+                        if (outcome && outcome.applied) onNotify && onNotify(outcome.sidecar_stale
+                          ? t.uiKeychain.alignSidecarStale
+                          : (outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone));
                         else if (outcome && outcome.reason === 'no_change') onNotify && onNotify(t.uiKeychain.alignNoChange);
                         else if (outcome && outcome.reason === 'write_skipped') onNotify && onNotify(t.uiKeychain.alignWriteSkipped);
                         else if (outcome && outcome.reason === 'no_project') onNotify && onNotify(t.uiKeychain.alignNoProject);

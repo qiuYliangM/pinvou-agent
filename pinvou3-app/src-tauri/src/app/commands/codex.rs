@@ -839,6 +839,15 @@ pub(crate) async fn create_codex_acp_session_with_workspace_binding(
                 .to_string(),
         );
     }
+    // Same rebind fence as every sibling root-accepting writer (review #484
+    // round-11 M3): both lanes commit binding writes here (the native
+    // bind_code_native_session / the ACP set_acp_workspace) plus the
+    // project-choice writes, which must not land between the rebind's
+    // candidate snapshot and its translation or the fresh binding keeps the
+    // dead `from` spelling. Held through the binding window (including the
+    // baseline capture on the ACP lane) and released when the command
+    // returns after record_project_choice.
+    let _fence = projects.rebind_fence()?;
     verify_workspace_binding(project_workspace.as_deref(), workspace_verifier)?;
     if !backend.is_acp() {
         let metadata = create_code_native_session(
@@ -1026,6 +1035,29 @@ async fn create_code_native_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::tests::ENV_LOCK;
+
+    /// Same shape as projects.rs's isolated_home_session_store (review #484
+    /// round-10 fresh-eyes M1): hold the process-wide env lock and point
+    /// PINVOU3_HOME at a dedicated directory, so `SessionStore::boot_*` never
+    /// reads (or reconciles) the developer's real `~/.pinvou3` — a real
+    /// scheduled profile made this fixture fail deterministically single-run
+    /// and silently touch user data. The home is deliberately not deleted
+    /// (records must outlive the guard, matching the sibling helper).
+    fn isolated_home_session_store() -> (SessionStore, std::sync::MutexGuard<'static, ()>) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "pinvou3-codex-keychain-home-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+        let store = SessionStore::boot_with_scheduled_root(home.join("scheduled")).expect("boot");
+        (store, guard)
+    }
 
     #[test]
     fn workspace_binding_is_fail_closed_and_repeatable() {
@@ -1172,8 +1204,11 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&tmp).expect("create test root");
-        let store = SessionStore::boot_with_scheduled_root(tmp.join("scheduled"))
-            .expect("boot session store");
+        // Hermetic boot (review #484 round-10 fresh-eyes M1): boot resolves
+        // the scheduled-profiles path from PINVOU3_HOME, so without the
+        // isolation the fixture walked the developer's real profiles and
+        // failed on the first foreign workspace.
+        let (store, _env_guard) = isolated_home_session_store();
         let agents = SessionAgentStore::for_test(tmp.join("session-agents.json"));
         let primary = tmp.join("primary");
         let extra = tmp.join("extra");
@@ -1249,6 +1284,27 @@ mod tests {
             .bind_session_workspace_with_roots(&plain, primary.clone(), keychain.clone())
             .expect("bind plain session via sidecar");
         assert_keychain(&plain);
+
+        // 优先级(评审 #484 round-10 fresh-eyes M1 sub-finding):同一会话两条
+        // store 都有**不同**的非空快照时,投影必须取 codex-acp 权威记录——
+        // 只断言"回落可读"锁不住读取顺序(两个 store 各自可读时,互换优先级
+        // 该测试仍然全绿)。
+        let second_extra = tmp.join("second-extra");
+        std::fs::create_dir_all(&second_extra).expect("create second extra");
+        let plain_keychain = vec![primary.clone(), second_extra.clone()];
+        store
+            .bind_session_workspace_with_roots(&acp, primary.clone(), plain_keychain.clone())
+            .expect("bind the acp session's plain sidecar with different roots");
+        let projected = project_keychain_roots(&agents, &store, &acp);
+        assert_eq!(
+            projected,
+            keychain,
+            "the agents record wins over the plain sidecar when both carry non-empty sets"
+        );
+        assert!(
+            !projected.iter().any(|root| root.ends_with("second-extra")),
+            "{projected:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -90,10 +90,18 @@ function rootPath(root) {
 // localeCompare where the store sorts byte-wise (`Ord` on `(&i64, &String)`);
 // the orders coincide for the generated id alphabet (`prj-` + fixed-width
 // base-36) — the sort here is display-order insurance, not a separate rule.
-function matchProjectByPath(projects, workspacePath) {
-  const ordered = [...projects].sort(
+// The (position, id) display order, materialized once per pass. Hot-path
+// callers (the workspace picker resolves every session at every turn
+// boundary) must pass the pre-ordered list instead of re-sorting per
+// resolution — review #484 round-11 M5.
+function orderedProjectsByPosition(projects) {
+  return [...projects].sort(
     (a, b) => (a.position || 0) - (b.position || 0) || String(a.id).localeCompare(String(b.id)),
   );
+}
+
+function matchProjectByPath(projects, workspacePath, orderedProjects) {
+  const ordered = Array.isArray(orderedProjects) ? orderedProjects : orderedProjectsByPosition(projects);
   return (
     ordered.find((project) =>
       (project && project.roots ? project.roots : []).some((root) => isUnderRoot(workspacePath, rootPath(root))),
@@ -105,7 +113,7 @@ function matchProjectByPath(projects, workspacePath) {
 // (current-project marker in the move picker, "remove from project" entry).
 // Mirrors the grouping tiers: explicit assignment first, then auto-grouping;
 // returns null for ungrouped sessions.
-function resolveSessionProjectId(item, projects, assignments) {
+function resolveSessionProjectId(item, projects, assignments, orderedProjects) {
   const projectList = Array.isArray(projects) ? projects.filter(Boolean) : [];
   const assignmentMap = assignments && typeof assignments === 'object' ? assignments : {};
   if (!item) return null;
@@ -115,7 +123,7 @@ function resolveSessionProjectId(item, projects, assignments) {
     if (assigned === null) return null;
   }
   if (!hasProjectWorkspace(item)) return null;
-  const matched = matchProjectByPath(projectList, item.workspacePath);
+  const matched = matchProjectByPath(projectList, item.workspacePath, orderedProjects);
   return matched ? matched.id : null;
 }
 
@@ -254,4 +262,4 @@ function capUnavailableRootsForDisplay(roots, expanded) {
   return { visibleRoots: list.slice(0, 1), hiddenCount: Math.max(0, list.length - 1) };
 }
 
-export { TEMPORARY_GROUP_KEY, PROJECT_SESSION_DRAG_TYPE, groupSessionsWithProjects, projectCoversPath, resolveSessionProjectId, rootPath, needsAddFolderConfirm, hasProjectWorkspace, capUnavailableRootsForDisplay, isUnderRoot };
+export { TEMPORARY_GROUP_KEY, PROJECT_SESSION_DRAG_TYPE, groupSessionsWithProjects, projectCoversPath, resolveSessionProjectId, orderedProjectsByPosition, rootPath, needsAddFolderConfirm, hasProjectWorkspace, capUnavailableRootsForDisplay, isUnderRoot };

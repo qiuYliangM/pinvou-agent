@@ -254,27 +254,31 @@ pub(crate) fn replace_project_roots_and_expel(
     let removed = previous_roots
         .map(|previous| removed_roots(&previous, &normalized))
         .unwrap_or_default();
-    let mut expel_session_ids = Vec::new();
+    let mut expel_candidates: Vec<(String, PathBuf)> = Vec::new();
     for root in &removed {
         // 与 delete_project 同一套枚举:两个绑定 store 里位于被移除根下的会话;
         // store 侧按 tier-① 语义跳过已有归属条目的 id。扫描失败必须上报,不能
         // 静默漏掉移出(那正是「根移除了、成员却复活」的成因)。窄化编辑例外:
-        // 仍在新根领地内的会话不驱逐(workspace_covered_by_roots)。
+        // 仍在新根领地内的会话不驱逐(workspace_covered_by_roots)。cwd 随 id
+        // 一起下发:store 在同一事务内按编辑后的 tier-② 解析决定是否落显式
+        // 移出——仍解析得进任何项目(含他项目仍在引用的共享根)的会话不写
+        // tombstone,全局移出只会无声拆散本次编辑未触碰的项目
+        // (评审 #484 round-11 M4)。
         for (session_id, path) in agents.sessions_under_workspace(root) {
             if !workspace_covered_by_roots(&path, &normalized) {
-                expel_session_ids.push(session_id);
+                expel_candidates.push((session_id, path));
             }
         }
         for (session_id, path) in sessions.workspace_bindings_under(root) {
             if !workspace_covered_by_roots(&path, &normalized) {
-                expel_session_ids.push(session_id);
+                expel_candidates.push((session_id, path));
             }
         }
     }
-    expel_session_ids.sort();
-    expel_session_ids.dedup();
+    expel_candidates.sort();
+    expel_candidates.dedup();
     store
-        .update_project_and_expel(project_id, name, normalized, &expel_session_ids)
+        .update_project_and_expel(project_id, name, normalized, &expel_candidates)
         .map_err(|e| format!("update_project({project_id}): {e:#}"))
 }
 
@@ -458,18 +462,30 @@ pub struct AlignOutcome {
     pub applied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// 双 store 已写入但存活引擎推送(SyncSession 或其前置的会话加载)失败:
-    /// 引擎本 incarnation 保持旧根集——对齐缩窄钥匙串时是更宽集合,属于
-    /// over-grant 方向,必须透出而非静默(评审 #484 round-9 N2)。下一次
+    /// 双 store 已写入但存活引擎推送(SyncSession 或其前置的会话加载)失败,
+    /// 或推送前复查发现回合已在围栏窗外开启(见命令 doc):引擎本 incarnation
+    /// 保持旧根集——对齐缩窄钥匙串时是更宽集合,属于 over-grant 方向,必须
+    /// 透出而非静默(评审 #484 round-9 N2 / round-11 M1)。下一次
     /// spawn/resume 会从绑定 store 回填同一份快照收敛。
     #[serde(default, skip_serializing_if = "align_push_not_failed")]
     pub live_push_failed: bool,
+    /// 双 store 已写入,但原生代码 sidecar 重写失败(评审 #484 round-10 M2):
+    /// 索引是对齐后的窄钥匙串,sidecar 滞留对齐前的宽根集——索引丢失时
+    /// `restore_missing_code_session_record` 会从 sidecar 复活更宽的集合,
+    /// over-grant 方向必须透出。下一次 align/rebind 成功重写即收敛。
+    #[serde(default, skip_serializing_if = "align_sidecar_not_stale")]
+    pub sidecar_stale: bool,
 }
 
 /// `skip_serializing_if` 需要 `&bool` 谓词(`std::ops::Not::not` 按值取参,
 /// 签名不匹配)。
 fn align_push_not_failed(live_push_failed: &bool) -> bool {
     !*live_push_failed
+}
+
+/// `skip_serializing_if` 需要 `&bool` 谓词(同 `align_push_not_failed`)。
+fn align_sidecar_not_stale(sidecar_stale: &bool) -> bool {
+    !*sidecar_stale
 }
 
 /// 对齐到项目(§6/§9.7 显式动作):把会话的钥匙串快照替换为它所属项目
@@ -479,11 +495,14 @@ fn align_push_not_failed(live_push_failed: &bool) -> bool {
 ///
 /// 双 store 写入(agent 记录 / 纯绑定 sidecar,与 rebind 同一套双写);
 /// 存活引擎经 `Op::SyncSession` 推送,下个回合生效。围栏:活动回合(ACP
-/// prompt / 原生回合 / 定时轮)以类型化 ALIGN_BUSY 拒绝;rebind 进行中则由
-/// rebind 门拒绝(读 project.roots 与写入必须在同一条 rebind 线之内,否则
-/// 会把未翻译的 from 拼写根写回刚翻译过的会话钥匙串);无绑定工作区的
-/// 临时/定时会话得到 ALIGN_NO_WORKSPACE。幂等:钥匙串与当前完全一致时返回
-/// applied=false、reason=no_change。
+/// prompt / 原生回合 / 定时轮)以类型化 ALIGN_BUSY 拒绝;该忙探测只覆盖
+/// 探测时刻——推送腿在 `handle_for` await 之后会再复查一次,窗外开启的
+/// 回合把推送降级为 `live_push_failed`(转录快照不得进 busy 引擎,评审
+/// #484 round-11 M1);rebind 进行中则由 rebind 门拒绝(读 project.roots
+/// 与写入必须在同一条 rebind 线之内,否则会把未翻译的 from 拼写根写回
+/// 刚翻译过的会话钥匙串);无绑定工作区的临时/定时会话得到
+/// ALIGN_NO_WORKSPACE。幂等:钥匙串与当前完全一致时返回 applied=false、
+/// reason=no_change。
 #[tauri::command]
 pub async fn align_session_to_project(
     session_id: String,
@@ -527,29 +546,45 @@ pub async fn align_session_to_project(
     // 透出(live_push_failed):缩窄对齐时存活引擎保留的是更宽的旧根集,
     // over-grant 方向不得静默(评审 #484 round-9 N2)。
     if let Some(engine) = engines.handle_for(&session_id).await {
-        match sessions.load(&session_id) {
-            Ok(saved) => {
-                if let Err(error) = engine
-                    .sync_session(session_id.clone(), saved.messages)
-                    .await
-                {
+        // Re-check once after handle_for's await (sibling pattern,
+        // engine_pool stop backstop): a turn whose reserve gate opened after
+        // the pre-align probe but whose SendMessage entered the engine
+        // mailbox before this SyncSession would complete and persist, then
+        // be wholesale-replaced by the stale pre-turn snapshot below —
+        // silent transcript loss is strictly worse than the over-grant the
+        // live_push_failed outcome exists to surface (review #484
+        // round-10/11 M1). Degraded to live_push_failed: the disk alignment
+        // stands and the next spawn/resume converges.
+        let busy_now = acp_pool.is_turn_active(&session_id).await
+            || engines.is_turn_active(&session_id)
+            || engines.is_scheduled_turn_running(&session_id);
+        if busy_now {
+            outcome.live_push_failed = true;
+        } else {
+            match sessions.load(&session_id) {
+                Ok(saved) => {
+                    if let Err(error) = engine
+                        .sync_session(session_id.clone(), saved.messages)
+                        .await
+                    {
+                        eprintln!(
+                            "[projects] align_session_to_project: push roots to live engine failed: {error:#}"
+                        );
+                        outcome.live_push_failed = true;
+                    }
+                }
+                Err(error) => {
+                    // CodeQL cleartext-logging (review #463 round 7, same
+                    // convention as the rebind lane below): the error context
+                    // embeds the session id (sessions/<id>.json paths), so only
+                    // the root cause — which never carries paths or ids — is
+                    // logged.
                     eprintln!(
-                        "[projects] align_session_to_project: push roots to live engine failed: {error:#}"
+                        "[projects] align_session_to_project: load session for live push failed: {}",
+                        error.root_cause()
                     );
                     outcome.live_push_failed = true;
                 }
-            }
-            Err(error) => {
-                // CodeQL cleartext-logging (review #463 round 7, same
-                // convention as the rebind lane below): the error context
-                // embeds the session id (sessions/<id>.json paths), so only
-                // the root cause — which never carries paths or ids — is
-                // logged.
-                eprintln!(
-                    "[projects] align_session_to_project: load session for live push failed: {}",
-                    error.root_cause()
-                );
-                outcome.live_push_failed = true;
             }
         }
     }
@@ -571,11 +606,13 @@ pub(crate) struct AlignStores<'a> {
 /// align 命令的「判定并落盘」内核:命令壳负责活动回合探测(`busy`)、存活引擎
 /// 推送与事件发射;这里只读 store、写两个绑定 store,并如实汇报 `applied`。
 ///
-/// 与 rebind 的差别(评审 #484:align 无写入后 busy 复核):rebind 的复核针对
-/// 「围栏到多文件迁移之间开启的回合会按旧目录执行」这个窗口;align 的写入是单
+/// 与 rebind 的差别(busy 复核的覆盖面):rebind 的复核针对「围栏到多文件
+/// 迁移之间开启的回合会按旧目录执行」这个窗口;align 的**store 写入腿**是单
 /// 条记录/sidecar 的原子重写,且从不移动会话自身 cwd(钥匙串只换附加根,
-/// §9.2 不换门)——围栏窗口内开始的回合仍在同一 cwd 上执行,新根集下个回合经
-/// SyncSession 生效,重试没有价值,故无写入后复核。
+/// §9.2 不换门)——围栏窗口内开始的回合仍在同一 cwd 上执行,新根集下个回合
+/// 经 SyncSession 生效,重试没有价值,故写入后不复核;但**引擎推送腿**不同:
+/// 转录快照进 busy 引擎会整体覆盖并发完成的回合,命令壳在 `handle_for`
+/// await 后复查一次,变忙即降级 `live_push_failed`(评审 #484 round-11 M1)。
 pub(crate) fn align_session_keychain(
     session_id: &str,
     stores: AlignStores<'_>,
@@ -636,6 +673,7 @@ pub(crate) fn align_session_keychain(
             applied: false,
             reason: Some("no_project".to_string()),
             live_push_failed: false,
+            sidecar_stale: false,
         });
     };
     let next = ProjectStore::keychain_for_workspace(&cwd, &project.roots);
@@ -647,6 +685,7 @@ pub(crate) fn align_session_keychain(
             applied: false,
             reason: Some("no_change".to_string()),
             live_push_failed: false,
+            sidecar_stale: false,
         });
     }
 
@@ -657,18 +696,23 @@ pub(crate) fn align_session_keychain(
     }
 
     // 双 store 写入:agent 记录(原生代码会话同时重写 sidecar)/ 纯 sidecar。
-    // Ok(false) = store 什么都没写(agent 记录消失 / sidecar 不可读):不得声称
-    // applied,命令层据此跳过存活引擎推送与事件(评审 #484 B3)。
-    let written = if agent_bound {
-        stores
+    // applied=false = store 什么都没写(agent 记录消失 / sidecar 不可读):不得
+    // 声称 applied,命令层据此跳过存活引擎推送与事件(评审 #484 B3)。agent
+    // 车道的 sidecar 重写失败不再被吞掉(评审 #484 round-10 M2):索引已提交
+    // 而 sidecar 滞留旧根集,索引丢失恢复会以 over-grant 方向复活——随
+    // outcome.sidecar_stale 透出。
+    let (written, sidecar_stale) = if agent_bound {
+        let write = stores
             .agents
             .set_session_workspace_roots(session_id, next.clone())
-            .map_err(|e| format!("align_session_to_project: {e:#}"))?
+            .map_err(|e| format!("align_session_to_project: {e:#}"))?;
+        (write.applied, write.sidecar_committed == Some(false))
     } else {
-        stores
+        let written = stores
             .sessions
             .set_session_workspace_roots(session_id, next.clone())
-            .map_err(|e| format!("align_session_to_project: {e:#}"))?
+            .map_err(|e| format!("align_session_to_project: {e:#}"))?;
+        (written, false)
     };
     if !written {
         return Ok(AlignOutcome {
@@ -677,6 +721,7 @@ pub(crate) fn align_session_keychain(
             applied: false,
             reason: Some("write_skipped".to_string()),
             live_push_failed: false,
+            sidecar_stale: false,
         });
     }
     Ok(AlignOutcome {
@@ -685,6 +730,7 @@ pub(crate) fn align_session_keychain(
         applied: true,
         reason: None,
         live_push_failed: false,
+        sidecar_stale,
     })
 }
 
@@ -1722,6 +1768,7 @@ mod tests {
             applied: true,
             reason: None,
             live_push_failed: false,
+            sidecar_stale: false,
         })
         .expect("serialize");
         let object = applied.as_object().expect("object");
@@ -1736,21 +1783,37 @@ mod tests {
             !object.contains_key("live_push_failed"),
             "live_push_failed only appears when the push actually failed"
         );
+        assert!(
+            !object.contains_key("sidecar_stale"),
+            "sidecar_stale only appears when the sidecar rewrite actually failed"
+        );
         let push_failed = serde_json::to_value(AlignOutcome {
             session_id: "s1".to_string(),
             roots: vec![PathBuf::from("/a")],
             applied: true,
             reason: None,
             live_push_failed: true,
+            sidecar_stale: false,
         })
         .expect("serialize");
         assert_eq!(push_failed["live_push_failed"], true);
+        let stale_sidecar = serde_json::to_value(AlignOutcome {
+            session_id: "s1".to_string(),
+            roots: vec![PathBuf::from("/a")],
+            applied: true,
+            reason: None,
+            live_push_failed: false,
+            sidecar_stale: true,
+        })
+        .expect("serialize");
+        assert_eq!(stale_sidecar["sidecar_stale"], true);
         let skipped = serde_json::to_value(AlignOutcome {
             session_id: "s1".to_string(),
             roots: Vec::new(),
             applied: false,
             reason: Some("no_change".to_string()),
             live_push_failed: false,
+            sidecar_stale: false,
         })
         .expect("serialize");
         assert_eq!(skipped["reason"], "no_change");

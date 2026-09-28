@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 const STORE_VERSION: u32 = 5;
 const CONFIG_DEFAULTS_VERSION: u32 = 1;
@@ -261,6 +262,26 @@ fn code_session_sidecar_path(store_path: &Path, session_id: &str) -> PathBuf {
     code_session_sidecar_root(store_path)
         .join(session_id)
         .join("code-session.json")
+}
+
+/// `set_session_workspace_roots` 的写入回执（评审 #484 round-10 M2）：
+/// `applied` = agent 记录已提交；`sidecar_committed` = 原生代码 sidecar 重写
+/// 回执——`None` = 非 code 会话无需 sidecar，`Some(false)` = 索引已提交但
+/// sidecar 重写失败（陈旧 sidecar 保留对齐前更宽的根集，索引丢失恢复时会
+/// 以 over-grant 方向复活），必须随 align outcome 透出而非静默。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceRootsWrite {
+    pub applied: bool,
+    pub sidecar_committed: Option<bool>,
+}
+
+impl WorkspaceRootsWrite {
+    fn skipped() -> Self {
+        Self {
+            applied: false,
+            sidecar_committed: None,
+        }
+    }
 }
 
 /// 原子写入原生代码会话 sidecar；写入失败逐条记日志并返回 false，不阻断会话
@@ -622,7 +643,7 @@ impl SessionAgentStore {
         &self,
         session_id: &str,
         workspace_roots: Vec<PathBuf>,
-    ) -> Result<bool> {
+    ) -> Result<WorkspaceRootsWrite> {
         // Snapshot the current keychain so a persist failure can roll memory
         // back to the on-disk state — the same convention as
         // rebind_workspace_prefix: without the rollback the process believes
@@ -631,12 +652,12 @@ impl SessionAgentStore {
         let original_roots = {
             let mut records = self.records.write();
             let Some(record) = records.get_mut(session_id) else {
-                return Ok(false);
+                return Ok(WorkspaceRootsWrite::skipped());
             };
             if record.workspace_kind != CodexWorkspaceKind::Project
                 || record.workspace_path.is_none()
             {
-                return Ok(false);
+                return Ok(WorkspaceRootsWrite::skipped());
             }
             let original_roots = record.workspace_roots.clone();
             record.workspace_roots = workspace_roots.clone();
@@ -649,16 +670,57 @@ impl SessionAgentStore {
             return Err(error);
         }
         let record = self.get(session_id);
-        if record.mode.is_code() {
-            write_code_session_sidecar(
+        let state_workspace_path = if record.workspace_kind == CodexWorkspaceKind::Project {
+            record.workspace_path.clone()
+        } else {
+            None
+        };
+        let sidecar_committed = if record.mode.is_code() {
+            Some(write_code_session_sidecar(
                 &self.path,
                 session_id,
                 record.workspace_kind,
                 record.workspace_path,
-                workspace_roots,
-            );
+                workspace_roots.clone(),
+            ))
+        } else {
+            None
+        };
+        // The per-session acp-state.json is the only durable ACP artifact that
+        // survives a session-agents.json loss (review #484 round-11 M8): keep
+        // its roots snapshot convergent with the index, or a later index loss
+        // lets the recovery path resurrect the pre-align (wider) root set.
+        // Failure here cannot roll the index back (it is already committed) —
+        // it is reported through `sidecar_committed`-class honesty by the
+        // caller's stale-sidecar surfacing, and the next respawn rewrites the
+        // whole state file anyway.
+        if record.workspace_kind == CodexWorkspaceKind::Project {
+            if let Some(workspace_path) = &state_workspace_path {
+                // 同步而不创建:acp-state.json 的创建归 spawn 路径所有;没有
+                // 该文件的会话(原生车道、测试直构 store)跳过,恢复路径本就
+                // 读不到。
+                if let Ok(state_path) = super::events::state_path(session_id) {
+                    if state_path.exists() {
+                        let patch = json!({
+                            "workspace": {
+                                "kind": record.workspace_kind,
+                                "path": workspace_path,
+                                "roots": workspace_roots,
+                            }
+                        });
+                        if let Err(error) = super::events::patch_acp_state(session_id, patch) {
+                            eprintln!(
+                                "[pinvou3-app] 同步 acp-state.json 钥匙串快照失败: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
         }
-        Ok(true)
+        Ok(WorkspaceRootsWrite {
+            applied: true,
+            sidecar_committed,
+        })
     }
 
     /// 创建会话时锁定的钥匙串快照(§6):全量可访问根(含主根);旧记录 / 临时
@@ -2323,6 +2385,20 @@ mod tests {
         // roots that were never persisted and a retry diff against memory
         // would misjudge the state. Mirrors
         // rebind_prefix_rolls_back_memory_when_index_persist_fails.
+        // Hermetic guard (review #484 round-10 M1 convention): the align write
+        // now also converges a pre-existing acp-state.json under
+        // sessions_root(), which honors PINVOU3_HOME — hold ENV_LOCK and
+        // redirect it so this test can never touch a real store.
+        let _env_guard = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_home = std::env::var("PINVOU3_HOME").ok();
+        let hermetic_home = std::env::temp_dir().join(format!(
+            "pinvou3-codex-align-rollback-home-{}",
+            std::process::id()
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &hermetic_home) };
         let root = std::env::temp_dir().join(format!(
             "pinvou3-codex-align-rollback-test-{}",
             std::process::id()
@@ -2361,33 +2437,44 @@ mod tests {
 
         // After clearing the obstacle a retry persists the same replacement.
         fs::remove_dir_all(store.path.with_extension("json.tmp")).unwrap();
-        assert!(
-            store
-                .set_session_workspace_roots("s1", vec![workspace.clone(), extra.clone()])
-                .expect("retry persists")
+        let retried = store
+            .set_session_workspace_roots("s1", vec![workspace.clone(), extra.clone()])
+            .expect("retry persists");
+        assert!(retried.applied);
+        assert_eq!(
+            retried.sidecar_committed,
+            Some(true),
+            "a healthy code-session rewrite reports the sidecar as committed"
         );
         assert_eq!(
             store.session_workspace_roots("s1"),
             vec![workspace.clone(), extra.clone()]
         );
 
-        // Ok(false) lanes: unknown session and a temporary (unbound) record
+        // skipped lanes: unknown session and a temporary (unbound) record
         // write nothing and never touch the disk.
-        assert!(
-            !store
-                .set_session_workspace_roots("ghost", vec![workspace.clone()])
-                .expect("unknown session")
-        );
+        let ghost = store
+            .set_session_workspace_roots("ghost", vec![workspace.clone()])
+            .expect("unknown session");
+        assert!(!ghost.applied);
+        assert_eq!(ghost.sidecar_committed, None);
         store
             .bind_code_native_session("temp", CodexWorkspaceKind::Temporary, None, Vec::new())
             .unwrap();
-        assert!(
-            !store
-                .set_session_workspace_roots("temp", vec![workspace])
-                .expect("temporary session has no keychain")
-        );
+        let temporary = store
+            .set_session_workspace_roots("temp", vec![workspace])
+            .expect("temporary session has no keychain");
+        assert!(!temporary.applied);
 
         fs::remove_dir_all(&root).unwrap();
+        // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+        // environment.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                None => std::env::remove_var("PINVOU3_HOME"),
+            }
+        }
     }
 
     #[test]

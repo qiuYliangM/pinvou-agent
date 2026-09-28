@@ -1158,6 +1158,17 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
     return { mode: d || (boundDraft ? "plan" : "yolo"), multiAgent: false };
   }
 
+  // The mode a chat draft WILL run once a workspace pick binds it (review
+  // #484 round-11 M6): grant-notice surfaces must describe the post-binding
+  // posture — bound drafts align with the code lane's safety posture
+  // (currentDraftModeState's bound arm), so the composer chip and the
+  // pre-grant notice must agree instead of the notice reading the unbound
+  // snapshot while the chip flips to plan.
+  function boundDraftMode() {
+    const d = state.modeDefaults && state.modeDefaults.code;
+    return d || "plan";
+  }
+
   // 事件监听器统一入口:按 payload.session_id 路由同步逻辑;后台变更后补一次 notify 刷新列表。
 function markRemoteTurn(sid, buf, preserveCommittedRevision, cause) { return pinvouSharedtauriMain().markRemoteTurn(sid, buf, preserveCommittedRevision, cause); }
 function onSessionEvent(e, fn) { return pinvouSharedtauriMain().onSessionEvent(e, fn); }
@@ -2456,6 +2467,9 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       // such channel, the UI guards on method existence).
       setDraftWorkspace,
       pickDraftWorkspace,
+      // Pre-grant notice mode for the chat lane's workspace surfaces (the
+      // posture the draft takes once the pick binds; review #484 round-11 M6).
+      boundDraftMode,
       // Working directory binding query for materialized sessions (bound
       // sessions share the code mode's safety posture; web/remote sessions have
       // no binding concept, stub returns null).

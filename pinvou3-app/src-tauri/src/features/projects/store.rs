@@ -335,6 +335,25 @@ fn identity_key_of_display(path: &Path) -> String {
     crate::platform::os::filesystem_path_identity_key(&path.to_string_lossy())
 }
 
+/// tier-② 归属解析的纯形态(不加锁):workspace 折叠键对每个项目的 roots 做
+/// same-or-nested 前缀匹配,projects 恒按 (position, id) 排序,`find` 即
+/// position 最小者。`resolve_session_project` 与 `update_project_and_expel`
+/// 的驱逐过滤共用,保证「读到的归属」与「移出判定」同一规则
+/// (评审 #484 round-11 M4)。
+fn tier2_project_of(state: &StoreState, workspace: &Path) -> Option<Project> {
+    let key = identity_key_of_display(&root_display(workspace));
+    state
+        .projects
+        .iter()
+        .find(|project| {
+            project
+                .roots
+                .iter()
+                .any(|root| key_is_same_or_nested(&key, &identity_key_of_display(root)))
+        })
+        .cloned()
+}
+
 /// Component-aware "same as, or nested under" on folded keys. The rule itself
 /// now lives in `platform::os::path_identity_is_same_or_nested` (review #463
 /// round-8 elegance: project-root validation, the codex rebind suffix matcher
@@ -740,10 +759,17 @@ impl ProjectStore {
     /// persists; if expulsion failed after the new roots landed, the command
     /// returned Err but a retry computed `removed_roots` as empty (roots were
     /// already replaced) and skipped expulsion forever — the next ensure would
-    /// silently re-adopt those members. `expel_session_ids` enumerates the
-    /// command layer's "sessions under removed roots"; entry-less ones are
-    /// written as explicit move-outs (None), ones with existing entries are
-    /// untouched (tier-① semantics, matching `delete_project`'s expel path).
+    /// silently re-adopt those members. `expel_candidates` enumerates the
+    /// command layer's "sessions under removed roots" with each session's cwd;
+    /// entry-less ones are written as explicit move-outs (None) ONLY when they
+    /// resolve to no project after the edit — one that still resolves against
+    /// the post-edit state (this project's remaining roots, or another project
+    /// still listing the shared root under the §9.9 overlap legalization) must
+    /// stay entry-less so tier-② keeps grouping it there; a global tombstone on
+    /// a shared root would silently ungroup a project this edit never touched
+    /// (review #484 round-11 M4). Ones with existing entries are untouched
+    /// (tier-① semantics, matching `delete_project`'s expel path — deletion
+    /// stays the user's explicit statement, §9.9).
     ///
     /// Persist FIRST, commit memory only on success (review #484 M3, same
     /// convention as `rebind_roots`): the previous order mutated the in-memory
@@ -756,7 +782,7 @@ impl ProjectStore {
         project_id: &str,
         name: Option<String>,
         roots: Vec<PathBuf>,
-        expel_session_ids: &[String],
+        expel_candidates: &[(String, PathBuf)],
     ) -> Result<Project> {
         let name = name.map(validate_name).transpose()?;
         let mut state = self.state.write();
@@ -783,8 +809,11 @@ impl ProjectStore {
             demote_stale_primary_root(project);
             project.updated_at = Utc::now();
         }
-        for session_id in expel_session_ids {
-            if !persisted.assignments.contains_key(session_id) {
+        for (session_id, cwd) in expel_candidates {
+            if persisted.assignments.contains_key(session_id) {
+                continue;
+            }
+            if tier2_project_of(&persisted, cwd).is_none() {
                 persisted.assignments.insert(session_id.clone(), None);
             }
         }
@@ -1356,17 +1385,7 @@ impl ProjectStore {
             Some(None) => return None,
             None => {}
         }
-        let key = identity_key_of_display(&root_display(workspace));
-        state
-            .projects
-            .iter()
-            .find(|project| {
-                project
-                    .roots
-                    .iter()
-                    .any(|root| key_is_same_or_nested(&key, &identity_key_of_display(root)))
-            })
-            .cloned()
+        tier2_project_of(&state, workspace)
     }
 
     /// 对齐用的钥匙串形态:主槽 = 会话自身 cwd(不换门,§9.2);附加根 = 项目

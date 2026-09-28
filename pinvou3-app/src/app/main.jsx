@@ -1856,7 +1856,7 @@ const NAV_PREFETCH = {
           roots,
         })) {
           setSettingsToast(workspaceGrantNotice(
-            activeLaneMode(),
+            currentView === 'codex' ? activeLaneMode() : chatLaneGrantMode(),
             roots.length,
             currentView === 'codex' && codexLaneDeliveryLimited,
           ));
@@ -1973,11 +1973,22 @@ const NAV_PREFETCH = {
       // recorded-only copy.
       const [codexLaneMode, setCodexLaneMode] = useState(null);
       const [codexLaneDeliveryLimited, setCodexLaneDeliveryLimited] = useState(false);
-      const workspacePickerRows = useMemo(() => computePickerRows({
-        projects: projectsListEntries || [],
-        items: boundWorkspaceItems,
-        assignments: projectsListAssignments || {},
-      }), [projectsListEntries, projectsListAssignments, boundWorkspaceItems]);
+      // Lazy hot view (review #484 round-11 M5): `boundWorkspaceItems`
+      // includes `codexSessions`, identity-replaced at every turn boundary,
+      // so an unconditional memo recomputed the rows twice per turn on the
+      // UI thread with the picker closed. Compute only while the picker is
+      // open; closed re-runs short-circuit to the shared empty array before
+      // any grouping work.
+      const EMPTY_PICKER_ROWS = [];
+      const workspacePickerRows = useMemo(() => (
+        workspacePicker
+          ? computePickerRows({
+            projects: projectsListEntries || [],
+            items: boundWorkspaceItems,
+            assignments: projectsListAssignments || {},
+          })
+          : EMPTY_PICKER_ROWS
+      ), [workspacePicker, projectsListEntries, projectsListAssignments, boundWorkspaceItems]);
       const closeWorkspacePicker = () => { setWorkspacePicker(null); setPickerExcluded(null); };
       // Returns whether the draft actually staged (the codex lane's request
       // object always lands); callers surface grant notices only on a real
@@ -2000,12 +2011,18 @@ const NAV_PREFETCH = {
           // subscribed snapshot: the public bridge object exposes no
           // activeSessionId getter, so bridge.activeSessionId is always
           // undefined and the guard below never fired (review #484 round-8 B1).
+          // Round-11 M7: the navigation is NOT gated on an active session —
+          // with no session active while the user is on monitor/outputs/
+          // settings, staging alone left the binding invisible in bridge
+          // state, silently binding a much later fresh draft to a workspace
+          // picked minutes earlier on another page. The chat page's own
+          // handleNewChat always navigates; this entry now does too.
           if (bs && bs.activeSessionId && bridge.sessions.createNewSession) {
             setCodeModeOn(false);
             await bridge.sessions.createNewSession();
-            setActiveChat(null);
-            setCurrentView('chat');
           }
+          setActiveChat(null);
+          setCurrentView('chat');
           applied = bridge.sessions.setDraftWorkspace(path || null, { projectId: projectId || null, workspaceRoots: roots || [] }) !== false;
         }
         closeWorkspacePicker();
@@ -2014,6 +2031,20 @@ const NAV_PREFETCH = {
       const activeLaneMode = () => (currentView === 'codex'
         ? codexLaneMode
         : ((bs && bs.modeState && bs.modeState.mode) || null));
+      // Chat-lane grant-notice mode (review #484 round-11 M6): the notice
+      // must describe the posture the draft takes ONCE the pick binds it —
+      // the bridge resolves a bound draft to the code lane's default
+      // (fallback plan), and the composer chip flips to exactly that mode
+      // when the pick lands. The render-scope snapshot still shows the
+      // unbound draft's mode at notice time, so reading it here showed YOLO
+      // "visibility" wording for a conversation that then ran plan (and the
+      // inverse overclaim under work-default=plan/code-default=yolo). The
+      // codex lane keeps the draft agent's own mode (correct since round-9).
+      const chatLaneGrantMode = () => (
+        bridge.sessions && typeof bridge.sessions.boundDraftMode === 'function'
+          ? bridge.sessions.boundDraftMode()
+          : ((bs && bs.modeState && bs.modeState.mode) || null)
+      );
       // Same-weight grant notice for every entry that grants folder access
       // without the picker's expansion panel (§9.4). Codex-lane channels for
       // a third-party ACP agent say "recorded" instead: the §6 stage-gate

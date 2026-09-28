@@ -1232,10 +1232,11 @@ fn resolve_session_project_multi_hit_follows_position_then_id() {
 
 #[test]
 fn update_project_and_expel_writes_tombstones_and_keeps_existing_entries() {
-    // §4 root-removal semantics: expel ids WITHOUT an assignment entry become
-    // explicit move-outs (None) in the same persist as the roots replacement;
-    // ids with existing entries (explicit Some / already moved out) stay
-    // untouched — tier-① wins over the expulsion enumeration.
+    // §4 root-removal semantics: expel candidates WITHOUT an assignment entry
+    // become explicit move-outs (None) in the same persist as the roots
+    // replacement when they resolve to no project after the edit; ids with
+    // existing entries (explicit Some / already moved out) stay untouched —
+    // tier-① wins over the expulsion enumeration.
     let temp = tempfile::tempdir().expect("tempdir");
     let store = store_in(&temp);
     let project = create(&store, "项目", &[abs("u-old"), abs("u-keep")]);
@@ -1244,15 +1245,16 @@ fn update_project_and_expel_writes_tombstones_and_keeps_existing_entries() {
         .move_session_to_project("s-keep", Some(&other.id), None)
         .expect("assign elsewhere");
 
+    let s_auto_cwd = abs("u-old").join("session");
     let updated = store
         .update_project_and_expel(
             &project.id,
             Some("改名".to_string()),
             vec![abs("u-keep")],
             &[
-                "s-auto".to_string(),
-                "s-keep".to_string(),
-                "s-auto".to_string(), // duplicates in the enumeration are harmless
+                ("s-auto".to_string(), s_auto_cwd.clone()),
+                ("s-keep".to_string(), s_auto_cwd.clone()),
+                ("s-auto".to_string(), s_auto_cwd), // duplicates in the enumeration are harmless
             ],
         )
         .expect("update and expel");
@@ -1261,13 +1263,48 @@ fn update_project_and_expel_writes_tombstones_and_keeps_existing_entries() {
     assert_eq!(
         store.assignment_of("s-auto"),
         Some(None),
-        "entry-less expel id becomes a tombstone"
+        "entry-less expel id that resolves nowhere becomes a tombstone"
     );
     assert_eq!(
         store.assignment_of("s-keep"),
         Some(Some(other.id.clone())),
         "an existing explicit assignment is not rewritten"
     );
+}
+
+/// review #484 round-11 M4: under the §9.9 overlap legalization two projects
+/// may reference the same folder. Removing that folder from the edited
+/// project expels only the edited project's membership — an entry-less
+/// session under the shared root that still resolves into the other project
+/// (position rule) must stay entry-less, or the global tombstone would
+/// silently ungroup it from a project this edit never touched (its "align to
+/// project" would then answer no_project).
+#[test]
+fn update_project_and_expel_keeps_sessions_still_resolving_into_another_project() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&temp);
+    let first = create(&store, "先建", &[abs("shared")]);
+    let edited = create(&store, "编辑", &[abs("shared"), abs("own-dir")]);
+    let cwd = abs("shared").join("session");
+
+    let updated = store
+        .update_project_and_expel(
+            &edited.id,
+            None,
+            vec![abs("own-dir")],
+            &[("s-shared".to_string(), cwd.clone())],
+        )
+        .expect("update and expel");
+    assert_eq!(updated.roots, vec![display(&abs("own-dir"))]);
+    assert_eq!(
+        store.assignment_of("s-shared"),
+        None,
+        "still resolvable through the surviving project: no tombstone"
+    );
+    let resolved = store
+        .resolve_session_project("s-shared", &cwd)
+        .expect("session keeps resolving after the edit");
+    assert_eq!(resolved.id, first.id, "tier-② lands in the position-0 project");
 }
 
 /// review #484 M3: update_project_and_expel persists BEFORE committing the
@@ -1293,7 +1330,10 @@ fn update_project_and_expel_rolls_back_memory_when_persist_fails() {
             &project.id,
             Some("新名".to_string()),
             vec![abs("e-new")],
-            &["s1".to_string()],
+            &[(
+                "s1".to_string(),
+                abs("e-old").join("session"),
+            )],
         )
         .expect_err("persist failure surfaces as an error");
     assert!(!error.to_string().is_empty());
@@ -1314,7 +1354,10 @@ fn update_project_and_expel_rolls_back_memory_when_persist_fails() {
             &project.id,
             Some("新名".to_string()),
             vec![abs("e-new")],
-            &["s1".to_string()],
+            &[(
+                "s1".to_string(),
+                abs("e-old").join("session"),
+            )],
         )
         .expect("retry persists");
     assert_eq!(updated.roots, vec![display(&abs("e-new"))]);

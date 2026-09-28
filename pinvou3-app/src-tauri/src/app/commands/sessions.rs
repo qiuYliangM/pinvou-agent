@@ -435,6 +435,18 @@ pub async fn create_session(
     }
     let metadata =
         create_session_record(set_active.unwrap_or(true), &store, &pool, workspace.clone())?;
+    // Same rebind fence as every sibling root-accepting writer (review #484
+    // round-11 M3): the binding write and the project-choice writes
+    // (last_primary_root + tier-1 assignment) must not commit between the
+    // rebind's candidate snapshot and its translation, or the fresh binding
+    // keeps the dead `from` spelling and escapes translation entirely. Held
+    // only for the binding window — the plain no-workspace create path stays
+    // fence-free.
+    let _fence = if workspace.is_some() {
+        Some(projects.rebind_fence()?)
+    } else {
+        None
+    };
     if let Some(workspace) = workspace.clone() {
         // A failed binding persist must not leave behind a session that "looked
         // created but falls back to the private execution root after restart":
@@ -466,6 +478,7 @@ pub async fn create_session(
             super::projects::emit_create_channel_assignment_event(&app);
         }
     }
+    drop(_fence);
     emit_session_event(&app, "session:list_changed", &metadata.id, "created");
     // 多 session 并发:不预热 engine(lazy)。新建的空 session 没有历史,首条 chat
     // 时 EnginePool.get_or_spawn 会为它 spawn 一个带专属 workspace 的 engine。

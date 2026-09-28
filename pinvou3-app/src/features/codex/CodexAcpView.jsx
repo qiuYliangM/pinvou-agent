@@ -3466,7 +3466,14 @@ export function CodexAcpView({
         await refreshSessions().catch(() => {});
         // live_push_failed: written, but the live engine kept the previous
         // (possibly wider) root set — surface it (review #484 round-9 N2).
-        if (onNotify) onNotify(outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone);
+        // Round-10 M2: a failed sidecar rewrite (index committed, disk copy
+        // stale) must surface like the other over-grant windows, not toast as
+        // a plain success.
+        if (onNotify) {
+          onNotify(outcome.sidecar_stale
+            ? t.uiKeychain.alignSidecarStale
+            : (outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone));
+        }
       } else if (outcome && outcome.reason === 'no_change' && onNotify) {
         onNotify(t.uiKeychain.alignNoChange);
       } else if (outcome && outcome.reason === 'write_skipped' && onNotify) {

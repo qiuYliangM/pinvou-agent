@@ -2,7 +2,7 @@
 // §2/§3/§9.3/§9.4): hot-view computation, primary-root resolution, mode-aware
 // notices. No UI/i18n dependencies; node-side unit testable.
 
-import { resolveSessionProjectId } from './projectGrouping.js';
+import { orderedProjectsByPosition, resolveSessionProjectId } from './projectGrouping.js';
 
 // Cold-project threshold (§3 accumulation mitigation): a materialized
 // origin=folder project with 30 days of no activity and no explicit members
@@ -39,19 +39,40 @@ export function projectLastActivity(project, items, assignments, projects) {
 // Rootless (tag-only) projects never appear: there is no root to bind, so
 // listing them would inflate the search threshold and render blank rows
 // (the row renderer cannot offer a disabled state for them).
+//
+// Complexity contract (review #484 round-11 M5): this function re-runs at
+// every session-list snapshot change even with the picker closed (the
+// container memoizes it on `codexSessions`, identity-replaced per turn), so
+// membership resolution is ONE pass over sessions — the (position, id)
+// project order is materialized once and each session resolves at most once
+// into the per-project activity map. The naive per-(project × session)
+// re-resolution re-sorted the whole project list per call (O(P×S·P log P),
+// measured 374ms-1.8s at 1000 sessions × 100 projects).
 export function computePickerRows({ projects, items, assignments, now }) {
   const nowMs = typeof now === 'number' ? now : Date.now();
   const assignmentMap = assignments && typeof assignments === 'object' ? assignments : {};
   const projectList = (Array.isArray(projects) ? projects : []).filter(Boolean);
+  const ordered = orderedProjectsByPosition(projectList);
+  // One pass over the bound items: latest member activity per project.
+  // Membership must be resolved against the FULL project list (see
+  // projectLastActivity) with the same tiers the sidebar grouping uses.
+  const activityByProject = new Map();
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    if (!item) return;
+    const projectId = resolveSessionProjectId(item, ordered, assignmentMap, ordered);
+    if (!projectId) return;
+    const time = itemTime(item);
+    const current = activityByProject.get(projectId);
+    if (current === undefined || time > current) activityByProject.set(projectId, time);
+  });
   return projectList
     .filter(project => pickerProjectRoots(project).length > 0)
     .map((project) => {
       const hasExplicitMembers = Object.values(assignmentMap).includes(project.id);
-      return {
-        project,
-        hasExplicitMembers,
-        lastActivity: projectLastActivity(project, items, assignmentMap, projectList),
-      };
+      const own = String((project && project.updated_at) || '');
+      const member = activityByProject.get(project.id);
+      const lastActivity = member !== undefined && member > own ? member : own;
+      return { project, hasExplicitMembers, lastActivity };
     })
     .filter((row) => {
       if (row.project.origin !== 'folder') return true;
