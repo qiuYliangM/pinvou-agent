@@ -204,7 +204,7 @@ async function runDenyAllOptInScenarios() {
       tools: ['gongwen'],
       skills: ['government-writing'],
       disabled: ['feishu'],
-      hidden: ['gongwen'],
+      hidden: ['gongwen', 'other-pack'],
     });
     const prepared = await prepareSceneCapabilities({ pinvouScene: 'work:document-writing' }, invoke);
     assert.strictEqual(prepared.ok, true);
@@ -212,6 +212,14 @@ async function runDenyAllOptInScenarios() {
     assert.deepStrictEqual(state.enableCalls, [['gongwen', 'government-writing']]);
     assert.strictEqual(state.hidden.has('gongwen'), false, 'enable un-hides the pack');
     assert.strictEqual(state.disabled.has('feishu'), true, 'unrelated packs stay disabled');
+    // Round-24 minor 10 (restores the deleted .js suite's assertion): an
+    // UNRELATED hidden entry survives a scene enable — only the scene packs
+    // are un-hidden; the hidden-cleanup must not sweep other ids.
+    assert.strictEqual(
+      state.hidden.has('other-pack'),
+      true,
+      'an unrelated hidden entry must survive the scene enable'
+    );
   }
 
   // Round-11 m10: the blocked branch — an explicit user opt-out refuses the
