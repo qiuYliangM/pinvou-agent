@@ -404,6 +404,26 @@ fn validate_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         if !root.is_absolute() {
             bail!("project root must be absolute: {}", root.display());
         }
+        // Round-11 M1 (review of the aligned keychain door): a project root
+        // that normalizes to the filesystem root flows into member keychains
+        // via `keychain_for_workspace` and makes the whole filesystem
+        // writable. Checked on the canonical form too — a symlink whose
+        // target is `/` must not pass on its lexical spelling. Ancestor
+        // relationships to a session's cwd are `align`'s declared purpose
+        // (§9.7) and stay allowed here.
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        for spelling in [root.as_path(), canonical.as_path()] {
+            if !spelling
+                .components()
+                .any(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                bail!(
+                    "project root {} normalizes to the filesystem root; \
+                     a project whose root is the filesystem would make every member session's keychain the whole filesystem",
+                    root.display()
+                );
+            }
+        }
         let display = root_display(root);
         let key = identity_key_of_display(&display);
         if keys.contains(&key) {

@@ -191,8 +191,6 @@ fn official_deepseek_model_name(model: &str) -> String {
     }
 }
 
-/// 会话钥匙串快照解析器闭包（创建时锁定的全量可访问根，§6）。注入理由同
-/// [`crate::features::sessions::ExecutionRootResolver`]：bridge 够不到 SessionStore/AcpPool。
 pub type WorkspaceRootsResolver =
     std::sync::Arc<dyn Fn(&str) -> Vec<std::path::PathBuf> + Send + Sync>;
 
@@ -232,10 +230,6 @@ pub struct Pinvou3Bridge {
     /// artifacts) is unaffected and is still decided uniformly by the `ledger`
     /// field of `SessionStore::session_roots`.
     pub execution_root_resolver: Option<ExecutionRootResolver>,
-    /// Session keychain-snapshot resolver: the full accessible-root set
-    /// locked at session creation (empty = single-root semantics). Injected
-    /// once at the same place as the execution-root resolver (composition
-    /// root, once the AcpPool is ready).
     pub workspace_roots_resolver: Option<WorkspaceRootsResolver>,
     /// Native code session predicate (code_session=true, covering both
     /// temporary and project-bound forms). Used for rendering the work/code

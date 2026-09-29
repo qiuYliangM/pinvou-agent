@@ -29,6 +29,39 @@ fn display(path: &std::path::Path) -> PathBuf {
     super::store::root_display(path)
 }
 
+#[test]
+fn create_rejects_a_filesystem_root_project_lexically_and_canonically() {
+    // Round-11 M1: a project whose root is the filesystem flows into member
+    // keychains via keychain_for_workspace and makes every member session's
+    // sandbox the whole filesystem. Rejected on the lexical spelling AND on
+    // the canonical form (a symlink to `/` must not pass on its link
+    // spelling). Unix-gated: the canonical leg needs a real symlink.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&temp);
+    let err = store
+        .create_project(
+            "root-project".to_string(),
+            vec![std::path::PathBuf::from("/")],
+        )
+        .expect_err("lexical fs-root must be rejected");
+    assert!(
+        err.to_string().contains("filesystem root"),
+        "unexpected error: {err}"
+    );
+
+    if std::env::consts::OS != "windows" {
+        let link = temp.path().join("root-link");
+        std::os::unix::fs::symlink("/", &link).expect("symlink to /");
+        let err = store
+            .create_project("root-project".to_string(), vec![link])
+            .expect_err("a symlink resolving to / must be rejected");
+        assert!(
+            err.to_string().contains("filesystem root"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
 fn create(store: &ProjectStore, name: &str, roots: &[PathBuf]) -> super::Project {
     store
         .create_project(name.to_string(), roots.to_vec())
