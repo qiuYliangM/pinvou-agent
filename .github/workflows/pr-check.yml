@@ -1050,6 +1050,14 @@ jobs:
         if: ${{ github.event_name != 'push' }}
         run: /usr/bin/time -v cargo test --manifest-path pinvou3-app/src-tauri/Cargo.toml --lib --features benchmark-hooks --locked --no-run
 
+      # 测试注册表守卫：重复 #[test] 会把一个用例注册两次并吞掉相邻用例的
+      # 属性（PR #455 round-26/28 两次发生），且对运行总数不可见（膨胀与
+      # 缩水相消）。复用上一步编译产物，秒级完成：断言无重复注册路径 +
+      # consent 关键 pin 全部在册（scripts/test-registry-guard.py）。
+      - name: test-registry guard（重复注册 + 必备 pin）
+        if: ${{ github.event_name != 'push' }}
+        run: python3 scripts/test-registry-guard.py
+
       - name: cargo test --lib（含 strict_mode 回归；真 bge-m3/vLLM 测试已 #[ignore]）
         if: ${{ github.event_name != 'push' }}
         run: |
