@@ -347,14 +347,6 @@ function pinvouSharedtauriMain() {
     depsInstalling: false,    // 一键安装进行中(brew/apt/winget)
     depsInstallError: null,   // 安装失败原因(stderr 透传/取消/包管理器不可用)
     depsInstallProgress: null, // 安装进度 {package,current,total,detail}(后端 deps:install_progress 事件)
-    // 厂商预装本地大模型一键引导:首屏检测结果 + 引导执行态
-    vllmSetup: null,          // {eligible, may_offer_setup, has_packages, engine_state:'stopped' in community (sole enum variant; vendor builds may extend), ...}
-    vllmBootstrapping: false, // 引导进行中(pkexec + 拉起 + 轮询就绪)
-    vllmSetupPhase: null,     // phase: 'authorizing'|'waiting'|'ready' (set locally to 'authorizing' when the flow starts; defensive vendor-edition UI field — the community backend never emits phase events)
-    vllmSetupAttempt: 0,      // probe count during the waiting phase (defensive: vendor-edition UI field; the community-edition backend never emits phase events)
-    vllmBootstrapDone: null,  // 成功结果 {base_url, model}, 据此显示「立即重启」
-    vllmBootstrapError: null, // 失败原因(pkexec stderr / 超时透传)
-    vllmSetupDismissed: false,// 本次会话内点了「跳过」,不再弹(不写持久标记)
     voiceInput: {
       status: "idle",         // idle | requesting_permission | recording | transcribing | postprocessing | completed | cancelled | failed
       message: "",
@@ -1171,7 +1163,7 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
 
   // 事件监听器统一入口:按 payload.session_id 路由同步逻辑;后台变更后补一次 notify 刷新列表。
 function markRemoteTurn(sid, buf, preserveCommittedRevision, cause) { return pinvouSharedtauriMain().markRemoteTurn(sid, buf, preserveCommittedRevision, cause); }
-function onSessionEvent(e, fn) { return pinvouSharedtauriMain().onSessionEvent(e, fn); }
+function onSessionEvent(e, fn, options) { return pinvouSharedtauriMain().onSessionEvent(e, fn, options); }
 function isScheduledRunSession(sid) { return pinvouSharedtauriMain().isScheduledRunSession(sid); }
 
   // Transcript persistence is authoritative in Rust. The UI only persists the
@@ -1443,7 +1435,7 @@ function planCardHydrationKey(item) { return pinvouSharedtauriMain().planCardHyd
     monitor: ["monitor", "monitorError"],
     settings: ["settings", "selectedPet"],
     models: ["activeModelId", "currentSessionModelId", "effectiveModelConfig", "savedModels"],
-    vllm: ["vllmBootstrapDone", "vllmBootstrapError", "vllmBootstrapping", "vllmSetup", "vllmSetupAttempt", "vllmSetupDismissed", "vllmSetupPhase"],
+    vllm: [],
     interaction: ["pinvouModal", "pinvouReviews", "pinvouSummoning", "superPermEnabled"],
     computerUse: ["computerUse"],
     personas: ["activePersona", "personaEvents", "personaPool"],
@@ -2044,6 +2036,10 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     state, listen, invoke, turnUsageDirty,
     sessionStates, renderMarkdown, bt,
     notify, onSessionEvent, runSyncOnSession,
+    // Live suppression probe for scheduleStreamNotify: inside a background
+    // working set the immediate first-delta notify is suppressed, so the
+    // stream scheduler must fall through to its bounded frame instead.
+    isNotifySuppressed: function () { return suppressNotify; },
     recordAuthoritySyncDiagnostic,
     authoritySyncBufferSnapshot,
     // 与历史重载路径共用同一信封判定（userMessageDisplayText 的 isInternalRuntimeEnvelopeText），
@@ -2133,10 +2129,6 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const saveSearchSettingsAndRestart = settingsFeature.saveSearchSettingsAndRestart;
   const submitFeedback = settingsFeature.submitFeedback;
   const discoverLocalVllm = settingsFeature.discoverLocalVllm;
-  const detectLocalVllmSetup = settingsFeature.detectLocalVllmSetup;
-  const bootstrapLocalVllm = settingsFeature.bootstrapLocalVllm;
-  const dismissVllmSetup = settingsFeature.dismissVllmSetup;
-  const declineVllmSetup = settingsFeature.declineVllmSetup;
   const loadModels = settingsFeature.loadModels; // startup loader (init); not on the facade
   const saveModel = settingsFeature.saveModel;
   const revealModelApiKey = settingsFeature.revealModelApiKey;
@@ -2552,10 +2544,6 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     feedback: { submitFeedback },
     vllm: {
       discoverLocalVllm,
-      detectLocalVllmSetup,
-      bootstrapLocalVllm,
-      dismissVllmSetup,
-      declineVllmSetup,
     },
     models: {
       saveModel,

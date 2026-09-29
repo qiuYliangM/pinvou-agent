@@ -180,7 +180,12 @@ const expectedProtocolHashes = {
   // Retired with the behavior telemetry client: the trackSceneBehavior helper
   // (scene_triggered track_behavior_event invoke) was removed, so the chat
   // surface is one invoke smaller.
-  chat: '9ab23d7af0a04de15a622f4efa5e544f5ce4ef7306862b7ec777189220a57ef3',
+  // Recomputed for per-frame stream notification coalescing; event names and
+  // invoke shapes remain unchanged.
+  // Recomputed for the coalescing hardening: chat:done cancels its session's
+  // pending notify frame, frame publishes contain subscriber throws, and the
+  // flush helper documents its runSyncOnSession extent contract.
+  chat: '648ace4c24985c2cd1cb8def8e8b2a4078824586295ba7016682cd2bf733baca',
   // Recomputed for the shared-helper dedup (see batch note above).
   dependencies: 'bcc3fb2ec60c5e80df5ac86bc8b4e14c810aa449d5ee5f4e3bc8ab1f32ffdff3',
   // Recomputed for #445 round-8: exitPlanToYolo accepts an explicit target
@@ -228,7 +233,10 @@ const expectedProtocolHashes = {
   // Recomputed for the dead-code cleanup: the dead saveSettingsAndRestart
   // wrapper (save_settings_and_restart invoke) was removed — no production
   // caller; the plain saveSettings + restart_app path stays the update route.
-  settings: '6ec54b363e711927cb1ac65fbb9c468fa8255c89ad49e7c1e695acca131fcb3a',
+  // Recomputed for the preinstalled-model startup removal: the
+  // detect_local_vllm_setup / bootstrap_local_vllm / decline_local_vllm_setup
+  // invokes left with the dead one-click setup chain.
+  settings: '2ceb4dabd59dc3c2eec0046915ccb04d7003035040511f961e15409fc4eb990a',
   // Recomputed for the dead-code cleanup: the never-emitted
   // remote_control:status / remote_control:session_created listeners were
   // removed, and the update:progress listener plus its coalescing timer
