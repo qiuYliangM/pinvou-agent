@@ -12,6 +12,13 @@ because the inflation and the deflation cancel. Against
      (absent = a stolen attribute silenced the pin). Extend REQUIRED_PINS
      when a new consent/rollback-critical pin lands.
 
+Platform caveat (review #455 round-30 m10): two REQUIRED_PINS are
+`#[cfg(unix)]`-gated (they need an unreadable-file fixture), so a local run
+only goes green on Linux — exactly where the CI rust-test leg wires this
+guard; on macOS/Windows the missing unix pins are expected misses, not
+thefts. The registry scope is the pinvou3-app/src-tauri crate; covering the
+other test manifests (e.g. pinvou-cli) is a registered follow-up.
+
 Run it wherever the lib test binary is already built (it reuses cargo's
 artifacts); CI wires it into the linux rust-test leg right after
 `cargo test --lib --no-run`.
@@ -33,8 +40,11 @@ REQUIRED_PINS = [
     # attributes were swapped by the round-28 insertion.
     "exact_cleanup_never_reowns_absent_dir_id_onto_foreign_claim",
     "enable_packages_state_changed_tracks_persisted_delta",
-    # mod.rs: secrets resync keeps the previous registry on unreadable state.
+    # mod.rs: secrets resync keeps the previous registry on unreadable state,
+    # and (round-30 MAJOR) a faulting mid-rebuild keyring read discards the
+    # partial rebuild wholesale instead of leaving a half-rebuilt registry.
     "secret_values_resync_unreadable_registry_keeps_previous",
+    "secret_values_resync_keyring_fault_keeps_previous_registry",
     # plugin_import.rs: rebaseline keeps the restore point through a supply
     # failure rollback.
     "unified_import_keeps_backup_through_supply_failure_rollback",
