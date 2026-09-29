@@ -150,7 +150,10 @@ const ManageProjectFoldersDialog = ({
                 onChange={e => setRenaming(e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !isImeComposing(e)) { e.preventDefault(); commitRename(); }
-                  if (e.key === 'Escape') { e.preventDefault(); setRenaming(null); }
+                  // Round-11 minor 12: the IME guard covers the rename Escape
+                  // too — a CJK cancel-conversion Escape must discard the
+                  // composition, not the draft.
+                  if (e.key === 'Escape' && !isImeComposing(e)) { e.preventDefault(); setRenaming(null); }
                 }}
                 onBlur={commitRename}
                 className="mt-0.5 w-full h-6 px-2 rounded-full text-[12px] outline-none bg-white text-[#1F1F1F] ring-1 ring-[#0B57D0] dark:bg-[#131314] dark:text-[#E3E3E3] dark:ring-[#A8C7FA]"

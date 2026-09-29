@@ -833,9 +833,13 @@ pub(crate) async fn create_codex_acp_session_with_workspace_binding(
     // 只在项目通道把 roots 与 path 一起下发——显式拒绝而不是静默丢弃
     // (评审 #484 round-7 minor;报错风格对齐 sessions::create_session 的
     // workspace_path/workspace_roots 校验)。
-    if project_workspace.is_none() && !keychain.is_empty() {
+    if project_workspace.is_none() && (!keychain.is_empty() || project_id.is_some()) {
+        // Round-11 minor 1: `project_id` without a workspace used to vanish
+        // in `record_project_choice`'s zip — a lost tier-1 assignment that
+        // silently falls back to tier-② adoption. Mirror the chat lane's
+        // hard reject so the caller re-sends a complete request.
         return Err(
-            "create_codex_acp_session: invalid workspace_roots: workspace_roots 必须随 workspace_path 一起提供(临时会话没有钥匙串快照)"
+            "create_codex_acp_session: invalid workspace_roots/project_id: both require workspace_path (temporary sessions carry no keychain or assignment)"
                 .to_string(),
         );
     }
