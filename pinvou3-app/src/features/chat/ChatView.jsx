@@ -770,6 +770,16 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       const activeSessionId = bs ? bs.activeSessionId : null;
       const activeSessionIdRef = useRef(activeSessionId);
       activeSessionIdRef.current = activeSessionId;
+      // Round-29 m8 (review #455): the scene-capability banner/toast slot is
+      // composer-global but its state is per-send; clear it on every session
+      // switch so a settled banner never bleeds into the next conversation.
+      // Async writers are additionally suppressed by their send-start
+      // session guard inside sendChatMessage (a slow welcome enable settling
+      // after the switch would otherwise re-render here).
+      useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously clear the per-send banner/toast when the session switches (same reset family as the design-element and back-to-bottom resets)
+        setSceneCapabilityStatus(null);
+      }, [activeSessionId]);
       const computerUseCopy = t.uiComputerUse;
       const computerUseSlice = (bs && bs.computerUse) || null;
       // Fetch the authoritative computer-use state on session mount/switch: the banner and
@@ -1570,6 +1580,18 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // eslint-disable-next-line sonarjs/cognitive-complexity -- scene-capability preflight and send orchestration are cohesive in a single callback; split refactor tracked separately
       const sendChatMessage = useCallback(async (text) => {
         if (!bridge.available) return false;
+        // Round-29 m8 (review #455): this flow awaits IPC between status
+        // writes — a slow welcome enable settling after a session switch
+        // must not render its banner (or ready toast) on the wrong
+        // session's composer. Capture the session at send start and let
+        // only same-session writes through; the switch effect clears the
+        // slot outright.
+        const sceneStatusSession = activeSessionIdRef.current;
+        const setSceneStatusForSession = (status) => {
+          if (activeSessionIdRef.current === sceneStatusSession) {
+            setSceneCapabilityStatus(status);
+          }
+        };
         // Both welcome-card send paths (sample-question click / free input)
         // complete the opt-in here (review #455 R8-2; logic extracted into
         // welcome-optin.js for direct testing): failure must not block the
@@ -1593,7 +1615,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           // The welcome pack was explicitly switched off by the user: abort the
           // send with guidance (same contract as the scene blocked path,
           // round-10 Major 2) instead of sending a reply without the tool.
-          setSceneCapabilityStatus({
+          setSceneStatusForSession({
             kind: 'error',
             text: t.uiChatScenes.switchedOffPacks(welcomeOptIn.blocked.join(', ')),
           });
@@ -1625,7 +1647,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         if (requirements) {
           const sceneCopy = t.uiChatScenes[requirements.key];
           if (canPrepareSceneCapabilities({ isWebHost: isWeb, dependencyInstallAvailable: can('dependencyInstall') })) {
-            setSceneCapabilityStatus({ kind: 'preparing', text: sceneCopy.preparing });
+            setSceneStatusForSession({ kind: 'preparing', text: sceneCopy.preparing });
             try {
               const prepared = await prepareSceneCapabilities(meta, invokeTauri);
               if (!prepared.ok) {
@@ -1651,7 +1673,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                 // failure must win over the scene failure copy here (the
                 // scene preflight re-runs and resurfaces on the next send;
                 // the welcome failure otherwise never surfaces at all).
-                setSceneCapabilityStatus({
+                setSceneStatusForSession({
                   kind: 'error',
                   text: welcomeOptIn.failed
                     ? t.uiChat.welcomeOptInFailed
@@ -1673,7 +1695,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
               // Round-13 m2: welcome failure wins here too (same rationale as
               // the prepared-not-ok branch above).
               console.warn('[pinvou3][chat-ui] scene capability prepare raised:', error);
-              setSceneCapabilityStatus({
+              setSceneStatusForSession({
                 kind: 'error',
                 text: welcomeOptIn.failed
                   ? t.uiChat.welcomeOptInFailed
@@ -1683,14 +1705,18 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             }
           }
         }
-        setSceneCapabilityStatus(resolveSendCapabilityStatus({
+        setSceneStatusForSession(resolveSendCapabilityStatus({
           welcomeFailed: welcomeOptIn.failed,
           welcomeText: t.uiChat.welcomeOptInFailed,
           sceneStatus,
         }));
         if (readyAutoClear) {
+          // The session guard inside the timeout keeps this stale closer
+          // from clearing a NEWER session's fresh ready toast.
           window.setTimeout(() => setSceneCapabilityStatus((current) => (
-            current && current.kind === 'ready' ? null : current
+            current && current.kind === 'ready' && activeSessionIdRef.current === sceneStatusSession
+              ? null
+              : current
           )), 1800);
         }
         if (!activeSessionId) {

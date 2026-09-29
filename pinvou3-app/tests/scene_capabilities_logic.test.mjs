@@ -106,7 +106,9 @@ function makeInvoke({ tools = [], skills = [], disabled = [], hidden = [], block
       if (args.scope !== 'plain') throw new Error('scene opt-in must target plain scope');
       state.enableCalls.push([...args.packageIds]);
       const blocked = args.packageIds.filter((id) => state.blockedOnEnable.has(id));
-      if (blocked.length) return { enabled: false, blocked };
+      // Round-29 m7 (review #455): the real IPC outcome always carries all
+      // three fields — keep the refused branch type-faithful.
+      if (blocked.length) return { enabled: false, blocked, not_applied: [] };
       // Round-13 m3: ids absent from the DenyAll expansion match nothing —
       // nothing is applied for them and the outcome reports not_applied.
       const notApplied = args.packageIds.filter((id) => state.notAppliedOnEnable.has(id));
@@ -277,11 +279,14 @@ async function runDenyAllOptInScenarios() {
       ],
       skills: ['government-writing'],
       disabled: ['other-pack'],
-      // Round-27 m10 (review #455): the hidden set carries the COMPANION id —
-      // it needs owner mapping, so a regression that owner-maps the disabled
-      // leg but not the hidden leg must fail here (the round-26 fixture's
-      // owner-id hidden entry could not discriminate that). The unrelated
-      // entry must survive the mapped-owner un-hide.
+      // Round-27 m10 (review #455), comment reworded round-29 m6: this
+      // fixture pins RAW-ID-IN-BATCH — the frontend builds one enable batch
+      // for both legs and the raw companion id reaches it unconditionally
+      // (mutation-verified: an owner map that drops the id empties the
+      // assertion). It can NOT discriminate per-leg owner-mapping: there is
+      // no separate hidden-leg mapping in the frontend to break, so the
+      // un-hide assertion below passes through the same raw id. The
+      // unrelated entry must survive the opt-in.
       hidden: ['government-writing', 'unrelated-pack'],
     });
     const prepared = await prepareSceneCapabilities({ pinvouScene: 'work:document-writing' }, invoke);
@@ -295,7 +300,7 @@ async function runDenyAllOptInScenarios() {
     assert.strictEqual(
       state.hidden.has('government-writing'),
       false,
-      'the hidden COMPANION id is un-hidden through its mapped owner (hidden leg is owner-mapped too)',
+      'the raw companion id in the batch un-hides it backend-side',
     );
     assert.strictEqual(
       state.hidden.has('unrelated-pack'),
