@@ -10,6 +10,13 @@ missed exactly this class; the de04d54a9 consent-sync reorder motivated
 the check). Per-file token sets keep the output attributable; it is a
 review INPUT, not a verdict — comment-only identifiers will show up too.
 
+Known limitation (round-26 minor 13, review #455): this check is
+additions-only — a deletion-shaped merge resolution (code the resolution
+removes relative to both parents) is structurally invisible to it; the
+review's file-list and deleted-symbol greps carry that load. A clean
+output here must not be read as "no resolution-authored content", only
+as "no resolution-ADDED identifiers".
+
 Usage: python3 scripts/audit-merge-authored.py [base-ref]
 """
 import re

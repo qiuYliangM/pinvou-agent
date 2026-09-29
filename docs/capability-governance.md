@@ -9,7 +9,8 @@
 > 已收敛为静态表 `MODE_TABLE`）；§3 的存储已收敛为**单一 `disabled_bundles.json`**
 > （`{scopes, hidden_scopes, default_off_scopes, initialized, project_skills_enabled, plain_defaults_migrated}`，键 = 包 id，见 §3.2），取代原
 > `disabled_connectors.json` + `disabled_skills.json` 双文件与 `skill:` 前缀跨文件借道；
-> companion 联动排除改由包模型现算（`bundle::skill_owner_package`）。§3.1 的
+> companion 联动排除改由包模型现算（门控侧解析用 `bundle::skill_gating_owner`，
+> 物理嵌套感知，round-26 minor 11 精确化）。§3.1 的
 > 统一包模型与「一个包 = 一个开关」已部分落地（`BundleStore` + `bundle_readiness`），
 > §3.3 的运行时工具名发现（现为 manifest 预测）、内置 CLI 连接器归并、统一失效入口
 > （现为各开关命令分别触发刷新）与 §6 的泛化命令面（现为 `set_disabled_connectors` /
@@ -61,7 +62,7 @@
 ### 3.1 数据模型：能力包（已定方向、未实施）
 
 > 现状：连接器与技能已收敛为单一 `disabled_bundles.json`（包 id × SessionMode，
-> §3.2），companion 技能按包模型归属（`bundle::skill_owner_package`）随所属包整体
+> §3.2），companion 技能按包模型归属（门控侧解析用 `bundle::skill_gating_owner`）随所属包整体
 > 上下线；下述统一「包」模型（含 `bundle_kind` 推导与「一个包 = 一个开关」）的其余
 > 部分（运行时工具名发现、内置 CLI 归并、统一失效入口）为目标设计，实施时以本节为准。
 
@@ -132,8 +133,10 @@ stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 �
   id」，已初始化 scope 从落盘列表移除，并连带清 hidden（隐藏包即使开关打开也
   看不到工具）；用户显式关掉的 id（非安装默认）整批拒绝、不改状态；
 - 回收站恢复过**恢复同意门**：恢复的包在已初始化 scope 重新落回默认禁用
-  （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；声明凭据的组合包在
-  未初始化 scope 走强制变体物化同一门（防供给面零同意上线）；门持久化失败
+  （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；声明凭据的组合包（manifest
+  三路凭据声明任一非空；bin 侧 manifest 副本不可读时同向强制，round-26 minor 11
+  与 marketplace-unification.md 对齐）在未初始化 scope 走强制变体物化同一门
+  （防供给面零同意上线）；门持久化失败
   在消费回收站条目之前报错，恢复可重试。注意两个上报信号的方向（round-24
   MAJOR 5 文档勘误，此前一句写反）：`blocked` 整批判拒只对**已初始化** scope
   的落盘 opt-out 有定义（未初始化 scope 物化的是现算扩集，不存在可对抗的
@@ -305,11 +308,6 @@ UI 或状态层出 bug 也放不出白名单外能力。已知开放侧翼：CLI
   是否在系统凭据存储，因此远程包恒报 Ready。**无法用 readiness 门控 OAuth
   授权是否完成**；授权态由 `connect`（flow=oauth）流程自理，UI 只能依赖
   `oauth` 标记打徽标，不能给「未授权」态。
-- **`tool_credentials` / `tool_config_fields` 不按 (key, target) 去重**：
-  两个收敛函数把 `config_fields`、`secret_env`、`secret_headers` 三路声明
-  简单拼接（`bundle.rs`），同一 `(key, target)` 在多路重复声明时会重复出现在
-  `BundleInfo.credentials` / `config_fields` 中，凭据收集弹窗与缺失判定可能
-  重复处理同一凭据。
 
 另有两条限制已随文内联登记：会话中关闭的上下文不可撤回边界（§3.3 末）、
 CLI 包真实执行面经 `bash` 的开放侧翼（§5 末）。
