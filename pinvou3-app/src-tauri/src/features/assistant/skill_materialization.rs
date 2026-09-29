@@ -834,4 +834,37 @@ mod tests {
             assert_eq!(dir, paths::sessions_root().join("abc-123").join("skills"));
         });
     }
+
+    /// Round-29 m3 (review #455): the staging exclusion in
+    /// `skill_source_dirs` (round-24 minor 3) is consent-load-bearing —
+    /// pin it. Import staging (`<id>.tmp`) and landing-backup (`<id>.old`)
+    /// dirs are not packs; admitting their skills would render ungated
+    /// content into initialized scopes under a suffix owner id during the
+    /// import window. Only a real pack's skills dir is a source.
+    #[test]
+    fn staging_residue_dirs_are_not_skill_sources() {
+        with_temp_home("pinvou3-skillscope", || {
+            let bundles = paths::bundles_root();
+            for residue in ["stage-pack.tmp", "stage-pack.old"] {
+                let dir = bundles.join(residue).join("skills").join("leak");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("SKILL.md"), "---\nname: leak\n---\n").unwrap();
+            }
+            let real = bundles.join("real-pack").join("skills");
+            std::fs::create_dir_all(&real).unwrap();
+
+            let dirs = skill_source_dirs();
+            assert!(
+                !dirs
+                    .iter()
+                    .any(|d| d.to_string_lossy().contains(".tmp")
+                        || d.to_string_lossy().contains(".old")),
+                "staging residue must not become a skill source: {dirs:?}"
+            );
+            assert!(
+                dirs.iter().any(|d| d == &real),
+                "the real pack's skills dir stays a source: {dirs:?}"
+            );
+        });
+    }
 }

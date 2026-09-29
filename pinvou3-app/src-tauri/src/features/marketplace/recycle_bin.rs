@@ -272,6 +272,17 @@ impl RecycleBin {
         Ok(())
     }
 
+    /// Round-29 m2 (review #455): 清单是否列有该 id——恢复管线的 preflight
+    /// 守卫必须与 take_back 的 fail-closed「不在回收站」拒绝同口径：孤儿回收
+    /// 目录（崩溃/双重回滚残留）能通过目录守卫，缺这道检查会让同意门先持久
+    /// 化幽灵行 + 安装默认标记，随后才被 take_back 拒绝。take_back 在文件锁
+    /// 内复查，仍是权威。
+    pub fn contains(&self, pkg_id: &str) -> Result<bool, String> {
+        let _guard = file_lock();
+        let file = load_locked(&self.file)?;
+        Ok(file.entries.iter().any(|e| e.id == pkg_id))
+    }
+
     /// 回收站列表：读清单 + 校验包目录存在（缺失标记 `package_missing`，
     /// 前端据此禁用"恢复"）。清单损坏 fail loud（返回 Err）。
     /// 持锁读取 + 校验，拿到的清单与目录是同一时刻的一致快照。
@@ -540,6 +551,16 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
             "恢复目标 {} 已存在，拒绝覆盖",
             paths::bundles_root().join(pkg_id).display()
         ));
+    }
+    // Round-29 m2 (review #455): mirror take_back's manifest-entry guard as
+    // well — an ORPHANED bin dir (crash / double-rollback residue) passes the
+    // two dir guards above, and without this check the consent gate below
+    // persists phantom rows + install-default markers before take_back
+    // refuses with 不在回收站 (the round-25 minor-9 class, fourth guard).
+    // take_back re-checks under the file lock and stays the authority; this
+    // preflight just keeps the doomed restore from writing consent state.
+    if !bin.contains(pkg_id)? {
+        return Err(format!("包 '{pkg_id}' 不在回收站"));
     }
     // 恢复碰撞 preflight（fail-closed，先于任何搬移）：回收期间市场状态可能已
     // 变（例如导入了把同名技能作为 companion 的包），碰撞状态下恢复会造出同
@@ -1215,6 +1236,75 @@ mod tests {
         );
         assert!(foreign.join("SKILL.md").is_file(), "他包同名副本不得受影响");
         assert!(store.get("my-skill").unwrap().is_none(), "不得重建登记");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PINVOU3_HOME", v) },
+            None => unsafe { std::env::remove_var("PINVOU3_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Round-29 m2 (review #455): an ORPHANED bin dir (manifest entry gone —
+    /// crash or double-rollback residue) must be refused by the preflight
+    /// BEFORE the consent gate; otherwise the gate persists phantom rows +
+    /// install-default markers and only take_back's 不在回收站 refusal
+    /// fires (fail-closed but wrong: the restore-pipeline guards must mirror
+    /// take_back, the round-25 minor-9 family, manifest-entry arm).
+    #[test]
+    fn restore_refuses_orphaned_bin_dir_without_phantom_consent() {
+        let _g = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("PINVOU3_HOME").ok();
+        let tmp = fresh_dir("restore-orphan");
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        let pkg = paths::bundles_root().join("my-skill");
+        std::fs::create_dir_all(pkg.join("skills/my-skill")).unwrap();
+        std::fs::write(
+            pkg.join("skills/my-skill/SKILL.md"),
+            "---\nname: my-skill\n---\n",
+        )
+        .unwrap();
+        let store = BundleStore::new();
+        store.upsert(upload_record("my-skill")).unwrap();
+        let record = store.get("my-skill").unwrap().unwrap();
+        store.remove("my-skill").unwrap();
+        RecycleBin::new()
+            .recycle_package("my-skill", KIND_SKILL, "my-skill.zip", record)
+            .unwrap();
+
+        // Orphan injection: drop the manifest entry, keep the bin dir.
+        let bin = RecycleBin::new();
+        assert!(bin.root.join("my-skill").is_dir(), "fixture: bin dir present");
+        {
+            let _guard = file_lock();
+            let mut manifest = load_locked(&bin.file).unwrap();
+            manifest.entries.retain(|e| e.id != "my-skill");
+            save_locked(&bin.file, &manifest).unwrap();
+        }
+
+        let err = restore_plugin("my-skill").unwrap_err();
+        assert!(
+            err.contains("不在回收站"),
+            "the orphaned dir must hit the manifest-entry guard: {err}"
+        );
+        assert!(
+            !tmp.join("disabled_bundles.json").exists(),
+            "the consent gate must not have run — no phantom consent state"
+        );
+        assert!(
+            bin.root.join("my-skill").is_dir(),
+            "the bin dir stays in place"
+        );
+        assert!(
+            !bin.contains("my-skill").unwrap(),
+            "the manifest stays without the entry"
+        );
+        assert!(
+            store.get("my-skill").unwrap().is_none(),
+            "no registration may be rebuilt"
+        );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("PINVOU3_HOME", v) },

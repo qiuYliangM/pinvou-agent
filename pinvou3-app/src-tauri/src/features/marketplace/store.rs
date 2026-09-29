@@ -713,7 +713,18 @@ fn legacy_skill_records() -> Result<Vec<BundleRecord>, String> {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(marker) = std::fs::read_to_string(dir.join(".installed-from")) else {
+        // Round-29 m4 (review #455): NotFound is the common no-marker skip,
+        // but an EXISTS-but-unreadable marker must abort the import exactly
+        // like the unreadable root above — the one-shot `legacy_imported`
+        // gate must not latch over an incomplete mirror (round-23 MAJOR-3 /
+        // round-24 m2 class, per-entry form).
+        let marker_path = dir.join(".installed-from");
+        let marker = if marker_path.exists() {
+            match std::fs::read_to_string(&marker_path) {
+                Ok(marker) => marker,
+                Err(e) => return Err(format!("读取 {} 失败: {e}", marker_path.display())),
+            }
+        } else {
             continue;
         };
         let marker = marker.trim();
@@ -1182,6 +1193,48 @@ mod tests {
             assert!(report2.imported.is_empty());
             let after_second = std::fs::read_to_string(store.file_path()).unwrap();
             assert_eq!(after_first, after_second, "二次导入不得改写文件");
+        });
+    }
+
+    /// Round-29 m4 (review #455): an EXISTS-but-unreadable `.installed-from`
+    /// marker must abort the legacy import (Err) instead of being silently
+    /// skipped — the one-shot `legacy_imported` gate must not latch over an
+    /// incomplete mirror (round-23 MAJOR-3 / round-24 m2 class, per-entry
+    /// form). A no-marker dir stays a plain skip.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_unreadable_marker_aborts_before_gate_latches() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home("pinvou3-store-test", || {
+            let skills = paths::bundle_skills_dir();
+            let good = skills.join("good");
+            std::fs::create_dir_all(&good).unwrap();
+            std::fs::write(good.join(".installed-from"), "pinvou3-marketplace:legacy-a").unwrap();
+            let sealed = skills.join("sealed");
+            std::fs::create_dir_all(&sealed).unwrap();
+            std::fs::write(sealed.join(".installed-from"), "pinvou3-marketplace:legacy-b").unwrap();
+            let sealed_marker = sealed.join(".installed-from");
+            std::fs::set_permissions(&sealed_marker, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            if std::fs::read_to_string(&sealed_marker).is_ok() {
+                eprintln!(
+                    "ROOT-SKIP[legacy_import_unreadable_marker_aborts_before_gate_latches]: unreadable-file fixture not effective (root); NOT exercised"
+                );
+                return;
+            }
+            // 无标记目录仍是普通跳过，不得触发任何错误路径。
+            std::fs::create_dir_all(skills.join("bare")).unwrap();
+
+            let store = BundleStore::new();
+            let err = store.import_legacy().unwrap_err();
+            assert!(
+                err.contains(".installed-from") || err.contains("读取"),
+                "the unreadable marker must abort the import: {err}"
+            );
+            assert!(
+                !store.load().unwrap().legacy_imported,
+                "the one-shot gate must not latch over an aborted import"
+            );
         });
     }
 

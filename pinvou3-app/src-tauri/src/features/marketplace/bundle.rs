@@ -944,6 +944,41 @@ mod tests {
         });
     }
 
+    /// Round-29 m3 (review #455): the staging exclusion in the physical
+    /// fallback (round-27 m4) is consent-load-bearing — pin it. A
+    /// crash-residue `<id>.tmp`/`<id>.old` dir nesting the skill must never
+    /// win the sorted-first race nor attribute the skill to a suffix-owner
+    /// id; without a real pack the skill stays standalone.
+    #[test]
+    fn staging_residue_never_wins_the_physical_owner_fallback() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = crate::platform::paths::bundles_root();
+            std::fs::create_dir_all(bundles.join("ghost.tmp").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "staging residue must not own the skill (standalone fallback)"
+            );
+            // `ghost.tmp` sorts before `real-pack`, so without the exclusion
+            // the sorted-first race would pick the residue dir.
+            std::fs::create_dir_all(bundles.join("real-pack").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "real-pack",
+                "the real pack owns the skill; the residue never wins the race"
+            );
+            std::fs::remove_dir_all(bundles.join("real-pack")).unwrap();
+            std::fs::rename(bundles.join("ghost.tmp"), bundles.join("ghost.old")).unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "the landing-backup (.old) arm is excluded too"
+            );
+        });
+    }
+
     #[test]
     fn collects_tool_credentials() {
         let tool = super::super::ToolManifest {

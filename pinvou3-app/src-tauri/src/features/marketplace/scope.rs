@@ -124,12 +124,14 @@ static PENDING_CORRUPT_RECOVERY: Mutex<Option<(PathBuf, DisabledBundlesFile)>> =
 
 /// Round-19 MAJOR 4: set when a read finds the on-disk `disabled_bundles.json`
 /// UNREADABLE (chmod-000 file, AV lock — bytes exist but cannot be salvaged).
-/// The next persist must not blind-rename over those unrecoverable bytes:
-/// `try_save` first renames the original aside (a rename needs only directory
-/// write permission, so it always succeeds) and clears this memo. Without it,
-/// "unreadable original → any write" permanently destroys the user's explicit
-/// opt-outs with no quarantine copy — the R6-B1 violation the read path
-/// already refuses for itself.
+/// Round-29 m1 (review #455) widens the arming to the corrupt-store read
+/// whose **quarantine write failed**: there too the bytes exist with no
+/// preserved copy, and the next persist must rename them aside before
+/// overwriting. `try_save` first renames the original aside (a rename needs
+/// only directory write permission, so it always succeeds) and clears this
+/// memo. Without it, "unreadable original → any write" permanently destroys
+/// the user's explicit opt-outs with no quarantine copy — the R6-B1
+/// violation the read path already refuses for itself.
 static UNREADABLE_ORIGINAL: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Clears the verdict memos. Test-only hygiene: the statics are process-global
@@ -417,6 +419,17 @@ fn quarantine_and_recover_disabled_bundles(raw: &[u8], error: &str) -> DisabledB
         eprintln!(
             "[marketplace] {quarantine_err}; skipping disabled_bundles.json overwrite this read"
         );
+        // Round-29 m1 (review #455): quarantine failed, so NO preserved copy
+        // of the corrupt bytes exists and the original is still in place —
+        // but only this read skips the overwrite. Arm the unreadable-original
+        // marker so a LATER load-then-save writer's persist renames those
+        // bytes aside before overwriting (differential transient failure:
+        // the quarantine write fails now, the main write succeeds later).
+        // Cleared by try_save's successful-persist tail.
+        *UNREADABLE_ORIGINAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(paths::pinvou3_home());
         return recovered;
     }
     if let Err(save_error) = try_save_disabled_bundles_file(&recovered) {
@@ -1818,6 +1831,104 @@ mod tests {
         });
     }
 
+    /// Round-29 m1 (review #455): a corrupt store whose QUARANTINE write
+    /// fails leaves no preserved copy, and only the failing read skips the
+    /// overwrite — without a marker, a later load-then-save writer
+    /// blind-writes over the still-unquarantined bytes (differential
+    /// transient failure: the quarantine write fails now, the main write
+    /// succeeds later). The failing read must arm the unreadable-original
+    /// marker so the next persist renames the corrupt original aside instead
+    /// of destroying the only copy.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_failure_arms_marker_so_later_writer_preserves_corrupt_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home("pinvou3-scope", || {
+            let home = paths::pinvou3_home();
+            let path = disabled_bundles_path();
+            let original = b"corrupt-user-optouts{{{".to_vec();
+            std::fs::write(&path, &original).unwrap();
+
+            // Read-only DIRECTORY (0o555): the file itself stays readable, so
+            // the read reaches the parse-corrupt branch, but the quarantine
+            // copy cannot land (it needs directory write permission).
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = home.join(".quarantine-fail-probe");
+            if std::fs::write(&probe, b"probe").is_ok() {
+                std::fs::remove_file(&probe).ok();
+                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!(
+                    "ROOT-SKIP[quarantine_failure_arms_marker_so_later_writer_preserves_corrupt_bytes]: read-only-dir fixture not effective (root); NOT exercised"
+                );
+                return;
+            }
+
+            let recovered = load_disabled_bundles_file();
+            assert!(
+                recovered.plain_defaults_migrated,
+                "the corrupt read degrades fail-closed: {recovered:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "the failing read must not touch the unquarantined original"
+            );
+            let siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&home)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains(".corrupt.") || n.contains(".unreadable."))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                siblings.is_empty(),
+                "the failed quarantine left no preserved copy: {siblings:?}"
+            );
+
+            // The differential: the transient failure heals, and a writer
+            // holding the in-memory recovered state persists it. The marker
+            // armed by the failed quarantine must rename the corrupt original
+            // aside instead of blind-writing over the only copy.
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            try_save_disabled_bundles_file(&recovered).unwrap();
+
+            let sidecars: Vec<std::path::PathBuf> = std::fs::read_dir(&home)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains(".unreadable."))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert_eq!(
+                sidecars.len(),
+                1,
+                "the writer preserved the unquarantined original: {sidecars:?}"
+            );
+            assert_eq!(
+                std::fs::read(&sidecars[0]).unwrap(),
+                original,
+                "the preserved copy must carry the original corrupt bytes"
+            );
+            let on_disk: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path).expect("the persist must land"),
+            )
+            .expect("the persisted store must be valid JSON");
+            assert_eq!(
+                on_disk.get("plain_defaults_migrated"),
+                Some(&serde_json::Value::Bool(true)),
+                "the writer's recovered state is the store again: {on_disk}"
+            );
+        });
+    }
+
     /// Round-20 MAJOR B, crash-window arm: the live store is gone but a
     /// `.corrupt.*` sibling proves it existed — the NotFound read must
     /// recover fail-closed (no scope initialized, freeze persisted) instead
@@ -2155,15 +2266,6 @@ mod tests {
         });
     }
 
-    /// Round-26 MAJOR 1 (review #455): post-teardown cleanup writers remove
-    /// rows by the **pre-teardown owner** (exact form). With the victim
-    /// pack's dir deleted and nothing in the bin, the normalized form's
-    /// gating fallback re-owns the absent id onto a foreign pack that claims
-    /// it (`companion_skills`) or physically nests it — the removal would
-    /// then erase the FOREIGN pack's consent rows while the stale victim
-    /// rows survive (silent zero-consent re-enable). The exact form targets
-    /// only the victim's rows and leaves the foreign pack untouched.
-    #[test]
     /// Round-28 MINOR 3 (review #455): `state_changed` is the load-bearing
     /// hot-refresh gate in `enable_marketplace_packages` — pin it at the
     /// domain level. A regression flipping the command gate back to the IPC
@@ -2222,6 +2324,15 @@ mod tests {
         });
     }
 
+    /// Round-26 MAJOR 1 (review #455): post-teardown cleanup writers remove
+    /// rows by the **pre-teardown owner** (exact form). With the victim
+    /// pack's dir deleted and nothing in the bin, the normalized form's
+    /// gating fallback re-owns the absent id onto a foreign pack that claims
+    /// it (`companion_skills`) or physically nests it — the removal would
+    /// then erase the FOREIGN pack's consent rows while the stale victim
+    /// rows survive (silent zero-consent re-enable). The exact form targets
+    /// only the victim's rows and leaves the foreign pack untouched.
+    #[test]
     fn exact_cleanup_never_reowns_absent_dir_id_onto_foreign_claim() {
         with_temp_home("pinvou3-scope", || {
             // Foreign installed pack claiming `victim` as a companion skill
@@ -2577,6 +2688,29 @@ mod tests {
             let mut expected = builtin;
             expected.push("gongwen".to_string());
             assert_eq!(load_disabled_bundles_for(ConnectorScope::Code), expected);
+        });
+    }
+
+    /// Round-29 m3 (review #455): the expansion disk leg's staging exclusion
+    /// is consent-load-bearing — crash-residue `<id>.tmp`/`<id>.old` dirs
+    /// nesting skills must not join the DenyAll expansion (a suffix-owner id
+    /// would then be persisted by the composer's first-write seeding as a
+    /// stored row + install-default marker).
+    #[test]
+    fn denyall_disk_leg_skips_staging_residue() {
+        with_temp_home("pinvou3-scope-denyall", || {
+            let bundles = paths::bundles_root();
+            for residue in ["stage-pack.tmp", "stage-pack.old"] {
+                let dir = bundles.join(residue).join("skills").join("leak");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("SKILL.md"), "# leak").unwrap();
+            }
+            let builtin: Vec<String> = builtin_cli_bundle_ids().map(str::to_string).collect();
+            assert_eq!(
+                load_disabled_bundles_for(ConnectorScope::Code),
+                builtin,
+                "staging residue must not join the expansion: no suffix-owner junk, no leak owner"
+            );
         });
     }
 

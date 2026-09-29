@@ -1036,21 +1036,22 @@ pub fn import_plugin_package(
     // plugin dirs, so the half-state would persist across boots. The backup
     // is deleted only once supply has succeeded.
 
-    // 导入即重基线：包内容整体替换后，旧包的 SKILL.md 说明备份（存于 extra，
-    // upsert_preserving 原样保留）随之失效——不清掉会让「清覆盖恢复」把**旧包**
-    // 的原描述写进新包（口径同 skill_marketplace::import_package_named）。三条
-    // UI 上传通道（选文件/拖 zip/拖 .md）都汇聚在这条统一导入路径上；首装无
-    // 备份时不写，避免无谓 churn。
-    // 位置契约：必须在 rename 成功之后**立即**执行、早于任何可能失败的供给
-    // 步骤（install_upload / upsert_preserving）。重基线与否取决于「内容已整
-    // 体替换」而非「整个导入成功」——若供给在重基线前失败早退（如 MCP 凭据缺
-    // 失），磁盘已是新包而备份仍指旧包，后续「清覆盖恢复」会把旧描述写进新
-    // SKILL.md（正是本块要防的损坏类）。
-    // 锁边界（MINOR 1 口径）：本块全程持有 import_lock（guard 至函数尾）；
-    // 展示说明的回写/恢复（update_display_meta → sync_display_description）在
-    // SKILL.md 读改写段**同样持有同 id 的 import_lock**（锁序一致：import_lock
-    // → store file_lock），同 id 的导入与编辑因此真正互斥，无「读备份 → 写
-    // SKILL.md」窗口被重导入插队的竞态。
+    // 导入即重基线（口径）：包内容整体替换后，旧包的 SKILL.md 说明备份（存于
+    // extra，upsert_preserving 原样保留）随之失效——不清掉会让「清覆盖恢复」
+    // 把**旧包**的原描述写进新包（口径同 skill_marketplace::import_package_named）。
+    // 三条 UI 上传通道（选文件/拖 zip/拖 .md）都汇聚在这条统一导入路径上；首装
+    // 无备份时不写，避免无谓 churn。
+    // Round-29 m5 (review #455): the old placement contract that lived here
+    // ("rebaseline immediately after the rename, BEFORE any supply step") is
+    // superseded by the round-27 m5 reorder — the consume point now sits
+    // AFTER supply (below): a moved_old supply-failure rollback restores the
+    // old files, so the backup must survive until supply resolves. Do not
+    // move the call back up on the old contract's authority.
+    // 锁边界（MINOR 1 口径）：统一导入全程持有 import_lock（guard 至函数尾）；
+    // 展示说明的回写/恢复（update_display_meta → sync_display_description）
+    // 在 SKILL.md 读改写段**同样持有同 id 的 import_lock**（锁序一致：
+    // import_lock → store file_lock），同 id 的导入与编辑因此真正互斥，无
+    // 「读备份 → 写 SKILL.md」窗口被重导入插队的竞态。
     let store = super::store::BundleStore::new();
     // 供给：MCP 组件走 install 管线写 mcp.json + installed.json（底座据此拉起 server，
     // 工具才能注册可用）。纯 skill 包无 mcp/ 目录，跳过（技能走物化通道）。
@@ -1126,9 +1127,11 @@ pub fn import_plugin_package(
     if let Err(e) = super::store::BundleStore::new().upsert_preserving(record) {
         log::warn!("[plugin-import] bundles.json 镜像写入失败（import {id}）: {e}");
     }
-    // （导入即重基线：包内容整体替换后旧包的说明备份随之失效，必须在 rename
-    // 成功后立即清理、早于任何可能失败的供给步骤——见上方 rename 成功后的
-    // 重基线块，勿移回此处。）
+    // （导入即重基线：包内容整体替换后旧包的说明备份随之失效。Round-29 m5
+    // (review #455): the consume point's ordering contract now lives at the
+    // rebaseline call above (round-27 m5: only AFTER supply succeeds — a
+    // moved_old rollback restores the old files and the backup must survive
+    // for the next attempt); this upsert site is not the rebaseline point.)
 
     Ok(PluginImportReport {
         id,
