@@ -107,6 +107,26 @@ impl ConnectorGate {
         let show = self.skills_should_show();
         (self.apply_bundle_skills)(show)
             .map_err(|e| format!("刷新{}技能门控失败: {e}", self.display_name))?;
+        if show {
+            // Round-30 m1 (review #455): materialization must not outrun the
+            // consent rows. A connector connected pre-PR whose fire-and-forget
+            // consent sync silently failed is re-materialized at every
+            // startup while its initialized scope's stored list never gains a
+            // row — and in an initialized scope the stored list is the sole
+            // truth (the expansion legs don't run), so the skills stay
+            // live-by-absence permanently. The idempotent membership push
+            // (the connect path's own call above) self-heals that cohort at
+            // every refresh; failures propagate fail-loud like the connect
+            // path instead of relying on the next connect.
+            crate::features::marketplace::sync_deny_all_scopes_after_install(self.id).map_err(
+                |e| {
+                    format!(
+                        "{}技能门控刷新后的默认关同意同步失败: {e}",
+                        self.display_name
+                    )
+                },
+            )?;
+        }
         Ok(show)
     }
 }

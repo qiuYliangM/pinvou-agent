@@ -270,6 +270,8 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         // whole process lifetime after a transient permissions hiccup (the
         // swallowing `installed_ids()` class). Keep the previous values on
         // Err; the next bridge boot (or a successful write) rebuilds.
+        // Round-30 MAJOR: this contract now also covers a faulting
+        // rebuild — nothing is cleared until the whole rebuild succeeds.
         let installed = match self.try_installed_ids() {
             Ok(ids) => ids,
             Err(error) => {
@@ -279,7 +281,20 @@ impl<S: CredentialStore> MarketplaceManager<S> {
                 return Ok(());
             }
         };
-        values.clear();
+        // Round-30 MAJOR (review #455): the rebuild itself is fallible — a
+        // mid-loop keyring fault (locked keychain / EACCES during boot
+        // rehydration) must not leave the registry half-rebuilt: tools
+        // scanned before the fault are repopulated, tools after it are
+        // missing, and the only production caller (the bridge boot, which
+        // logs "MCP secret env sync skipped" and moves on) swallows the
+        // error — unresolved `${ENV}` placeholders for the whole process
+        // lifetime, the exact "silent 401s" harm this function's own doc
+        // names. Build into a local map and swap under the guard only on
+        // success; the previous values survive any Err, the same contract
+        // the unreadable-registry arm above keeps (and the twin pin
+        // `secret_values_resync_keyring_fault_keeps_previous_registry`
+        // holds).
+        let mut rebuilt: HashMap<String, String> = HashMap::new();
         for tool_id in installed {
             let Some(manifest) = self.load_manifest(&tool_id) else {
                 continue;
@@ -288,13 +303,14 @@ impl<S: CredentialStore> MarketplaceManager<S> {
                 let reference = mcp_secret_reference(&tool_id, &target, &key);
                 match self.credential_store.get(&reference) {
                     Ok(Some(value)) if !value.trim().is_empty() => {
-                        values.insert(mcp_secret_env_var(&key), value);
+                        rebuilt.insert(mcp_secret_env_var(&key), value);
                     }
                     Ok(_) => {}
                     Err(e) => return Err(mcp_secret_store_error(&tool_id, &key, e)),
                 }
             }
         }
+        *values = rebuilt;
         Ok(())
     }
 

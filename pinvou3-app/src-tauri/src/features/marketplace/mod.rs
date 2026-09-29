@@ -8527,6 +8527,88 @@ mod tests {
         });
     }
 
+    /// Credential store whose reads fault for one specific tool: models a
+    /// keyring faulting mid-rebuild (per-reference granularity, so the tool
+    /// BEFORE the faulting one rebuilds cleanly and the fault lands mid-loop
+    /// — the exact half-rebuilt shape round-30's MAJOR closes).
+    struct FaultSecondToolStore {
+        inner: MemoryCredentialStore,
+    }
+
+    impl CredentialStore for FaultSecondToolStore {
+        fn get(&self, reference: &CredentialReference) -> Result<Option<String>, CredentialError> {
+            if reference.account.starts_with("mcp:fault-b:") {
+                return Err(CredentialError::new("keyring unavailable (simulated)"));
+            }
+            self.inner.get(reference)
+        }
+        fn set(&self, reference: &CredentialReference, value: &str) -> Result<(), CredentialError> {
+            self.inner.set(reference, value)
+        }
+        fn delete(&self, reference: &CredentialReference) -> Result<(), CredentialError> {
+            self.inner.delete(reference)
+        }
+    }
+
+    /// Round-30 MAJOR (review #455): the keyring-fault twin of the pin above —
+    /// a mid-REBUILD credential-store fault must keep the previous registry
+    /// intact, not a half-rebuilt one. Under the old clear-then-rebuild form
+    /// `values.clear()` ran BEFORE the fallible loop: a fault on the second
+    /// tool left the first tool repopulated, the second missing, and every
+    /// previous entry gone, while the only production caller (the bridge
+    /// boot) swallows the error — unresolved `${ENV}` placeholders for the
+    /// whole process lifetime. The build-then-swap form discards the partial
+    /// rebuild wholesale on any Err.
+    #[test]
+    fn secret_values_resync_keyring_fault_keeps_previous_registry() {
+        with_temp_home(|| {
+            for (tool, key) in [("fault-a", "FAULT_A_KEY"), ("fault-b", "FAULT_B_KEY")] {
+                let manifest = serde_json::json!({
+                    "id":tool,"name":tool,"description":"d","version":"1","icon":"x","category":"c",
+                    "mcp_tools":[],"command":"python","args":["server.py"],
+                    "secret_env":[{"key":key,"provider":"test","required":true}]
+                });
+                write_tool_manifest(tool, &serde_json::to_string_pretty(&manifest).unwrap());
+            }
+            write_installed_ids(&["fault-a".to_string(), "fault-b".to_string()]);
+            let manager = MarketplaceManager::with_store(FaultSecondToolStore {
+                inner: MemoryCredentialStore::default(),
+            });
+            // fault-a's credential is stored and readable; fault-b's reads fault.
+            manager
+                .credential_store
+                .set(
+                    &mcp_secret_reference("fault-a", "env", "FAULT_A_KEY"),
+                    "fault-a-value",
+                )
+                .unwrap();
+
+            // Seed the "previous registry" with an unrelated entry.
+            let keep_var = mcp_secret_env_var("KEEP_API_KEY");
+            store_secret_value(keep_var.clone(), "previous-registry-value".to_string());
+
+            let err = manager.sync_secret_values().unwrap_err();
+            assert!(
+                err.contains("fault-b"),
+                "the fault must be reported for the second tool: {err}"
+            );
+
+            // The previous registry entry survives the failed rebuild...
+            assert_eq!(
+                snapshot_secret_values().get(&keep_var).map(String::as_str),
+                Some("previous-registry-value"),
+                "a faulting rebuild must keep the previous registry intact (clear-then-rebuild would lose it)"
+            );
+            // ...and the partial rebuild is discarded wholesale: fault-a's
+            // freshly scanned value never landed.
+            let a_var = mcp_secret_env_var("FAULT_A_KEY");
+            assert!(
+                !snapshot_secret_values().contains_key(&a_var),
+                "the discarded rebuild must not leave a half-rebuilt registry"
+            );
+        });
+    }
+
     /// Uninstalling (or permanently downgrading) a tool with sensitive-by-name
     /// legacy env keys must delete the credential the enumeration now covers —
     /// before the dual-target enumeration these store entries were orphaned

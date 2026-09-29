@@ -462,18 +462,7 @@ impl Pinvou3Bundle {
             // Fail-closed like the uninstall path's `source_may_be_upload`: an
             // unreadable store means "may be an upload" → skip the cleanup
             // entirely (its last step deletes `bundles/<id>` wholesale).
-            let user_uploaded = crate::features::marketplace::store::BundleStore::new()
-                .records()
-                .map(|records| {
-                    records.iter().any(|r| {
-                        r.id == tool_id
-                            && matches!(
-                                r.source,
-                                crate::features::marketplace::store::BundleSource::Upload(_)
-                            )
-                    })
-                })
-                .unwrap_or(true);
+            let user_uploaded = Self::user_upload_record_exists(tool_id);
             if !user_uploaded {
                 // 廉价残留探测:所有清理面都干净时直接返回——uninstall 会无条件重写
                 // installed.json / mcp.json(manifest 声明 secret_targets 时还会清
@@ -540,10 +529,51 @@ impl Pinvou3Bundle {
                 // 搬进 bundles/<id>/mcp/，而 uninstall 的 can_redeliver=false 规则
                 // （非内嵌 id 不可重释放）保留包目录——不删则 manifest 存活、退役
                 // 工具以「自定义 MCP 卡」复活（G8a）。Upload 保护已在上方判定。
+                // Round-30 m5 (review #455): the top probe is checked ONCE, but
+                // a same-id Upload import can land in the window (the uninstall
+                // above is not instantaneous) — deleting wholesale at this
+                // point would destroy the user's unique uploaded copy, the
+                // exact loss the guard exists to prevent. Re-probe AT the
+                // deletion point, fail-closed on an unreadable store (same
+                // `source_may_be_upload` direction as the top probe): keep
+                // `bundles/<id>` and defer the residue sweep to the next
+                // startup, the same defer-with-retry contract as the
+                // uninstall-deferred arm above.
+                if Self::user_upload_record_exists(tool_id) {
+                    log::warn!(
+                        "[cleanup] retired tool '{tool_id}': an Upload record for the same id \
+                         appeared during cleanup; keeping bundles/<id> and deferring the \
+                         residue sweep to the next startup"
+                    );
+                    crate::platform::startup::mark_with_detail(
+                        "rust",
+                        "retired_tool_cleanup:deferred",
+                        "upload-record appeared mid-cleanup",
+                    );
+                    return Ok(());
+                }
                 let _ = std::fs::remove_dir_all(paths::bundles_root().join(tool_id));
             }
         }
         Ok(())
+    }
+
+    /// Upload 记录探测（退役 id 保护的共用判定,round-30 m5）：Upload 记录存在
+    /// → true;store 不可读 → true(fail-closed,与卸载路径的 `source_may_be_upload`
+    /// 同方向:读不了就当"可能是上传"处理)。
+    fn user_upload_record_exists(tool_id: &str) -> bool {
+        crate::features::marketplace::store::BundleStore::new()
+            .records()
+            .map(|records| {
+                records.iter().any(|r| {
+                    r.id == tool_id
+                        && matches!(
+                            r.source,
+                            crate::features::marketplace::store::BundleSource::Upload(_)
+                        )
+                })
+            })
+            .unwrap_or(true)
     }
 
     /// 探测已下架 marketplace 工具是否还有任何残留清理面:安装目录、installed.json、

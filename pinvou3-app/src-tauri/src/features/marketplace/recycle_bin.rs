@@ -731,18 +731,27 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
             // be deleted by this rollback. Guard the remove the same way: if
             // a record now exists whose installed_at differs from the one
             // this restore wrote, a reinstall landed mid-flight and its
-            // record stays.
-            let our_record = BundleStore::new().get(pkg_id).ok().flatten();
-            match our_record {
-                Some(current) if current.installed_at != record.installed_at => {
+            // record stays. Round-30 m7 (review #455): an unreadable store
+            // must NOT read as record-absent — removing then would delete
+            // whatever record is present (possibly a concurrent reinstall's,
+            // the exact outcome this comment forbids) once the EACCES clears
+            // between `get` and `remove`. The Err arm conservatively skips,
+            // the same direction as the mismatch arm.
+            match BundleStore::new().get(pkg_id) {
+                Ok(Some(current)) if current.installed_at != record.installed_at => {
                     log::warn!(
                         "[recycle-bin] 恢复 {pkg_id} 回滚期间检测到并发重装（installed_at 不一致），保留现有登记不移除"
                     );
                 }
-                _ => {
+                Ok(_) => {
                     if let Err(se) = BundleStore::new().remove(pkg_id) {
                         log::warn!("[recycle-bin] 恢复 {pkg_id} 回滚后登记移除失败: {se}");
                     }
+                }
+                Err(ge) => {
+                    log::warn!(
+                        "[recycle-bin] 恢复 {pkg_id} 回滚时登记不可读（{ge}），保守跳过移除：可能存在并发重装，留待下次卸载清理"
+                    );
                 }
             }
             return Err(format!("恢复 {pkg_id} 失败（已回滚至回收站，可重试）: {e}"));

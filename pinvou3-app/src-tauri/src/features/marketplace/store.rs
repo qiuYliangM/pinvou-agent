@@ -708,7 +708,13 @@ fn legacy_skill_records() -> Result<Vec<BundleRecord>, String> {
     };
     let now = now_iso8601();
     let mut out = Vec::new();
-    for entry in rd.flatten() {
+    // Round-30 m6 (review #455): `flatten()` silently drops mid-scan
+    // iteration errors — the one-shot `legacy_imported` gate could latch
+    // over an incomplete mirror (records permanently skipped). Propagate
+    // like the root read above and the per-entry markers below: the last
+    // leg of the round-23 MAJOR-3 class in this function.
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("遍历旧布局技能目录失败: {e}"))?;
         let dir = entry.path();
         if !dir.is_dir() {
             continue;

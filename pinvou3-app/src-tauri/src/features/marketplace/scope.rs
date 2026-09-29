@@ -385,7 +385,24 @@ fn load_disabled_bundles_file_locked() -> DisabledBundlesFile {
         file.initialized
             .insert(SessionMode::Plain.as_str().to_string());
         file.plain_defaults_migrated = true;
-        save_disabled_bundles_file(&file);
+        // Round-30 m2 (review #455): the freeze branches' R7-M2 contract —
+        // first-read verdicts surface persist failures through the
+        // UNPERSISTED_VERDICT memo — applies to the legacy migration too:
+        // it persists the same kind of frozen verdict (marker set, plain
+        // initialized empty). The log-and-drop wrapper made an unwritable
+        // home silently re-run the migration + catalog walk every boot; the
+        // memo keeps the in-process verdict and hands it to a later
+        // NotFound read (the re-run itself stays idempotent — the verdict
+        // derives from the file's own contents).
+        if let Err(error) = try_save_disabled_bundles_file(&file) {
+            eprintln!(
+                "[scope] CRITICAL: failed to persist the legacy migration verdict: {error}; holding the in-process verdict until a save succeeds"
+            );
+            *UNPERSISTED_VERDICT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((paths::pinvou3_home(), file.clone()));
+        }
     }
     if normalize_stored_lists(&mut file) {
         save_disabled_bundles_file(&file);
