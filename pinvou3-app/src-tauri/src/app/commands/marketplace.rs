@@ -226,8 +226,9 @@ pub(super) async fn install_marketplace_tool_post_install(tool_id: String) -> Re
     // scope with zero consent, with nothing at boot to reconcile it. The
     // crash window is now the ms-wide span between two adjacent fs-backed
     // operations. Ordering is safe against validation failure: the rollback
-    // uninstall's teardown removes the entries this sync wrote
-    // (`remove_bundle_from_disabled_scopes`). That teardown degrades persist
+    // uninstall's teardown removes the entries this sync wrote (the exact
+    // form, `remove_bundle_from_disabled_scopes_exact`). That teardown
+    // degrades persist
     // failures to `log::warn`, so a rollback-time persist failure can still
     // strand a consent row for a pack that is gone — stale-deny, i.e. the
     // fail-closed direction (review #455 round-22 minor 2).
@@ -271,8 +272,11 @@ pub(super) async fn install_marketplace_tool_post_install(tool_id: String) -> Re
                 mgr.uninstall(&rollback_tool_id)
             })
             .await;
-            // Best-effort compensation: surface a rollback failure instead of
-            // discarding it — the validation error remains the one returned.
+            // Best-effort compensation: LOG a rollback failure instead of
+            // discarding it — the validation error remains the one returned
+            // (round-28 nit: the rollback result is not surfaced to the user;
+            // on a failed rollback the pack remains installed — fail-closed
+            // state, the log line is the only trace).
             match &rollback_result {
                 Err(e) => {
                     log::warn!(

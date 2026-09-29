@@ -1259,6 +1259,11 @@ impl<S: CredentialStore> MarketplaceManager<S> {
             .load_manifest(tool_id)
             .map(|manifest| secrets::manifest_secret_targets(&manifest))
             .unwrap_or_default();
+        // Round-28 MAJOR 1 (review #455): snapshot companion owners HERE —
+        // pre-transaction, while this tool's conditional claim is still alive.
+        // Post-commit resolution would fall through to the physical fallback
+        // and could re-own a companion name onto a live foreign pack.
+        let companion_owners = self.snapshot_companion_owners(tool_id);
 
         // mcp.json / installed.json / bundles.json 镜像 / 包目录回收在同一事务窗口：
         // 回收失败即整体回到卸载前状态（目录由 recycle_package 自回滚，登记以本次
@@ -1346,7 +1351,7 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         // fully usable instead of producing a half-uninstalled state.
         // Upload 组合包的 companion 目录已随整包搬离（false 分支的清理自然空转）；
         // 预置 companion 物理删除沿用既有语义（可重获得）。
-        self.cleanup_uninstalled_tool_state(tool_id, &secret_targets, false);
+        self.cleanup_uninstalled_tool_state(tool_id, &secret_targets, false, &companion_owners);
 
         // Environments and wheel caches are garbage-collected by reference to the still-installed MCPs.
         // A failed cleanup never rolls back the finished uninstall; the next uninstall retries, so a held file cannot leave the tool stuck in a half state where the config is gone but uninstall keeps erroring.
@@ -1463,11 +1468,20 @@ impl<S: CredentialStore> MarketplaceManager<S> {
     /// before any supply-side teardown so a failed companion delete aborts the
     /// whole uninstall). Keep the two policies distinct and the cross
     /// references intact when touching either side.
+    /// Round-28 MAJOR 1 (review #455): the companion-owner snapshots MUST be
+    /// computed **before the uninstall transaction commits** — post-commit the
+    /// tool's own conditional claim is dead (and its manifest may be gone),
+    /// so `resolve_pack_owner_id` falls through to the physical fallback and
+    /// can re-own a companion name onto a live foreign pack that nests an
+    /// undeclared `skills/<name>/`, letting the exact removal erase THAT
+    /// pack's consent rows. Callers snapshot with claims alive and thread the
+    /// pairs in; the best-effort swallow stays per this leg's policy.
     fn cleanup_uninstalled_tool_state(
         &self,
         tool_id: &str,
         secret_targets: &[(String, String)],
         preserve_companion_skills: bool,
+        companion_owners: &[(String, String)],
     ) {
         for (target, key) in secret_targets {
             let reference = secrets::mcp_secret_reference(tool_id, target, key);
@@ -1510,15 +1524,25 @@ impl<S: CredentialStore> MarketplaceManager<S> {
             if !unavailable.contains(&skill_id) {
                 continue;
             }
-            // Round-27 MAJOR 1 (review #455): snapshot the owner pack BEFORE
-            // the uninstall attempt — a failed/swallowed uninstall keeps the
-            // dir in place (the normalized form would then erase a
-            // still-installed skill's rows), and a mid-loop aborted deletion
-            // can leave a foreign pack's nesting that the post-deletion
-            // fallback would re-own the id onto (erasing THAT pack's rows).
-            // Exact form with the pre-teardown snapshot; the best-effort
+            // Round-28 MAJOR 1 (review #455): the owner comes from the
+            // pre-transaction snapshot threaded by the caller — re-resolving
+            // here would run against the post-commit world where this tool's
+            // claim is dead and the fallback can re-own the name onto a live
+            // foreign pack. Exact form on that snapshot; the best-effort
             // swallow stays per this leg's policy.
-            let owner = scope::resolve_pack_owner_id(&skill_id);
+            let Some(owner) = companion_owners
+                .iter()
+                .find(|(sid, _)| sid == &skill_id)
+                .map(|(_, owner)| owner)
+            else {
+                // No pre-transaction snapshot (the companion list changed
+                // between snapshot and cleanup): keep the conservative no-op —
+                // without a claims-alive resolution this leg must not guess.
+                log::warn!(
+                    "[marketplace] no pre-transaction owner snapshot for companion '{skill_id}' of {tool_id}; skipping its consent cleanup"
+                );
+                continue;
+            };
             let _ = skill_marketplace::SkillMarketplaceManager::new().uninstall(&skill_id);
             if let Err(e) = scope::remove_bundle_from_disabled_scopes_exact(&owner) {
                 log::warn!(
@@ -1528,11 +1552,28 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         }
     }
 
+    /// Round-28 MAJOR 1: snapshot companion ids to their owner packs while the
+    /// tool's claims are still alive (pre-transaction). Must run before any
+    /// state that `skill_owner_package_with`'s `bundle_installed` condition
+    /// reads is torn down.
+    fn snapshot_companion_owners(&self, tool_id: &str) -> Vec<(String, String)> {
+        self.companion_skills(tool_id)
+            .into_iter()
+            .map(|sid| {
+                let owner = scope::resolve_pack_owner_id(&sid);
+                (sid, owner)
+            })
+            .collect()
+    }
+
     fn mark_tool_uninstalled_locked(&self, tool_id: &str) -> Result<(), DowngradeError> {
         let secret_targets = self
             .load_manifest(tool_id)
             .map(|manifest| secrets::manifest_secret_targets(&manifest))
             .unwrap_or_default();
+        // Round-28 MAJOR 1: pre-transaction companion-owner snapshot (same
+        // rationale as `uninstall`; this repair path has no eager pass).
+        let companion_owners = self.snapshot_companion_owners(tool_id);
         let transaction = MarketplaceStateTransaction::begin(&self.installed_file)
             .map_err(DowngradeError::Integrity)?;
         // 不变量与 uninstall 相同：写入器拒绝必须是闭包内第一个操作，事务快照
@@ -1571,7 +1612,12 @@ impl<S: CredentialStore> MarketplaceManager<S> {
                         }
                     }
                 }
-                self.cleanup_uninstalled_tool_state(tool_id, &secret_targets, preserve_companions);
+                self.cleanup_uninstalled_tool_state(
+                    tool_id,
+                    &secret_targets,
+                    preserve_companions,
+                    &companion_owners,
+                );
                 if let Err(error) = store::BundleStore::new().remove(tool_id) {
                     log::warn!(
                         "[marketplace] bundles.json mirror cleanup failed during Python repair ({tool_id}): {error}"

@@ -157,7 +157,7 @@ pub(crate) fn skill_owner_package_with(tools: &[super::ToolManifest], skill_name
 /// undeclared skill to the skill name itself, it would enter every scope with
 /// zero consent and no composer row to turn it off (the record-driven lists
 /// have no such row). The fallback shares materialization's lens: purely
-/// physical (no install-record lookups, staging dirs not excluded either —
+/// physical (no install-record lookups, staging dirs excluded (round-27 m4) —
 /// the gating side does not distinguish "currently importing" dirs; import
 /// collision checks never route through this function). First match in sorted
 /// order keeps the outcome deterministic when several packs nest the same

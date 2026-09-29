@@ -100,11 +100,11 @@ static DISABLED_BUNDLES_FILE_LOCK: Mutex<()> = Mutex::new(());
 /// traces — a fresh install would be misjudged as an upgrade and plain would
 /// flip back to fully on (fail-open, exactly what the freeze prevents). Keyed
 /// by home-directory path so tests switching PINVOU3_HOME do not cross-talk;
-/// after a successful save the file is the truth. On a persist failure the
-/// memo carries the verdict for the **whole process lifetime** — every later
-/// read reuses it instead of re-evaluating (round-26 minor 12: the doc
-/// previously claimed a "brief" carry, contradicting the test-hygiene doc
-/// below; the memo is not cleared on later successful saves).
+/// after a successful save the file is the truth and both memos are cleared
+/// (scope.rs persist path). On a persist failure the memo carries the verdict
+/// for the rest of the process — every later read reuses it instead of
+/// re-evaluating (round-28 nit: the round-26 wording claimed the memo is
+/// "not cleared on later successful saves", which the code disproves).
 static UNPERSISTED_VERDICT: Mutex<Option<(PathBuf, DisabledBundlesFile)>> = Mutex::new(None);
 
 /// In-process memo for corrupt-recovery "quarantine kept, overwrite save
@@ -306,7 +306,9 @@ fn load_disabled_bundles_file_locked() -> DisabledBundlesFile {
             // failure, record this verdict in the in-process memo (R7-M2) —
             // later reads reuse it; the fail-closed direction is guaranteed
             // by the verdict itself (fresh = plain uninitialized = DenyAll
-            // fallback).
+            // fallback) **in this process only** — across a restart the
+            // first-boot-trace re-evaluation hazard returns (the registered
+            // crash-during-freeze family, round-28 nit).
             if let Err(freeze_error) = try_save_disabled_bundles_file(&file) {
                 eprintln!(
                     "[scope] CRITICAL: failed to persist the plain-defaults migration verdict: {freeze_error}; holding the in-process verdict (plain initialized = {}) until restart - first-boot traces will not re-open the fresh/upgraded evaluation",
@@ -503,6 +505,14 @@ fn to_package_id_with(tools: &[super::ToolManifest], raw: &str) -> String {
         // pack row — while it awaits restore, its consent row (written
         // verbatim by the gate) must not be re-owned on read through a
         // foreign claim or nesting.
+        //
+        // Round-28 MINOR 6 (review #455) — disclosed neither-leg window:
+        // during `import_plugin_package`'s rename `bundles/p` -> `bundles/p.old`
+        // a concurrent load sees p neither on-disk nor in the bin and can
+        // remap a stored "p" row onto a foreign claimant (persisted). The
+        // window is the rename instant only and atomic on one filesystem, but
+        // if the re-import then fails and p is restored, p's row is gone —
+        // registered alongside #515 rather than answered with a lock here.
         || super::recycle_bin::RecycleBin::held_dir(stripped).is_dir();
     if pack_row {
         return stripped.to_string();
@@ -2154,6 +2164,64 @@ mod tests {
     /// rows survive (silent zero-consent re-enable). The exact form targets
     /// only the victim's rows and leaves the foreign pack untouched.
     #[test]
+    /// Round-28 MINOR 3 (review #455): `state_changed` is the load-bearing
+    /// hot-refresh gate in `enable_marketplace_packages` — pin it at the
+    /// domain level. A regression flipping the command gate back to the IPC
+    /// `enabled` flag (the round-26 minor-1 bug class) or dropping a
+    /// `changed |=` leg fails here.
+    #[test]
+    fn enable_packages_state_changed_tracks_persisted_delta() {
+        with_temp_home("pinvou3-scope", || {
+            // Initialized scope, hidden-only un-hide: X sits in the hidden
+            // set only — every disabled/default list is untouched but the
+            // hidden leg persists a visibility change.
+            save_hidden_bundles_for(ConnectorScope::Plain, &["hidden-only".to_string()]).unwrap();
+            save_disabled_bundles_for(ConnectorScope::Plain, &[]).unwrap();
+            let outcome =
+                enable_packages_in_scope(ConnectorScope::Plain, &["hidden-only".to_string()])
+                    .unwrap();
+            assert!(
+                outcome.state_changed,
+                "hidden-only un-hide persists state: {outcome:?}"
+            );
+
+            // Applied batch: "a" carries an install-default marker
+            // (enableable); "b" is an explicit opt-out without one. Plant the
+            // raw file — the composer write path would seed no markers for
+            // entries it transitioned.
+            let path = disabled_bundles_path();
+            std::fs::write(
+                &path,
+                r#"{"scopes":{"plain":["a","b"]},"default_off_scopes":{"plain":["a"]},"initialized":["plain"],"plain_defaults_migrated":true}"#,
+            )
+            .unwrap();
+            let outcome =
+                enable_packages_in_scope(ConnectorScope::Plain, &["a".to_string()]).unwrap();
+            assert!(
+                outcome.state_changed && outcome.not_applied.is_empty(),
+                "enableable applied batch persists state: {outcome:?}"
+            );
+
+            // Refused batch (explicit user opt-out "b"): nothing changes.
+            let outcome =
+                enable_packages_in_scope(ConnectorScope::Plain, &["b".to_string()]).unwrap();
+            assert!(
+                !outcome.state_changed && !outcome.blocked.is_empty(),
+                "refused batch changes nothing: {outcome:?}"
+            );
+
+            // Uninitialized DenyAll scope, no id matches the expansion:
+            // not_applied-only, nothing persisted.
+            let outcome =
+                enable_packages_in_scope(ConnectorScope::Code, &["no-such-pack".to_string()])
+                    .unwrap();
+            assert!(
+                !outcome.state_changed && !outcome.not_applied.is_empty(),
+                "not_applied-only batch persists nothing: {outcome:?}"
+            );
+        });
+    }
+
     fn exact_cleanup_never_reowns_absent_dir_id_onto_foreign_claim() {
         with_temp_home("pinvou3-scope", || {
             // Foreign installed pack claiming `victim` as a companion skill

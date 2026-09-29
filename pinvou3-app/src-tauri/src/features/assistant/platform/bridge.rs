@@ -2331,6 +2331,11 @@ impl Pinvou3Bridge {
                 .into_iter()
                 .collect();
         names.sort();
+        // Round-28 nit (review #455): `find_skill_dir` per disabled name costs
+        // a full manifest walk each (via `skill_owner_package`), not one stat
+        // per pack — O(names x catalog) per ruleset rebuild. Accepted bound:
+        // disabled-skill counts are small and rebuilds are infrequent; a
+        // per-call owner snapshot would be the next hoist if that changes.
         for name in names {
             let Some(dir) = manager.find_skill_dir(&name) else {
                 continue; // not installed / already excluded from materialization: no script to intercept

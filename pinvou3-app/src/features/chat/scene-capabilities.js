@@ -158,7 +158,7 @@ async function prepareSceneCapabilities(meta, invoke) {
   // contains the scene packs, the user-initiated scene action is the explicit
   // opt-in — enable_marketplace_packages persists it (and un-hides) and
   // hot-refreshes the running session's tool allowlist and skill-composition
-  // directory, taking effect on the current turn.
+  // directory, visible to sessions from the next conversation turn.
   // Round-16 minor 13, closed by the shared companion map (main's #563
   // extracted it so the scene path and ToolStoreView cannot drift): the
   // backend's disabled/hidden sets and the DenyAll expansion carry OWNER pack

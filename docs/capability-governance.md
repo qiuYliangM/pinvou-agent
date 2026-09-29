@@ -122,7 +122,7 @@ stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 �
   `marketplace-unification.md` §5.4）；
 - hidden 只决定包是否出现在 composer 列表，不决定 on/off；disabled 只决定
   开关态，不影响列表可见性；
-- 卸载走 `remove_bundle_from_disabled_scopes`，同时清 disabled 与 hidden
+- 卸载清理走 **exact 形态** `remove_bundle_from_disabled_scopes_exact`（属主在拆除前快照，round-28 与实现对齐），同时清 disabled 与 hidden
   （防残留 hidden 误隐藏未来同名重装；ima 断开随技能卸载走同一入口）；
   CLI 连接器「断开」（logout，删授权不删记录）不走该入口，两个集合均不动；
 - 能力开关写路径（`save_disabled_bundles_for`）只写 `scopes`，不动 hidden；
@@ -135,10 +135,11 @@ stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 �
   看不到工具）；用户显式关掉的 id（非安装默认）整批拒绝、不改状态；
 - 回收站恢复过**恢复同意门**：恢复的包在已初始化 scope 重新落回默认禁用
   （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；**声明凭据的 MCP 包**
-  （manifest `secret_env`/`secret_headers` 任一非空，或 `config_fields` 含
-  `secret: true` 条目——不限于技能组合包；bin 侧 manifest 副本不可读时同向
-  强制；round-27 m8 与 recycle_bin 实现、marketplace-unification.md 三方
-  对齐）在未初始化 scope 走强制变体物化同一门（防供给面零同意上线）；
+  （manifest `secret_env`/`secret_headers` 任一非空、`config_fields` 含
+  `secret: true` 条目、或敏感命名的历史 `env` 键（`is_sensitive_key_name`，
+  round-28 补第四腿）——不限于技能组合包；bin 侧 manifest 副本不可读时同向
+  强制；与 recycle_bin 实现、marketplace-unification.md 对齐）在未初始化
+  scope 走强制变体物化同一门（防供给面零同意上线）；
   门持久化失败
   在消费回收站条目之前报错，恢复可重试。注意两个上报信号的方向（round-24
   MAJOR 5 文档勘误，此前一句写反）：`blocked` 整批判拒只对**已初始化** scope
@@ -305,10 +306,12 @@ UI 或状态层出 bug 也放不出白名单外能力。已知开放侧翼：CLI
 #279 遗留、按 `marketplace-unification.md` Phase 4 承诺登记于此：
 
 - **OAuth 远程包 readiness 恒 Ready**：远程 OAuth MCP 包（manifest `servers`
-  非空）没有必填凭据声明——`tool_credentials` 只收敛
-  `config_fields`（仅 `secret: true` 条目，`secrets.rs`）/`secret_env`/
-  `secret_headers`，不含 `servers`
-  （`bundle.rs`），而 `readiness_for` 对 Mcp/Bundle 只查 credentials 必填项
+  非空）没有必填凭据声明——`tool_credentials` 收敛全部三路声明
+  （`config_fields` 各条目按其 `required` 标记，`secret: false` 也计入；
+  `secret_env`；`secret_headers`），不含 `servers`（`bundle.rs`；round-28
+  MAJOR 2 勘误：round-27 m8 曾把「仅 secret:true」的 `manifest_secret_targets`
+  过滤误归到此函数——那是恢复同意门的凭据探测，另一条收敛路径），而
+  `readiness_for` 对 Mcp/Bundle 只查 credentials 必填项
   是否在系统凭据存储，因此远程包恒报 Ready。**无法用 readiness 门控 OAuth
   授权是否完成**；授权态由 `connect`（flow=oauth）流程自理，UI 只能依赖
   `oauth` 标记打徽标，不能给「未授权」态。
