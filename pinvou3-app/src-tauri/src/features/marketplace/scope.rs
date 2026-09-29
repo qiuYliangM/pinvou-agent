@@ -72,6 +72,19 @@ pub struct DisabledBundlesFile {
     /// back to DenyAll (default fully off).
     #[serde(default)]
     pub plain_defaults_migrated: bool,
+    /// Round-31 BLOCKER (review #455): ledger of `"<scope>:<pack>"` pairs whose
+    /// install-default row the install/connect/startup sync has successfully
+    /// persisted in an initialized DenyAll scope. The startup connector-gate
+    /// refresh pushes rows only for pairs **absent** here: "user enabled" and
+    /// "never synced" are observably identical on current state alone (both =
+    /// skills materialized + row absent), so a plain membership push re-added
+    /// the row at every boot and silently reverted explicit enables. A later
+    /// user enable removes the stored row while this entry survives — its
+    /// presence is exactly the "sync already ran once" fact. Teardown
+    /// ([`remove_bundle_from_disabled_scopes_exact`]) clears the pack's
+    /// entries so a fresh install / reconnect re-syncs default-off.
+    #[serde(default)]
+    pub install_default_synced: Vec<String>,
     /// 未知键原样保留（前向兼容）。
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
@@ -566,6 +579,13 @@ pub fn resolve_pack_owner_id(raw_id: &str) -> String {
 /// 按独立技能 id 落库，MCP 后装则认领翻转到包 id——只在写时归一会让用户的
 /// 「关/隐藏」在认领翻转后静默失效（F4）；读时归一让门控跟随技能本体。
 fn normalize_stored_pkg_ids(ids: &[String]) -> Vec<String> {
+    // Round-31 perf (review #455 ledger, "the cheapest win"): the empty input
+    // is the common shape for fresh/minimal stores — the full manifest walk
+    // (available_tools) ran even for it on every resolve call; the empty
+    // result is the answer without consulting any manifest.
+    if ids.is_empty() {
+        return Vec::new();
+    }
     let tools = MarketplaceManager::new().available_tools();
     normalize_stored_pkg_ids_with(&tools, ids)
 }
@@ -1221,6 +1241,26 @@ pub fn save_disabled_bundles(ids: &[String]) {
 /// persisted"). Callers surface the error after their own success commit; a
 /// retry of the sync is safe (idempotent membership push).
 pub fn sync_deny_all_scopes_after_install(raw_id: &str) -> Result<(), String> {
+    sync_deny_all_scopes_inner(raw_id, false)
+}
+
+/// The STARTUP connector-gate-refresh variant (round-31 BLOCKER, review
+/// #455): LEDGER-GATED — pushes rows only for `(scope, pack)` pairs that no
+/// sync ever recorded. For a connected connector the refresh's `show` is
+/// always true (the legacy disable flags are read-only), so a plain
+/// membership push here re-added the row a user enable had removed at every
+/// boot, silently reverting explicit enables. The ledger entry survives the
+/// user's later enable (which removes the stored row, not this fact);
+/// ledger absence is exactly the never-synced cohort the backfill targets.
+/// The install/connect variant stays deliberately un-gated: connecting is a
+/// user action with fresh-install semantics ("等同新装") and re-arms the
+/// default-off — both variants record the ledger pair, so this refresh
+/// never undoes what either of them wrote.
+pub fn sync_deny_all_scopes_refresh(raw_id: &str) -> Result<(), String> {
+    sync_deny_all_scopes_inner(raw_id, true)
+}
+
+fn sync_deny_all_scopes_inner(raw_id: &str, ledger_gated: bool) -> Result<(), String> {
     let package_id = to_package_id(raw_id);
     let _guard = DISABLED_BUNDLES_FILE_LOCK
         .lock()
@@ -1235,6 +1275,10 @@ pub fn sync_deny_all_scopes_after_install(raw_id: &str) -> Result<(), String> {
         if !file.initialized.contains(key) {
             continue;
         }
+        let ledger_key = format!("{key}:{package_id}");
+        if ledger_gated && file.install_default_synced.contains(&ledger_key) {
+            continue;
+        }
         let ids = file.scopes.entry(key.to_string()).or_default();
         if !ids.iter().any(|id| id == &package_id) {
             ids.push(package_id.clone());
@@ -1245,6 +1289,13 @@ pub fn sync_deny_all_scopes_after_install(raw_id: &str) -> Result<(), String> {
             if !defaults.iter().any(|id| id == &package_id) {
                 defaults.push(package_id.clone());
             }
+            changed = true;
+        }
+        // Recorded even when the row already existed — the ledger answers
+        // "did a sync ever run for this pair", which is what keeps the
+        // STARTUP refresh from re-adding a lifted row later.
+        if !file.install_default_synced.contains(&ledger_key) {
+            file.install_default_synced.push(ledger_key);
             changed = true;
         }
     }
@@ -1337,6 +1388,17 @@ pub fn remove_bundle_from_disabled_scopes_exact(package_id: &str) -> Result<(), 
         defaults.retain(|id| id != package_id);
         changed |= defaults.len() != before;
     }
+    // Round-31 BLOCKER (review #455): teardown also clears the pack's
+    // install-default sync ledger entries, so a fresh install / reconnect
+    // re-syncs default-off. This is the TEARDOWN-only hook: the composer
+    // enable path rewrites the scope lists wholesale and deliberately does
+    // NOT come through here — a user enable must keep the ledger entry
+    // (that is what makes the enable sticky against the startup refresh).
+    let ledger_prefix = format!(":{package_id}");
+    let before_ledger = file.install_default_synced.len();
+    file.install_default_synced
+        .retain(|entry| !entry.ends_with(&ledger_prefix));
+    changed |= file.install_default_synced.len() != before_ledger;
     if changed {
         try_save_disabled_bundles_file(&file)?;
     }

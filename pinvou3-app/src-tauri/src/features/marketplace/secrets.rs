@@ -296,8 +296,29 @@ impl<S: CredentialStore> MarketplaceManager<S> {
         // holds).
         let mut rebuilt: HashMap<String, String> = HashMap::new();
         for tool_id in installed {
-            let Some(manifest) = self.load_manifest(&tool_id) else {
-                continue;
+            let manifest = match self.load_manifest(&tool_id) {
+                Some(manifest) => manifest,
+                None => {
+                    let manifest_path =
+                        super::mcp_catalog::package_mcp_dir(&tool_id).join("manifest.json");
+                    if manifest_path.exists() {
+                        // Round-31 m1 (review #455): the manifest EXISTS but
+                        // could not be loaded (AV lock / transient parse
+                        // failure — the codebase itself documents AV briefly
+                        // holding files). Returning Ok here would evict this
+                        // tool's secrets in the final swap (silent unresolved
+                        // `${ENV}` → silent 401s) while the contract above
+                        // claims nothing is cleared until the whole rebuild
+                        // succeeds. Fail the rebuild: the previous registry
+                        // stays intact and the next boot retries.
+                        return Err(format!(
+                            "manifest for installed tool '{tool_id}' exists but could not be loaded; keeping the previous secret registry"
+                        ));
+                    }
+                    // Genuinely absent (registry/dir skew): the tool is not
+                    // on disk — it has no secrets to rehydrate.
+                    continue;
+                }
             };
             for (target, key) in manifest_secret_targets(&manifest) {
                 let reference = mcp_secret_reference(&tool_id, &target, &key);
@@ -305,7 +326,23 @@ impl<S: CredentialStore> MarketplaceManager<S> {
                     Ok(Some(value)) if !value.trim().is_empty() => {
                         rebuilt.insert(mcp_secret_env_var(&key), value);
                     }
-                    Ok(_) => {}
+                    Ok(value) => {
+                        // Round-31 m2 (review #455): a successful read with
+                        // nothing stored while the OS keyring is unreachable
+                        // is the UndeterminableMiss classification (the
+                        // credential may sit in the keyring) — the
+                        // SecretResolveError doctrine's own words. A hard Err
+                        // would fail every boot rehydration on a keyring-less
+                        // host, so: warn and skip; the placeholder resolves
+                        // empty until the keyring returns.
+                        if value.is_none()
+                            && self.credential_store.os_keyring_unreachable(&reference)
+                        {
+                            log::warn!(
+                                "[marketplace] MCP tool '{tool_id}' secret {key} was not found while the OS keyring is unreachable; the credential may live in the keyring — skipped this rehydration"
+                            );
+                        }
+                    }
                     Err(e) => return Err(mcp_secret_store_error(&tool_id, &key, e)),
                 }
             }

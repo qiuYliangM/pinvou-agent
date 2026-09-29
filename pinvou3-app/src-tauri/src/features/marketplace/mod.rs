@@ -544,7 +544,7 @@ pub use crate::features::marketplace::scope::save_disabled_bundles;
 pub use crate::features::marketplace::scope::{
     load_disabled_bundles, load_disabled_bundles_for, load_hidden_bundles_for,
     remove_bundle_from_disabled_scopes, save_disabled_bundles_for, save_hidden_bundles_for,
-    sync_deny_all_scopes_after_install, unavailable_bundles_for,
+    sync_deny_all_scopes_after_install, sync_deny_all_scopes_refresh, unavailable_bundles_for,
 };
 
 /// 按会话类型 scope 持久化连接器禁用列表并刷新技能目录。

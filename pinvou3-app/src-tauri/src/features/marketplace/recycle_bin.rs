@@ -569,12 +569,24 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
     // 自身副本不会被误判为他包副本。
     let recycled_skills_dir = bin.root.join(pkg_id).join("skills");
     if recycled_skills_dir.is_dir() {
-        let mut skill_names: Vec<String> = std::fs::read_dir(&recycled_skills_dir)
+        let mut skill_names: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&recycled_skills_dir)
             .map_err(|e| format!("读取 {} 失败: {e}", recycled_skills_dir.display()))?
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        {
+            // Round-31 m3 (review #455): propagate mid-scan entry/type errors —
+            // `.flatten()` + `unwrap_or(false)` silently skipped skills, and a
+            // collision missed here would double-materialize the same skill.
+            // Errors before take_back keep the bin entry: retry stays real.
+            let entry =
+                entry.map_err(|e| format!("遍历 {} 失败: {e}", recycled_skills_dir.display()))?;
+            if entry
+                .file_type()
+                .map_err(|e| format!("读取 {} 类型失败: {e}", entry.path().display()))?
+                .is_dir()
+            {
+                skill_names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
         skill_names.sort();
         for name in &skill_names {
             super::skill_marketplace::ensure_skill_restorable(name)?;
@@ -588,9 +600,21 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
     // take_back. A later install_upload failure still rolls the entry back
     // with the gate already written (consistent: bin + disabled).
     let mut consent_ids = vec![pkg_id.to_string()];
-    if let Ok(rd) = std::fs::read_dir(recycled_skills_dir.as_path()) {
-        for entry in rd.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    if recycled_skills_dir.is_dir() {
+        // Round-31 m3 (review #455): the gate's skill enumeration must not
+        // swallow root/entry/type errors either (`if let Ok` + `.flatten()`
+        // silently narrowed the consent cohort); a failure here is before
+        // take_back, so the bin entry stays and the retry is real.
+        for entry in std::fs::read_dir(recycled_skills_dir.as_path())
+            .map_err(|e| format!("读取 {} 失败: {e}", recycled_skills_dir.display()))?
+        {
+            let entry =
+                entry.map_err(|e| format!("遍历 {} 失败: {e}", recycled_skills_dir.display()))?;
+            if entry
+                .file_type()
+                .map_err(|e| format!("读取 {} 类型失败: {e}", entry.path().display()))?
+                .is_dir()
+            {
                 consent_ids.push(entry.file_name().to_string_lossy().into_owned());
             }
         }

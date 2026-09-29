@@ -1085,12 +1085,16 @@ pub fn import_plugin_package(
             }
             // Round-26 minor 5 (review #455): when the rollback itself failed,
             // the landed dir stayed live with zero consent — the user-facing
-            // error must carry that, not just the log line.
+            // error must carry that, not just the log line. Round-31 m7
+            // (review #455): the suffix is diff-authored user-visible copy —
+            // English sibling-form (like the surrounding English-language
+            // skill_gate/ima errors), not CJK that would surface raw to
+            // en/ja users.
             let suffix = if rolled_back {
                 String::new()
             } else {
                 format!(
-                    "；目录回滚也失败了，已落地的 {id} 目录仍以零同意状态留在磁盘上，请检查后手动删除或重试导入: {pkg_dir:?}"
+                    "; the directory rollback also failed: the landed {id} directory is still on disk with zero consent — remove it manually or retry the import: {pkg_dir:?}"
                 )
             };
             return Err(format!("MCP 供给失败（{id}）: {e}{suffix}"));

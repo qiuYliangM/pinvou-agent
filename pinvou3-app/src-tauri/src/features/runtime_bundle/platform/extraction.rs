@@ -539,6 +539,16 @@ impl Pinvou3Bundle {
                 // `bundles/<id>` and defer the residue sweep to the next
                 // startup, the same defer-with-retry contract as the
                 // uninstall-deferred arm above.
+                // Round-31 m4 (review #455): the re-probe alone is
+                // check-then-act — a same-id Upload import landing BETWEEN the
+                // probe and the delete still loses its just-landed unique copy
+                // while its store record says installed. Hold the import lock
+                // for the id across the re-probe + delete pair (the same lock
+                // the import path serializes its landing under), closing the
+                // window instead of narrowing it.
+                let import_lock =
+                    crate::features::marketplace::plugin_import::import_lock_for(tool_id);
+                let _import_guard = import_lock.lock().unwrap_or_else(|p| p.into_inner());
                 if Self::user_upload_record_exists(tool_id) {
                     log::warn!(
                         "[cleanup] retired tool '{tool_id}': an Upload record for the same id \
