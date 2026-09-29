@@ -442,6 +442,16 @@ fn quarantine_and_recover_disabled_bundles(raw: &[u8], error: &str) -> DisabledB
 /// through `load_disabled_bundles_file_locked` → save, so persisting here
 /// converges the whole file.
 fn normalize_stored_lists(file: &mut DisabledBundlesFile) -> bool {
+    // Round-27 m9 (review #455): the walk is skipped entirely when every
+    // stored list is empty — the all-empty state is the common shape for
+    // fresh/minimal installs, and a full manifest walk per load there was a
+    // pure regression vs base (it multiplies across every consumer).
+    if file.scopes.values().all(|v| v.is_empty())
+        && file.hidden_scopes.values().all(|v| v.is_empty())
+        && file.default_off_scopes.values().all(|v| v.is_empty())
+    {
+        return false;
+    }
     // Round-24 MAJOR 3 (related cheaper hoist): one manifest walk serves every
     // non-empty list on the file — the per-list normalize re-parsed all
     // manifests once per list on every load.

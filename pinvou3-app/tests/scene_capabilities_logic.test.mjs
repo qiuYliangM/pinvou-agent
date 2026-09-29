@@ -277,11 +277,12 @@ async function runDenyAllOptInScenarios() {
       ],
       skills: ['government-writing'],
       disabled: ['other-pack'],
-      // Round-26 minor 10 (review #455): the owner-normalization leg also
-      // feeds the hidden set — a regression that owner-maps disabledIds but
-      // not hiddenIds must fail here, so the fixture carries a hidden owner
-      // entry the batch must un-hide.
-      hidden: ['other-pack', 'unrelated-pack'],
+      // Round-27 m10 (review #455): the hidden set carries the COMPANION id —
+      // it needs owner mapping, so a regression that owner-maps the disabled
+      // leg but not the hidden leg must fail here (the round-26 fixture's
+      // owner-id hidden entry could not discriminate that). The unrelated
+      // entry must survive the mapped-owner un-hide.
+      hidden: ['government-writing', 'unrelated-pack'],
     });
     const prepared = await prepareSceneCapabilities({ pinvouScene: 'work:document-writing' }, invoke);
     assert.strictEqual(prepared.ok, true, 'the mapped owner opt-in must let the send proceed');
@@ -292,9 +293,9 @@ async function runDenyAllOptInScenarios() {
     );
     assert.strictEqual(state.disabled.has('other-pack'), false, 'the owner pack is opted in');
     assert.strictEqual(
-      state.hidden.has('other-pack'),
+      state.hidden.has('government-writing'),
       false,
-      'the owner pack is un-hidden by the same normalized batch',
+      'the hidden COMPANION id is un-hidden through its mapped owner (hidden leg is owner-mapped too)',
     );
     assert.strictEqual(
       state.hidden.has('unrelated-pack'),

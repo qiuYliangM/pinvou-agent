@@ -1052,7 +1052,6 @@ pub fn import_plugin_package(
     // → store file_lock），同 id 的导入与编辑因此真正互斥，无「读备份 → 写
     // SKILL.md」窗口被重导入插队的竞态。
     let store = super::store::BundleStore::new();
-    super::skill_marketplace::rebaseline_skill_desc_backup(&store, &id, "统一导入");
     // 供给：MCP 组件走 install 管线写 mcp.json + installed.json（底座据此拉起 server，
     // 工具才能注册可用）。纯 skill 包无 mcp/ 目录，跳过（技能走物化通道）。
     // 注：旧 spanner 供给路径已删除；skill 包无可执行供给（tools[]/runtime 协议
@@ -1096,6 +1095,11 @@ pub fn import_plugin_package(
             return Err(format!("MCP 供给失败（{id}）: {e}{suffix}"));
         }
     }
+    // Round-27 m5 (review #455): rebaseline (consume) the description backup
+    // only after supply succeeded — on a moved_old rollback the old files are
+    // restored, so the restore point must survive for the next attempt; the
+    // ordering comment's justification now matches the failure path.
+    super::skill_marketplace::rebaseline_skill_desc_backup(&store, &id, "统一导入");
     if moved_old {
         let _ = std::fs::remove_dir_all(&backup);
     }
@@ -1554,13 +1558,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 供给失败不得绕过重基线（位置契约回归钉）：统一导入在 rename 成功后
-    /// 立即重基线、早于任何可失败的供给步骤。v2 附 mcp/manifest.json 触发
-    /// 供给，并预置形状损坏的 mcp.json（合法 JSON 但 servers 非对象）令
-    /// add_to_mcp_json 确定性失败——导入返回 Err 后，旧包说明备份必须已被
-    /// 丢弃，磁盘包目录已是 v2 内容。若未来把重基线挪回供给之后，本测试必红。
+    /// 说明备份与供给失败的顺序契约（round-27 m5 语义，review #455）：重基线
+    /// 只在新内容**留存**时发生——moved_old 回滚把旧版文件还原后，旧包的说明
+    /// 备份必须幸存（它正是旧内容的有效还原点；round-24 版本曾把重基线放在
+    /// 供给之前，回滚会把还原点提前丢掉）。v2 附 mcp/manifest.json 触发供给，
+    /// 并预置形状损坏的 mcp.json（合法 JSON 但 servers 非对象）令
+    /// add_to_mcp_json 确定性失败——导入返回 Err、旧版还原后，备份必须仍是
+    /// 旧值；随后成功导入新版本时重基线照常消费备份。
     #[test]
-    fn unified_import_rebaselines_backup_even_when_supply_fails() {
+    fn unified_import_keeps_backup_through_supply_failure_rollback() {
         use std::io::Write;
         let _g = crate::platform::paths::tests::ENV_LOCK
             .lock()
@@ -1624,11 +1630,13 @@ mod tests {
             .expect_err("MCP 供给必须失败");
         assert!(err.contains("MCP 供给失败"), "失败须来自供给步骤: {err}");
 
-        // 回归点：供给失败早退不得绕过重基线——备份已丢弃，磁盘已是 v2。
+        // Round-27 m5 回归点：moved_old 回滚还原了旧版文件——说明备份必须
+        // 幸存（还原点与还原后的旧内容一致；若在此处丢弃，重试导入前的一次
+        // 清覆盖恢复将没有还原点可用）。
         assert_eq!(
-            store.skill_desc_backup("greet").unwrap(),
-            None,
-            "供给失败时重基线必须已发生（否则清覆盖会把旧包描述写进新包）"
+            store.skill_desc_backup("greet").unwrap().as_deref(),
+            Some("orig1"),
+            "供给失败回滚后备份必须幸存（旧内容仍以还原点保护）"
         );
         // Round-24 MAJOR 2：供给失败不得残留已落地的无登记目录——其技能会以
         // 零同意进入每个已初始化 scope（本次为首次安装路径，无旧版本可还原，

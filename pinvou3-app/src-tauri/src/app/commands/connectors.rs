@@ -83,7 +83,10 @@ pub async fn get_bundle_visibility(scope: Option<String>) -> Result<Vec<String>,
 /// contract that held only because both JS callers checked the payload.
 #[derive(serde::Serialize)]
 pub struct EnablePackagesOutcome {
-    /// The batch was applied and persisted (hot-refresh followed).
+    /// The batch was applied and persisted with full per-id coverage (round-27
+    /// m10: the hot refresh is gated on the domain `state_changed`, not this
+    /// flag — a mixed batch or a hidden-only un-hide persists state while this
+    /// reads false).
     pub enabled: bool,
     /// Non-empty = refused: these ids sit in the scope's **explicit** user
     /// switch state (install-default offs lift freely, round-11 B2); nothing
@@ -304,7 +307,9 @@ async_command_passthrough!(tmeet_domain, tmeet_skills_state() -> Result<Value, S
 /// 随目录变化，四轮评审 M-6a）。失败分两态（round-26 minor 4 修正措辞）：域层
 /// 安装/凭据前的失败 = 技能未装上，本就不需重写；**同意状态持久化失败** = 技能
 /// 已装上但命令以 Err 返回且跳过本函数的重写——前端经 imaSkillsFailed 模板给出
-/// 手动关闭指引，残留为 stale-deny 方向（fail-safe，见 domain 层注释）。
+/// 手动关闭指引。残留方向是 **stale-allow**（同意行未持久化 → 已初始化 scope 的
+/// 新会话默认开启该包；与 domain 层错误文案一致；round-27 m1 修正方向措辞），
+/// 由前端指引与 DenyAll 未初始化兜底共同收口，非 fail-safe。
 // The disallowed hot-refresh is required since the native-tool ownership gate:
 // the freshly installed package flips `ima_openapi` from denied to admitted
 // for DenyAll scopes' explicit-enable path, and online engines must see it.

@@ -176,6 +176,16 @@ pub(crate) fn skill_gating_owner_with(tools: &[super::ToolManifest], skill_name:
     if let Ok(rd) = std::fs::read_dir(crate::platform::paths::bundles_root()) {
         let mut owners: Vec<String> = rd
             .flatten()
+            // Round-27 m4 (review #455): skip import staging (`<id>.tmp`) and
+            // landing backup (`<id>.old`) dirs — the same exclusion the two
+            // lenses this fallback shares with (materialization's
+            // `skill_source_dirs`, the expansion disk leg) already apply; a
+            // crash-residue staging dir could otherwise win the sorted-first
+            // race and render its skills ungated under the suffix owner id.
+            .filter(|pkg| {
+                let name = pkg.file_name().to_string_lossy().into_owned();
+                !name.ends_with(".tmp") && !name.ends_with(".old")
+            })
             .filter(|pkg| pkg.path().join("skills").join(skill_name).is_dir())
             .filter_map(|pkg| pkg.file_name().into_string().ok())
             .collect();

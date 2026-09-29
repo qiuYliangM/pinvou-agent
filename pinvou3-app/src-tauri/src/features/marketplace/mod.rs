@@ -1510,8 +1510,17 @@ impl<S: CredentialStore> MarketplaceManager<S> {
             if !unavailable.contains(&skill_id) {
                 continue;
             }
+            // Round-27 MAJOR 1 (review #455): snapshot the owner pack BEFORE
+            // the uninstall attempt — a failed/swallowed uninstall keeps the
+            // dir in place (the normalized form would then erase a
+            // still-installed skill's rows), and a mid-loop aborted deletion
+            // can leave a foreign pack's nesting that the post-deletion
+            // fallback would re-own the id onto (erasing THAT pack's rows).
+            // Exact form with the pre-teardown snapshot; the best-effort
+            // swallow stays per this leg's policy.
+            let owner = scope::resolve_pack_owner_id(&skill_id);
             let _ = skill_marketplace::SkillMarketplaceManager::new().uninstall(&skill_id);
-            if let Err(e) = scope::remove_bundle_from_disabled_scopes(&skill_id) {
+            if let Err(e) = scope::remove_bundle_from_disabled_scopes_exact(&owner) {
                 log::warn!(
                     "[marketplace] persisting the post-uninstall switch cleanup for companion skill '{skill_id}' of {tool_id} failed (stale entries would be inherited by a same-id reinstall): {e}"
                 );

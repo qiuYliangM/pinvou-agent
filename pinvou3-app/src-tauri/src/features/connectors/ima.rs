@@ -385,12 +385,11 @@ pub async fn ima_logout() -> Result<Value, String> {
         // uninstall failure instead; the logout stays retryable (the consent
         // rows and the pack dir are both intact).
         //
-        // Round-26 MAJOR 1 (review #455): snapshot the owner pack while
-        // `bundles/` still holds the skill — after the deletion the
-        // normalized cleanup's gating fallback could be hijacked by a foreign
-        // pack's claim and erase THAT pack's consent rows.
-        let ima_pack_owner =
-            crate::features::marketplace::scope::resolve_pack_owner_id(IMA_SKILL_ID);
+        // Round-26 MAJOR 1 (review #455) / round-27 m2: `IMA_SKILL_ID` is
+        // itself the pack id — the exact cleanup consumes it verbatim. No
+        // `resolve_pack_owner_id` snapshot: on a retry after a partial logout
+        // the dir is absent and the fallback could remap the literal onto a
+        // foreign claim, making the "snapshot" itself the hijack vector.
         if let Err(e) = SkillMarketplaceManager::new().uninstall(IMA_SKILL_ID) {
             return Err(format!(
                 "ima logout: skill uninstall failed — the pack stays installed and its consent rows are unchanged; retry: {e}"
@@ -403,7 +402,7 @@ pub async fn ima_logout() -> Result<Value, String> {
         // 告警降级（stale-deny 方向本就 fail-safe）——否则清理在凭据已删后
         // 失败会让登出永久报错（每次重试都在同一步失败）。
         let cleanup_result = crate::features::marketplace::scope::
-            remove_bundle_from_disabled_scopes_exact(&ima_pack_owner);
+            remove_bundle_from_disabled_scopes_exact(IMA_SKILL_ID);
         if let Err(e) = &cleanup_result {
             log::warn!(
                 "[ima] logout consent-cleanup persist failed (the residue is stale-deny, fail-safe): {e}"

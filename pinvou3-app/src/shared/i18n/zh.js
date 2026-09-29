@@ -613,7 +613,7 @@ dictZh.uiToolDetails.flow = {
   openBrowser:'在浏览器打开 ↗', connectionIncomplete:'连接未完成', close:'关闭', retry:'重试',
 };
 
-dictZh.uiToolDetails.actions = { connectedTmeet:'已连接腾讯会议', enabled:'已连接。工具开关默认关闭，可在输入框工具列表中开启', disconnectedTmeet:'已断开腾讯会议', connectingIma:'正在连接「腾讯 ima」', validatingIma:'正在校验 OpenAPI 凭证…', connectedIma:'已连接「腾讯 ima」', imaEnabled:'IMA 已连接。工具开关默认关闭，可在输入框工具列表中开启。', imaFailed:'IMA 连接失败', imaSkillsFailed:err=>`IMA 已连接，但技能同意状态保存失败，新会话将默认开启这些技能；请在输入框工具列表中手动关闭：${err}`, disconnectedIma:'已断开「腾讯 ima」', operationFailed:'操作失败，请重试' };
+dictZh.uiToolDetails.actions = { connectedTmeet:'已连接腾讯会议', enabled:'已连接。工具开关默认关闭，可在输入框工具列表中开启', disconnectedTmeet:'已断开腾讯会议', connectingIma:'正在连接「腾讯 ima」', validatingIma:'正在校验 OpenAPI 凭证…', connectedIma:'已连接「腾讯 ima」', imaEnabled:'IMA 已连接。工具开关默认关闭，可在输入框工具列表中开启。', imaFailed:'IMA 连接失败', imaSkillsFailed:err=>`IMA 连接未完成：技能已安装，但同意状态保存失败，本次连接已回滚（需重新连接）；重连后如技能默认开启，请在输入框工具列表中手动关闭：${err}`, disconnectedIma:'已断开「腾讯 ima」', operationFailed:'操作失败，请重试' };
 
 dictZh.uiToolDetails.tmeetSteps = [{key:'runtime',label:'准备运行时',sub:'使用应用自带 Node'},{key:'cli',label:'安装连接组件',sub:'tmeet · 首次约 40 秒'},{key:'qr',label:'扫码登录',sub:'腾讯会议授权页'}];
 

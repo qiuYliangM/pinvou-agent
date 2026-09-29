@@ -3,7 +3,8 @@
 本文档描述 pinvou3 当前的能力治理架构：哪些能力存在、谁决定它们在某个会话
 中可用、运行时如何生效。取代 `tool-governance.md`（v0.9.0 blocklist 时代；
 该文件内容尚未全部并入本文，迁移完成前以其为准的部分仍按原文件执行）与
-`skill-scope-governance-改动说明.md`（PR 验收记录，内容已沉淀于此）。
+`skill-scope-governance-改动说明.md`（PR 验收记录，文件已随 #287 删除，
+内容已沉淀于此）。
 
 > **落地状态**（2026-09-18）：§1、§2 为现状（能力档案已退役，模式能力差量
 > 已收敛为静态表 `MODE_TABLE`）；§3 的存储已收敛为**单一 `disabled_bundles.json`**
@@ -133,10 +134,12 @@ stored 包行）映射到所属包（companion → MCP/CLI 包，独立技能 �
   id」，已初始化 scope 从落盘列表移除，并连带清 hidden（隐藏包即使开关打开也
   看不到工具）；用户显式关掉的 id（非安装默认）整批拒绝、不改状态；
 - 回收站恢复过**恢复同意门**：恢复的包在已初始化 scope 重新落回默认禁用
-  （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；声明凭据的组合包（manifest
-  三路凭据声明任一非空；bin 侧 manifest 副本不可读时同向强制，round-26 minor 11
-  与 marketplace-unification.md 对齐）在未初始化 scope 走强制变体物化同一门
-  （防供给面零同意上线）；门持久化失败
+  （带安装默认标记，欢迎卡/场景 opt-in 可抬起）；**声明凭据的 MCP 包**
+  （manifest `secret_env`/`secret_headers` 任一非空，或 `config_fields` 含
+  `secret: true` 条目——不限于技能组合包；bin 侧 manifest 副本不可读时同向
+  强制；round-27 m8 与 recycle_bin 实现、marketplace-unification.md 三方
+  对齐）在未初始化 scope 走强制变体物化同一门（防供给面零同意上线）；
+  门持久化失败
   在消费回收站条目之前报错，恢复可重试。注意两个上报信号的方向（round-24
   MAJOR 5 文档勘误，此前一句写反）：`blocked` 整批判拒只对**已初始化** scope
   的落盘 opt-out 有定义（未初始化 scope 物化的是现算扩集，不存在可对抗的
@@ -303,7 +306,8 @@ UI 或状态层出 bug 也放不出白名单外能力。已知开放侧翼：CLI
 
 - **OAuth 远程包 readiness 恒 Ready**：远程 OAuth MCP 包（manifest `servers`
   非空）没有必填凭据声明——`tool_credentials` 只收敛
-  `config_fields`/`secret_env`/`secret_headers`，不含 `servers`
+  `config_fields`（仅 `secret: true` 条目，`secrets.rs`）/`secret_env`/
+  `secret_headers`，不含 `servers`
   （`bundle.rs`），而 `readiness_for` 对 Mcp/Bundle 只查 credentials 必填项
   是否在系统凭据存储，因此远程包恒报 Ready。**无法用 readiness 门控 OAuth
   授权是否完成**；授权态由 `connect`（flow=oauth）流程自理，UI 只能依赖
