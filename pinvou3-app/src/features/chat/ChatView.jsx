@@ -770,16 +770,6 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       const activeSessionId = bs ? bs.activeSessionId : null;
       const activeSessionIdRef = useRef(activeSessionId);
       activeSessionIdRef.current = activeSessionId;
-      // Round-29 m8 (review #455): the scene-capability banner/toast slot is
-      // composer-global but its state is per-send; clear it on every session
-      // switch so a settled banner never bleeds into the next conversation.
-      // Async writers are additionally suppressed by their send-start
-      // session guard inside sendChatMessage (a slow welcome enable settling
-      // after the switch would otherwise re-render here).
-      useEffect(() => {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously clear the per-send banner/toast when the session switches (same reset family as the design-element and back-to-bottom resets)
-        setSceneCapabilityStatus(null);
-      }, [activeSessionId]);
       const computerUseCopy = t.uiComputerUse;
       const computerUseSlice = (bs && bs.computerUse) || null;
       // Fetch the authoritative computer-use state on session mount/switch: the banner and
@@ -1883,6 +1873,20 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         // otherwise a leftover tool card would displace the "Hello" greeting.
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deps reviewed manually: setJustInstalledTool is a parent one-shot directive callback; adding it would retrigger clearing on parent rerenders
       }, [justInstalledTool, activeSessionId, draftEpoch]);
+
+      // Round-29 m8 + round-30 m8 (review #455): clear the per-send
+      // scene-capability banner/toast on session switch AND on "New chat"
+      // while already in draft (draftEpoch increments on the click while
+      // activeSessionId stays null→null — the exact case the welcome-card
+      // reset above documents), so a settled banner never bleeds into the
+      // next conversation or the fresh draft. Async writers are additionally
+      // suppressed by their send-start session guard inside sendChatMessage
+      // (a slow welcome enable settling after the switch would otherwise
+      // re-render here).
+      useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously clear the per-send banner/toast when the session or draft epoch changes (same reset family as the design-element and back-to-bottom resets)
+        setSceneCapabilityStatus(null);
+      }, [activeSessionId, draftEpoch]);
 
 
       // chip 显示当前会话绑定的模型:切会话/草稿时刷新 currentSessionModelId

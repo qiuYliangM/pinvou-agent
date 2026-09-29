@@ -1844,7 +1844,17 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           setAlert({
             visible: true, loading: false,
             title: detailCopy.actions.imaFailed,
-            subtitle: consentFailure ? detailCopy.actions.imaSkillsFailed(msg.slice(0, 220)) : detailCopy.actions.operationFailed,
+            // Round-30 m9 (review #455): gate the raw tail like the sibling
+            // tmeet card masks err below — zh keeps the diagnostic text
+            // (showRawErrors), en/ja get the localized generic in its place,
+            // so one card no longer shows raw backend text while the other
+            // masks translated guidance. The en/ja guidance-copy exemption
+            // itself stays in the registered i18n sweep (PR body).
+            subtitle: consentFailure
+              ? detailCopy.actions.imaSkillsFailed(
+                detailCopy.showRawErrors ? msg.slice(0, 220) : detailCopy.actions.operationFailed,
+              )
+              : detailCopy.actions.operationFailed,
             isInstall: false, isError: true,
           });
         } finally {
