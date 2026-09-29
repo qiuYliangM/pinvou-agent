@@ -324,11 +324,16 @@ UI 或状态层出 bug 也放不出白名单外能力。已知开放侧翼：CLI
 - **丢失存储臂（round-30 m4，评审 #455）**：`installed.json` 被**删除**（非损坏——损坏已
   fail-closed）且 `mcp.json` 仍记有 server 条目时，`read_installed` 把 NotFound 判为
   「确认空注册表」，registry 腿为空而磁盘腿对纯 MCP 包失明 ⇒ 未初始化 plain scope 中
-  该包工具被放行。触发需外部破坏存储文件；与 `sessions/` 信号的丢失处置不对称
+  该包工具被放行。**round-31 m9 更正：该开口与模式无关**（expansion 对
+  plain/code 同构，`session_mode.rs`）——未初始化 **code** scope 同样受影响，非
+  plain 独有。触发需外部破坏存储文件；与 `sessions/` 信号的丢失处置不对称
   （后者有 `.corrupt.*`/`.unreadable.*` 兄弟证据的 fail-closed 恢复臂，scope.rs
   丢失存储恢复——该分支**刻意跳过 legacy 迁移**，兄弟证据证明统一期存储存在过，
   其搁置的判定不可知，宁全关不翻全开）。收敛方向：NotFound 时从 `mcp.json` 重建
-  id，或在此登记为外部破坏下的已知限制（现按后者登记）。
+  id，或在此登记为外部破坏下的已知限制（现按后者登记）。§7 清单同时补记
+  **companion 技能同意同步吞错**（round-31 m9）：uninstall 事务内的 companion
+  循环对同步失败按 log-only 继续（commands/marketplace.rs），已披露的
+  companion-loop 例外——失败方向为残留禁用（fail-closed），与 #515 家族同簿。
 - 会话中关闭的上下文不可撤回边界（§3.3 末）、
   CLI 包真实执行面经 `bash` 的开放侧翼（§5 末）。
 
