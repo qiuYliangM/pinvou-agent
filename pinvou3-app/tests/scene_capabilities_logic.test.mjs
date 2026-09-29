@@ -277,6 +277,11 @@ async function runDenyAllOptInScenarios() {
       ],
       skills: ['government-writing'],
       disabled: ['other-pack'],
+      // Round-26 minor 10 (review #455): the owner-normalization leg also
+      // feeds the hidden set — a regression that owner-maps disabledIds but
+      // not hiddenIds must fail here, so the fixture carries a hidden owner
+      // entry the batch must un-hide.
+      hidden: ['other-pack', 'unrelated-pack'],
     });
     const prepared = await prepareSceneCapabilities({ pinvouScene: 'work:document-writing' }, invoke);
     assert.strictEqual(prepared.ok, true, 'the mapped owner opt-in must let the send proceed');
@@ -286,6 +291,16 @@ async function runDenyAllOptInScenarios() {
       'the companion id must normalize to its mapped owner pack in the enable batch',
     );
     assert.strictEqual(state.disabled.has('other-pack'), false, 'the owner pack is opted in');
+    assert.strictEqual(
+      state.hidden.has('other-pack'),
+      false,
+      'the owner pack is un-hidden by the same normalized batch',
+    );
+    assert.strictEqual(
+      state.hidden.has('unrelated-pack'),
+      true,
+      'an unrelated hidden entry survives the companion opt-in',
+    );
   }
 
   console.log('scene_capabilities_logic deny-all opt-in: ok');
