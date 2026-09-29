@@ -428,8 +428,7 @@ fn quarantine_and_recover_disabled_bundles(raw: &[u8], error: &str) -> DisabledB
         // Cleared by try_save's successful-persist tail.
         *UNREADABLE_ORIGINAL
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(paths::pinvou3_home());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(paths::pinvou3_home());
         return recovered;
     }
     if let Err(save_error) = try_save_disabled_bundles_file(&recovered) {

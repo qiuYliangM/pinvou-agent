@@ -855,10 +855,8 @@ mod tests {
 
             let dirs = skill_source_dirs();
             assert!(
-                !dirs
-                    .iter()
-                    .any(|d| d.to_string_lossy().contains(".tmp")
-                        || d.to_string_lossy().contains(".old")),
+                !dirs.iter().any(|d| d.to_string_lossy().contains(".tmp")
+                    || d.to_string_lossy().contains(".old")),
                 "staging residue must not become a skill source: {dirs:?}"
             );
             assert!(

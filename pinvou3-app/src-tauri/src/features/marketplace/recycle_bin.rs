@@ -1276,7 +1276,10 @@ mod tests {
 
         // Orphan injection: drop the manifest entry, keep the bin dir.
         let bin = RecycleBin::new();
-        assert!(bin.root.join("my-skill").is_dir(), "fixture: bin dir present");
+        assert!(
+            bin.root.join("my-skill").is_dir(),
+            "fixture: bin dir present"
+        );
         {
             let _guard = file_lock();
             let mut manifest = load_locked(&bin.file).unwrap();

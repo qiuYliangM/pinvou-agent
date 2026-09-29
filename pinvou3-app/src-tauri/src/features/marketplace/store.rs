@@ -1212,7 +1212,11 @@ mod tests {
             std::fs::write(good.join(".installed-from"), "pinvou3-marketplace:legacy-a").unwrap();
             let sealed = skills.join("sealed");
             std::fs::create_dir_all(&sealed).unwrap();
-            std::fs::write(sealed.join(".installed-from"), "pinvou3-marketplace:legacy-b").unwrap();
+            std::fs::write(
+                sealed.join(".installed-from"),
+                "pinvou3-marketplace:legacy-b",
+            )
+            .unwrap();
             let sealed_marker = sealed.join(".installed-from");
             std::fs::set_permissions(&sealed_marker, std::fs::Permissions::from_mode(0o000))
                 .unwrap();
