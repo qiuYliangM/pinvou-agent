@@ -2,8 +2,8 @@
 //!
 //! 设计依据：`docs/marketplace-unification.md` §3.1（存储层 BundleRecord）、§4（存储
 //! 布局）、§9（首启一次性导入）。本模块只管 `~/.pinvou3/marketplace/bundles.json`
-//! 的读写与旧布局**登记**；物理目录搬移（`bundles/<id>/`、`assets/cli/`）与旧布局
-//! 删除在后续 PR，本刀一律不动磁盘上的包内容。
+//! 的读写与旧布局**登记**，一律不动磁盘上的包内容；物理搬移与旧布局同名残留
+//! 清理由 connectors 侧 `migrate_legacy_binary` 按 lock 校验执行。
 //!
 //! 纪律（§10）：
 //! - 原子写（tmp + rename，走底座 `write_atomic`）+ 进程内 FILE_LOCK 串行化读-改-写；
@@ -425,7 +425,9 @@ impl BundleStore {
     ///
     /// - **幂等**：`legacy_imported` 闸置位后直接跳过；闸未置位时也只补缺失 id，
     ///   已存在的记录永远保留（用户/新管线写入的赢）。
-    /// - **非破坏性**：只读旧布局、只写 bundles.json；目录搬移与旧布局删除在后续 PR。
+    /// - **非破坏性**：只读旧布局、只写 bundles.json；目录搬移与同名残留清理由
+    ///   connectors 侧 `migrate_legacy_binary` 按 lock 校验执行（boot 序列在
+    ///   本 import 之后；#608）。
     /// - **注册表不可读 = 不导入、不落闸**（review #455 round-23 MAJOR 3）：
     ///   installed.json 存在但不可读时整体报错返回，`legacy_imported` 不置位——
     ///   宁可下次启动重试，也不把一次吞错读取得来的不完整镜像永久烘焙进
@@ -661,7 +663,7 @@ fn collect_legacy_records() -> Result<Vec<BundleRecord>, String> {
     // class the registry conversion closed). A missing legacy dir stays the
     // common Ok(empty) case; only an existing-but-unreadable root errors.
     out.extend(legacy_skill_records()?);
-    out.extend(legacy_cli_records()?);
+    out.extend(legacy_cli_records());
     // id 去重（保序留先）：MCP 包与其同名 companion 技能（pptx↔pptx）会各扫到一次，
     // 终态模型里它们是同一个包（§5.2「一个包 = 一张卡」），MCP 侧记录含凭据声明，
     // 信息更全，故排在前面的 MCP 记录优先。
@@ -762,10 +764,14 @@ fn legacy_skill_records() -> Result<Vec<BundleRecord>, String> {
 /// 内置 CLI 连接器 → Builtin 包记录。安装态判定：companion 技能目录在盘
 /// （连接时才解包）或 CLI 二进制在盘。存量二进制对照 lock 表验 SHA-256：
 /// 匹配 → 正常登记；不匹配/无法校验 → 记 `degraded`（§9.3，
-/// 修复动作 = 重新下载，物理搬移 `assets/cli/` 在后续 PR）。
-/// CLI 腿只做 `is_file` 存在性探测（无 read_dir 根可失败），Result 仅为与
-/// 另两腿的签名对称（round-24 minor 2）。
-fn legacy_cli_records() -> Result<Vec<BundleRecord>, String> {
+/// 修复动作 = 重新下载；旧布局搬移与同名残留清理由 connectors 侧
+/// `migrate_legacy_binary` 按 lock 校验执行（#608））。
+/// CLI 腿只做 `is_file` 存在性探测（无 read_dir 根可失败）——#608 移除了
+/// 仅为与另两腿签名对称而保留的空壳 `Result`（round-24 minor 2 的对称性
+/// 理由随空壳一并失效）；另两腿（registry / skill 扫描）保留 `Result`，
+/// 其 fail-closed 传播是 review #455 round-23 MAJOR 3 / round-29 m4 /
+/// round-30 m6 的契约。
+fn legacy_cli_records() -> Vec<BundleRecord> {
     let skills_dir = paths::bundle_skills_dir();
     let now = now_iso8601();
     let mut out = Vec::new();
@@ -796,7 +802,7 @@ fn legacy_cli_records() -> Result<Vec<BundleRecord>, String> {
             extra: serde_json::Map::new(),
         });
     }
-    Ok(out)
+    out
 }
 
 enum CliAssetState {
