@@ -613,7 +613,7 @@ dictZh.uiToolDetails.flow = {
   openBrowser:'在浏览器打开 ↗', connectionIncomplete:'连接未完成', close:'关闭', retry:'重试',
 };
 
-dictZh.uiToolDetails.actions = { connectedTmeet:'已连接腾讯会议', enabled:'已连接。工具开关默认关闭，可在输入框工具列表中开启', disconnectedTmeet:'已断开腾讯会议', connectingIma:'正在连接「腾讯 ima」', validatingIma:'正在校验 OpenAPI 凭证…', connectedIma:'已连接「腾讯 ima」', imaEnabled:'IMA 已连接。工具开关默认关闭，可在输入框工具列表中开启。', imaFailed:'IMA 连接失败', disconnectedIma:'已断开「腾讯 ima」', operationFailed:'操作失败，请重试' };
+dictZh.uiToolDetails.actions = { connectedTmeet:'已连接腾讯会议', enabled:'已连接。工具开关默认关闭，可在输入框工具列表中开启', disconnectedTmeet:'已断开腾讯会议', connectingIma:'正在连接「腾讯 ima」', validatingIma:'正在校验 OpenAPI 凭证…', connectedIma:'已连接「腾讯 ima」', imaEnabled:'IMA 已连接。工具开关默认关闭，可在输入框工具列表中开启。', imaFailed:'IMA 连接失败', imaSkillsFailed:err=>`IMA 已连接，但技能同意状态保存失败，新会话将默认开启这些技能；请在输入框工具列表中手动关闭：${err}`, disconnectedIma:'已断开「腾讯 ima」', operationFailed:'操作失败，请重试' };
 
 dictZh.uiToolDetails.tmeetSteps = [{key:'runtime',label:'准备运行时',sub:'使用应用自带 Node'},{key:'cli',label:'安装连接组件',sub:'tmeet · 首次约 40 秒'},{key:'qr',label:'扫码登录',sub:'腾讯会议授权页'}];
 
@@ -935,7 +935,7 @@ desktopHint:'请先在桌面端安装 Obsidian 并创建笔记库，然后在这
 { key:'cli', label:'安装连接组件', sub:'dws · 首次约 40 秒' },
 { key:'qr', label:'扫码登录', sub:'钉钉 App 扫一扫' },
   ],
-  connFailed:'连接失败', dingtalkSkillsFailed:err=>`钉钉已授权，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, wecomSkillsFailed:err=>`企业微信已连接，但工具状态保存失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, feishuSkillsFailed:err=>`飞书已连接，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, tmeetSkillsFailed:err=>`腾讯会议已连接，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, tmeetAuthIncomplete:'腾讯会议授权未完成，请完成浏览器登录后重试',
+  connFailed:'连接失败', dingtalkSkillsFailed:err=>`钉钉已连接，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, wecomSkillsFailed:err=>`企业微信已连接，但工具状态保存失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, feishuSkillsFailed:err=>`飞书已连接，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, tmeetSkillsFailed:err=>`腾讯会议已连接，但技能启用失败，新会话将默认开启该工具；请在输入框工具列表中手动关闭：${err}`, tmeetAuthIncomplete:'腾讯会议授权未完成，请完成浏览器登录后重试',
   emptyNoMatch:'未找到匹配的工具', emptyNoInstalled:'还没有已安装的工具', emptyNoTools:'未检索到工具',
   emptyNoMatchHint:'换个关键词试试，或检查一下拼写。', emptyNoInstalledHint:'去商店安装连接器或技能后，会出现在这里。', emptyNoInstalledHintReadonly:'桌面端尚未安装工具或技能。',
   emptyNoToolsHint:'请尝试修改搜索词或查阅 API 开发文档。',

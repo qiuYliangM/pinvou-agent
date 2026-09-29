@@ -1836,7 +1836,17 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           notifyComposerToolsChanged();
         } catch (e) {
           console.error('ima connect failed:', e);
-          setAlert({ visible: true, loading: false, title: detailCopy.actions.imaFailed, subtitle: detailCopy.actions.operationFailed, isInstall: false, isError: true });
+          // Round-25 minor 5: the consent-sync failure copy (with its
+          // "turn them off in the tools list" guidance) was previously
+          // discarded here — surface it through the localized template.
+          const msg = String(e && e.message ? e.message : e);
+          const consentFailure = msg.includes('persisting their default-off consent state failed');
+          setAlert({
+            visible: true, loading: false,
+            title: detailCopy.actions.imaFailed,
+            subtitle: consentFailure ? detailCopy.actions.imaSkillsFailed(msg.slice(0, 220)) : detailCopy.actions.operationFailed,
+            isInstall: false, isError: true,
+          });
         } finally {
           setBusyId((current) => releaseBusy(current, 'ima'));
         }
