@@ -1544,6 +1544,12 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         return () => window.removeEventListener('pinvou:present-artifact', onPresentArtifact);
       }, [activeSessionId, showArtifactsPreview]);
       const draftEpoch = bs ? bs.draftEpoch : 0;
+      // Round-31 m5 (review #455): the async send-flow guards compare the
+      // CURRENT draft epoch at write time; the callback closure would go
+      // stale, so mirror the epoch in a ref (same pattern as
+      // activeSessionIdRef above).
+      const draftEpochRef = useRef(draftEpoch);
+      draftEpochRef.current = draftEpoch;
       // 切换 session / 新建草稿会话时读取各自 working set 里的未发送内容。
       // 从设置、工具商店等页面返回时 ChatView 会重新挂载，初始 state 也从
       // 同一份内存草稿恢复。
@@ -1575,10 +1581,17 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         // must not render its banner (or ready toast) on the wrong
         // session's composer. Capture the session at send start and let
         // only same-session writes through; the switch effect clears the
-        // slot outright.
-        const sceneStatusSession = activeSessionIdRef.current;
+        // slot outright. Round-31 m5: the key is the FULL session identity
+        // (`session:draftEpoch`, the exact key the welcome-card reset
+        // builds) — drafts are both `null` for activeSessionId, so a send
+        // in flight from draft D1 could otherwise still paint into fresh
+        // draft D2 (a new-chat click bumps the epoch while the session id
+        // stays null→null).
+        const sceneStatusSession = `${activeSessionIdRef.current || 'draft'}:${draftEpochRef.current}`;
+        const sceneStatusKeyNow = () =>
+          `${activeSessionIdRef.current || 'draft'}:${draftEpochRef.current}`;
         const setSceneStatusForSession = (status) => {
-          if (activeSessionIdRef.current === sceneStatusSession) {
+          if (sceneStatusKeyNow() === sceneStatusSession) {
             setSceneCapabilityStatus(status);
           }
         };
@@ -1704,7 +1717,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           // The session guard inside the timeout keeps this stale closer
           // from clearing a NEWER session's fresh ready toast.
           window.setTimeout(() => setSceneCapabilityStatus((current) => (
-            current && current.kind === 'ready' && activeSessionIdRef.current === sceneStatusSession
+            current && current.kind === 'ready' && sceneStatusKeyNow() === sceneStatusSession
               ? null
               : current
           )), 1800);
