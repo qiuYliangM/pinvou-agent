@@ -1474,7 +1474,12 @@ impl<S: CredentialStore> MarketplaceManager<S> {
             let _ = self.credential_store.delete(&reference);
             secrets::remove_secret_value(&secrets::mcp_secret_env_var(key));
         }
-        if let Err(e) = remove_bundle_from_disabled_scopes(tool_id) {
+        // Round-26 MAJOR 1 (review #455): `tool_id` is a pack id and this
+        // cleanup runs after the dir is deleted/redeliverable-stripped — the
+        // normalized form's gating fallback could re-own the absent id onto a
+        // foreign pack's claim and erase THAT pack's consent rows. Exact
+        // removal targets only this pack's rows.
+        if let Err(e) = scope::remove_bundle_from_disabled_scopes_exact(tool_id) {
             // Teardown itself returns (): the uninstall commit succeeded, so a
             // failed consent-sync persist cannot roll it back — but it must not
             // vanish (round-17 minor 1): a stale stored entry + marker would
@@ -8406,6 +8411,64 @@ mod tests {
                 Some("legacy-manifest-value"),
                 "the local legacy secret must survive the restart rehydration"
             );
+        });
+    }
+
+    /// Round-25 minor 10 (review #455; the pin was explicitly requested last
+    /// round) / round-26 minor 2: an unreadable `installed.json` must NOT
+    /// clear the in-process secret registry — every `${ENV}` placeholder
+    /// would stay unresolved for the whole process lifetime after a
+    /// transient permissions hiccup. The keep-previous branch (round-13 m4)
+    /// returns Ok with the registry untouched; reverting it to the swallowing
+    /// read (`installed_ids()` → empty on error → `values.clear()` rebuild of
+    /// nothing) fails this pin.
+    // architecture-guard: allow-target-cfg -- the unix regression needs an
+    // unreadable (0o000) installed.json fixture; test-only inline
+    // cfg(unix)+PermissionsExt (same exemption precedent as store.rs /
+    // scope.rs, review #455); a read() probe guards against running as root.
+    #[cfg(unix)]
+    #[test]
+    fn secret_values_resync_unreadable_registry_keeps_previous() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home(|| {
+            write_installed_ids(&["keep-reg".to_string()]);
+            let manager = MarketplaceManager::with_store(MemoryCredentialStore::default());
+
+            // Seed the "previous registry" directly: the pin's subject is the
+            // keep-previous branch on the unreadable read, not the derivation
+            // (the sibling resync pins cover the rebuild legs).
+            let env_var = mcp_secret_env_var("KEEP_API_KEY");
+            store_secret_value(env_var.clone(), "previous-registry-value".to_string());
+            assert!(
+                snapshot_secret_values().contains_key(&env_var),
+                "precondition: the previous registry holds the secret"
+            );
+
+            // Now make installed.json unreadable and resync: the previous
+            // registry must survive untouched.
+            let installed_path = crate::platform::paths::pinvou3_home()
+                .join("marketplace")
+                .join("installed.json");
+            std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            if std::fs::read(&installed_path).is_ok() {
+                std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                eprintln!(
+                    "ROOT-SKIP[secret_values_resync_unreadable_registry_keeps_previous]: running as root - the unreadable-file fixture stays readable; NOT exercised"
+                );
+                return;
+            }
+
+            manager.sync_secret_values().unwrap();
+            assert_eq!(
+                snapshot_secret_values().get(&env_var).map(String::as_str),
+                Some("previous-registry-value"),
+                "the keep-previous branch must leave the registry intact on an unreadable registry (a reverted swallow would clear it)"
+            );
+
+            std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
         });
     }
 

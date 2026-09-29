@@ -608,6 +608,20 @@ pub(super) fn uninstall_marketplace_tool_sync(tool_id: &str) -> Result<(), Strin
                 crate::features::marketplace::store::BundleSource::Upload(_)
             )
         });
+    // Round-26 MAJOR 1 (review #455): snapshot every companion skill's owner
+    // pack BEFORE any directory disappears — once the skill dir is deleted
+    // (or the whole package is recycled), the normalized cleanup's gating
+    // fallback can be re-owned by a foreign pack's claim/nesting and the
+    // removal would erase THAT pack's consent rows.
+    let companion_owners: std::collections::HashMap<String, String> = companions
+        .iter()
+        .map(|sid| {
+            (
+                sid.clone(),
+                crate::features::marketplace::scope::resolve_pack_owner_id(sid),
+            )
+        })
+        .collect();
     for sid in &companions {
         if recycles_with_package {
             continue; // companion 随整包回收，见上注释
@@ -617,19 +631,28 @@ pub(super) fn uninstall_marketplace_tool_sync(tool_id: &str) -> Result<(), Strin
             .map_err(|e| format!("联动卸载配套技能 '{sid}' 失败（已中止工具卸载，请重试）: {e}"))?;
         // Scope entries are cleared only after the skill is actually gone —
         // otherwise a still-installed skill would be silently re-enabled.
-        crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(sid)?;
+        // Exact form (round-26 MAJOR 1): the rows were owned by the
+        // pre-teardown snapshot; re-normalizing a deleted id is hijackable.
+        // `sid` always has a snapshot entry (same iteration source), so the
+        // fallback is unreachable; production code avoids expect().
+        let owner = companion_owners.get(sid).map(String::as_str).unwrap_or(sid);
+        crate::features::marketplace::scope::remove_bundle_from_disabled_scopes_exact(owner)?;
     }
     mgr.uninstall(tool_id)?;
     if recycles_with_package {
         // 整包已回收（companion 目录随包搬离）→ 此时技能确实没了，再清 scope。
         for sid in &companions {
-            crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(sid)?;
+            let owner = companion_owners.get(sid).map(String::as_str).unwrap_or(sid);
+            crate::features::marketplace::scope::remove_bundle_from_disabled_scopes_exact(owner)?;
         }
     }
     // The uninstalled connector is removed from both scopes' disabled sets (no
     // stale ids). Fail-visible (round-17 minor 1): a stale entry + marker would
-    // be inherited by a same-id reinstall's install sync.
-    crate::features::marketplace::remove_bundle_from_disabled_scopes(tool_id)?;
+    // be inherited by a same-id reinstall's install sync. Exact form
+    // (round-26 MAJOR 1): the dir is already deleted/recycled, so the
+    // normalized form could re-own `tool_id` onto a foreign claim — `tool_id`
+    // is itself the pack id.
+    crate::features::marketplace::scope::remove_bundle_from_disabled_scopes_exact(tool_id)?;
     Ok(())
 }
 // ---------------------------------------------------------------------------
@@ -1000,10 +1023,16 @@ pub async fn uninstall_marketplace_skill(
 }
 
 pub(super) fn uninstall_marketplace_skill_sync(skill_id: &str) -> Result<(), String> {
+    // Round-26 MAJOR 1 (review #455): snapshot the owner pack while the skill
+    // dir is still on disk — after the deletion the normalized cleanup's
+    // gating fallback could be hijacked by a foreign pack's claim/nesting and
+    // erase THAT pack's consent rows.
+    let owner = crate::features::marketplace::scope::resolve_pack_owner_id(skill_id);
     crate::features::marketplace::skill_marketplace::SkillMarketplaceManager::new()
         .uninstall(skill_id)?;
-    // 已卸载的技能从两个 scope 的禁用集移除（避免残留 id，与连接器同语义）。
-    crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(skill_id)?;
+    // 已卸载的技能从两个 scope 的禁用集移除（避免残留 id，与连接器同语义）；
+    // exact 形式按卸载前快照的属主清行（round-26 MAJOR 1）。
+    crate::features::marketplace::scope::remove_bundle_from_disabled_scopes_exact(&owner)?;
     Ok(())
 }
 

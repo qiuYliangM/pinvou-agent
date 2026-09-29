@@ -112,7 +112,9 @@ pub struct EnablePackagesOutcome {
 // reported as a plain success; the caller surfaces blocked/not_applied. The
 // initialized-arm caveat on `not_applied` applies here unchanged: an empty
 // `not_applied` from an initialized scope is "no signal", not "coverage
-// proven".
+// proven". The hot-refresh gate below uses the domain `state_changed` (round-26
+// minor 1), not `enabled` — they are different predicates: a mixed batch and a
+// hidden-only un-hide both change persisted state while `enabled` reads false.
 impl From<crate::features::marketplace::scope::EnablePackagesOutcome> for EnablePackagesOutcome {
     fn from(value: crate::features::marketplace::scope::EnablePackagesOutcome) -> Self {
         let blocked = value.blocked;
@@ -134,7 +136,10 @@ impl From<crate::features::marketplace::scope::EnablePackagesOutcome> for Enable
 /// resurrect a package the user explicitly turned off). After persisting, it
 /// hot-refreshes on the same path as `set_disabled_connectors`: rewrite
 /// online session composite skills directories + the tool allowlist +
-/// execpolicy rulesets, taking effect in the current conversation turn.
+/// execpolicy rulesets — visible to sessions from the **next** conversation
+/// turn (round-26 minor 1, aligning this wording with the engine-pool
+/// hot-refresh doc; the refresh is not applied retroactively to an in-flight
+/// turn).
 #[tauri::command]
 pub async fn enable_marketplace_packages(
     package_ids: Vec<String>,
@@ -146,18 +151,23 @@ pub async fn enable_marketplace_packages(
     // The inner `?` is the persist failure (round-12 review): the command must
     // fail rather than report `enabled: true` for state that never reached
     // disk — the frontend renders its failure notice from the rejected invoke.
-    let outcome: EnablePackagesOutcome = tokio::task::spawn_blocking(move || {
+    let domain_outcome = tokio::task::spawn_blocking(move || {
         crate::features::marketplace::scope::enable_packages_in_scope(scope, &package_ids)
     })
     .await
-    .map_err(|e| format!("enable_marketplace_packages join: {e}"))??
-    .into();
-    // Round-24 minor 11: `enabled` is false for a refused batch OR a batch
-    // whose every id matched nothing (not_applied-only) — in both, no scope
-    // state changed and the full hot refresh is pure overhead. Previously
-    // gated on `blocked.is_empty()` alone, which still refreshed for the
-    // not_applied-only case.
-    if outcome.enabled {
+    .map_err(|e| format!("enable_marketplace_packages join: {e}"))??;
+    let outcome: EnablePackagesOutcome = domain_outcome.clone().into();
+    // Round-26 minor 1 (review #455): the refresh gate is "did the persisted
+    // state actually change", not the IPC `enabled` coverage flag. A mixed
+    // batch (some ids applied+persisted, some `not_applied`) and a
+    // hidden-only un-hide (the hidden-set leg persists a visibility change
+    // with every id `not_applied`) both leave live sessions with stale
+    // allowlists if the refresh is skipped. `enabled` stays false for those
+    // — it honestly reports partial coverage — but the refresh must run.
+    // Round-24 minor 11's underlying point stands for the truly-inert case:
+    // a refused batch and a not_applied-only batch change nothing, so the
+    // full hot refresh stays skipped there (state_changed is false).
+    if domain_outcome.state_changed {
         // Identical finalization to the other switch writers (round-16 minor
         // 9: previously re-inlined the same seven statements). Skipped only
         // when the batch was refused (round-10 Major 2) and no state changed.
@@ -291,7 +301,10 @@ async_command_passthrough!(tmeet_domain, tmeet_skills_state() -> Result<Value, S
 
 /// ima 连接成功会安装配套技能 ima-skills（domain 层落盘）→ 重写在线会话组合目录
 /// （skill 双 scope 治理事件驱动时机）+ 热刷 execpolicy 规则集（技能脚本 deny 规则
-/// 随目录变化，四轮评审 M-6a）。失败时技能未装上，不重写。
+/// 随目录变化，四轮评审 M-6a）。失败分两态（round-26 minor 4 修正措辞）：域层
+/// 安装/凭据前的失败 = 技能未装上，本就不需重写；**同意状态持久化失败** = 技能
+/// 已装上但命令以 Err 返回且跳过本函数的重写——前端经 imaSkillsFailed 模板给出
+/// 手动关闭指引，残留为 stale-deny 方向（fail-safe，见 domain 层注释）。
 // The disallowed hot-refresh is required since the native-tool ownership gate:
 // the freshly installed package flips `ima_openapi` from denied to admitted
 // for DenyAll scopes' explicit-enable path, and online engines must see it.

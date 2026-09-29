@@ -100,8 +100,11 @@ static DISABLED_BUNDLES_FILE_LOCK: Mutex<()> = Mutex::new(());
 /// traces — a fresh install would be misjudged as an upgrade and plain would
 /// flip back to fully on (fail-open, exactly what the freeze prevents). Keyed
 /// by home-directory path so tests switching PINVOU3_HOME do not cross-talk;
-/// after a successful save the file is the truth, and this memo only briefly
-/// carries the verdict on a write failure.
+/// after a successful save the file is the truth. On a persist failure the
+/// memo carries the verdict for the **whole process lifetime** — every later
+/// read reuses it instead of re-evaluating (round-26 minor 12: the doc
+/// previously claimed a "brief" carry, contradicting the test-hygiene doc
+/// below; the memo is not cleared on later successful saves).
 static UNPERSISTED_VERDICT: Mutex<Option<(PathBuf, DisabledBundlesFile)>> = Mutex::new(None);
 
 /// In-process memo for corrupt-recovery "quarantine kept, overwrite save
@@ -495,6 +498,18 @@ fn to_package_id_with(tools: &[super::ToolManifest], raw: &str) -> String {
         return stripped.to_string();
     }
     crate::features::marketplace::bundle::skill_gating_owner_with(tools, stripped)
+}
+
+/// Resolve a stored id to its pack owner **while the package state is still
+/// intact** — the pre-teardown snapshot for the exact-cleanup shape (round-26
+/// MAJOR 1, review #455). A writer that deletes a skill/package directory and
+/// then cleans its consent rows must capture the owner **before** the
+/// deletion: once the dir is gone the gating fallback can be hijacked by a
+/// foreign pack's `companion_skills` claim or physical nesting, and the
+/// cleanup would erase the foreign pack's rows. Pass the snapshot to
+/// [`remove_bundle_from_disabled_scopes_exact`].
+pub fn resolve_pack_owner_id(raw_id: &str) -> String {
+    to_package_id(raw_id)
 }
 
 /// 读时归一：存储条目按**当前**认领状态重映射为包 id 并去重（保序）。
@@ -926,6 +941,18 @@ fn resolve_scope_disabled_ids(file: &DisabledBundlesFile, scope: ConnectorScope)
             // materialization on one truth.
             if let Ok(rd) = std::fs::read_dir(paths::bundles_root()) {
                 for entry in rd.flatten() {
+                    // Round-26 minor 8 (review #455): skip import staging
+                    // (`<id>.tmp`) and landing backup (`<id>.old`) dirs — the
+                    // same exclusion materialization's scan applies
+                    // (skill_materialization::skill_source_dirs). A staging
+                    // dir resolving through the physical fallback to a
+                    // suffix-owner id would be persisted by the composer's
+                    // first-write seeding as a stored row + install-default
+                    // marker (inert junk after the window; over-deny).
+                    let pack_name = entry.file_name().to_string_lossy().into_owned();
+                    if pack_name.ends_with(".tmp") || pack_name.ends_with(".old") {
+                        continue;
+                    }
                     let Ok(skills_dir) = std::fs::read_dir(entry.path().join("skills")) else {
                         continue;
                     };
@@ -1189,22 +1216,67 @@ pub fn sync_deny_all_scopes_after_install(raw_id: &str) -> Result<(), String> {
 /// inherits them through the install sync's initialized-arm no-op — the
 /// mirror image of the install-sync fail-visible direction (round-13 B3), so
 /// the persist propagates instead of degrading to a log line.
+///
+/// Round-26 MAJOR 1 (review #455): writers that run **after** the package
+/// directory is gone (uninstall/rollback/companion teardown) must NOT use
+/// this normalized form — with the dir absent the fallback can be hijacked
+/// by a foreign pack's `companion_skills` claim or physical nesting, and the
+/// removal erases the foreign pack's consent rows. Those writers snapshot
+/// the owner with [`resolve_pack_owner_id`] before the deletion (or pass the
+/// pack id they already hold) and call
+/// [`remove_bundle_from_disabled_scopes_exact`].
 pub fn remove_bundle_from_disabled_scopes(raw_id: &str) -> Result<(), String> {
     let package_id = to_package_id(raw_id);
+    remove_bundle_from_disabled_scopes_exact(&package_id)
+}
+
+/// [`remove_bundle_from_disabled_scopes`] for a caller that already holds the
+/// **package id** — no re-normalization, on **either** side (round-26 MAJOR 1,
+/// review #455). Post-teardown cleanup writers use this: the normalized
+/// load would re-own a dir-absent id onto a foreign pack's claim/nesting
+/// *and persist the remap before the removal even runs*, so the removal
+/// would erase the foreign pack's rows while the stale rows survive as the
+/// foreign owner. This variant reads the raw file (no migration, no
+/// normalization, no freeze — a missing file is nothing to clean and a
+/// corrupt file is left for the regular read path's fail-closed recovery)
+/// and removes exactly the caller-resolved owner's rows from the three sets.
+pub fn remove_bundle_from_disabled_scopes_exact(package_id: &str) -> Result<(), String> {
     let _guard = DISABLED_BUNDLES_FILE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut file = load_disabled_bundles_file_locked();
+    let path = disabled_bundles_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        // Nothing was ever stored for cleanup.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "reading disabled_bundles.json for the exact cleanup: {error}"
+            ));
+        }
+    };
+    let mut file: DisabledBundlesFile = match serde_json::from_str(&content) {
+        Ok(file) => file,
+        // Skip the cleanup on a corrupt store: the regular read path owns the
+        // fail-closed recovery (quarantine + DenyAll fallback), and blindly
+        // overwriting from here could race or bypass the quarantine. The
+        // leftover rows are the stale-deny direction (fail-safe).
+        Err(error) => {
+            return Err(format!(
+                "disabled_bundles.json unparseable — skipping the exact cleanup (recovery is owned by the regular read path): {error}"
+            ));
+        }
+    };
     let mut changed = false;
     for ids in file.scopes.values_mut() {
         let before = ids.len();
-        ids.retain(|id| id != &package_id);
+        ids.retain(|id| id != package_id);
         changed |= ids.len() != before;
     }
     // 可见性集同样清理：卸载后残留 hidden 会误隐藏未来同名重装。
     for ids in file.hidden_scopes.values_mut() {
         let before = ids.len();
-        ids.retain(|id| id != &package_id);
+        ids.retain(|id| id != package_id);
         changed |= ids.len() != before;
     }
     // The marker must go with the entry (round-12 self-review): a stale
@@ -1213,7 +1285,7 @@ pub fn remove_bundle_from_disabled_scopes(raw_id: &str) -> Result<(), String> {
     // stored entry, then the user switches the connector off again).
     for defaults in file.default_off_scopes.values_mut() {
         let before = defaults.len();
-        defaults.retain(|id| id != &package_id);
+        defaults.retain(|id| id != package_id);
         changed |= defaults.len() != before;
     }
     if changed {
@@ -1259,6 +1331,14 @@ pub struct EnablePackagesOutcome {
     /// empty): fail-closed in effect, but callers must not read an empty
     /// `not_applied` as "coverage proven" in that state.
     pub not_applied: Vec<String>,
+    /// Round-26 minor 1 (review #455): whether this call actually mutated the
+    /// persisted file — the disabled/default-off lists, the materialized
+    /// snapshot, or the hidden set. A mixed batch (some ids applied, some
+    /// `not_applied`) and a hidden-only un-hide both set this true, so the
+    /// caller's hot-refresh gate cannot skip a refresh that live sessions
+    /// need. Independent of `blocked`/`not_applied`, which describe the
+    /// per-id outcome, not the persisted-state delta.
+    pub state_changed: bool,
 }
 
 pub fn enable_packages_in_scope(
@@ -1310,6 +1390,7 @@ pub fn enable_packages_in_scope(
             return Ok(EnablePackagesOutcome {
                 blocked,
                 not_applied: Vec::new(),
+                state_changed: false,
             });
         }
     }
@@ -1371,6 +1452,7 @@ pub fn enable_packages_in_scope(
     Ok(EnablePackagesOutcome {
         blocked: Vec::new(),
         not_applied,
+        state_changed: changed,
     })
 }
 
@@ -2053,6 +2135,75 @@ mod tests {
         });
     }
 
+    /// Round-26 MAJOR 1 (review #455): post-teardown cleanup writers remove
+    /// rows by the **pre-teardown owner** (exact form). With the victim
+    /// pack's dir deleted and nothing in the bin, the normalized form's
+    /// gating fallback re-owns the absent id onto a foreign pack that claims
+    /// it (`companion_skills`) or physically nests it — the removal would
+    /// then erase the FOREIGN pack's consent rows while the stale victim
+    /// rows survive (silent zero-consent re-enable). The exact form targets
+    /// only the victim's rows and leaves the foreign pack untouched.
+    #[test]
+    fn exact_cleanup_never_reowns_absent_dir_id_onto_foreign_claim() {
+        with_temp_home("pinvou3-scope", || {
+            // Foreign installed pack claiming `victim` as a companion skill
+            // AND physically nesting skills/victim/ (both remap legs).
+            let shadow = paths::bundles_root().join("shadow-pack");
+            std::fs::create_dir_all(shadow.join("mcp")).unwrap();
+            std::fs::write(
+                shadow.join("mcp").join("manifest.json"),
+                r#"{"id":"shadow-pack","name":"shadow","description":"d","version":"1","icon":"x","category":"c","mcp_tools":[],"command":"python","args":["s.py"],"companion_skills":["victim"]}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(shadow.join("skills/victim")).unwrap();
+            std::fs::create_dir_all(paths::pinvou3_home().join("marketplace")).unwrap();
+            std::fs::write(
+                paths::pinvou3_home()
+                    .join("marketplace")
+                    .join("installed.json"),
+                serde_json::json!(["shadow-pack"]).to_string(),
+            )
+            .unwrap();
+            // The victim pack is deleted-and-unbinned: no `bundles/victim/`,
+            // no bin entry. The fallback does hijack the id in this state —
+            // that is exactly why the writers must not re-normalize here.
+            assert_eq!(
+                resolve_pack_owner_id("victim"),
+                "shadow-pack",
+                "precondition: the absent-dir id is hijackable by the foreign claim"
+            );
+
+            // Verbatim rows as the writers would have inherited them (the
+            // write paths normalize, so plant the file directly).
+            let path = disabled_bundles_path();
+            std::fs::write(
+                &path,
+                r#"{"scopes":{"plain":["victim","shadow-pack"]},"hidden_scopes":{"plain":["victim","shadow-pack"]},"default_off_scopes":{"plain":["victim"]},"initialized":["plain"],"plain_defaults_migrated":true}"#,
+            )
+            .unwrap();
+
+            remove_bundle_from_disabled_scopes_exact("victim").unwrap();
+            let file = load_disabled_bundles_file();
+            assert_eq!(
+                file.scopes.get("plain").map(|v| v.as_slice()),
+                Some(&["shadow-pack".to_string()][..]),
+                "the victim row goes, the foreign pack's row stays: {file:?}"
+            );
+            assert_eq!(
+                file.hidden_scopes.get("plain").map(|v| v.as_slice()),
+                Some(&["shadow-pack".to_string()][..]),
+                "the hidden leg obeys the same ownership: {file:?}"
+            );
+            assert!(
+                file.default_off_scopes
+                    .get("plain")
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "the marker goes with the victim entry only: {file:?}"
+            );
+        });
+    }
+
     /// 一次助手调用覆盖**所有** scope 的 disabled + hidden 两套集合:退役工具清理等
     /// 调用方依赖「单次调用 = 全清理面」,无需逐 scope 手工 load/retain/save
     /// (#522:逐 scope 两段式各自取锁,会在 load 与 save 之间丢并发更新)。
@@ -2373,6 +2524,12 @@ mod tests {
             // Skip the assertions when the platform/environment cannot simulate
             // unreadable dirs (Windows, root).
             let Some(_unreadable) = make_dir_unreadable_for_test(&skill_dir) else {
+                // Round-26 minor 9 (review #455): an ineffective fixture (root,
+                // Windows) previously skipped silently — the pin then passed
+                // vacuously. Loud ROOT-SKIP, per the round-11 m12 convention.
+                eprintln!(
+                    "ROOT-SKIP[denyall_default_degraded_scan_biases_to_overdeny]: unreadable-dir fixture not effective (root or non-unix); NOT exercised"
+                );
                 return;
             };
             let degraded = load_disabled_bundles_for(ConnectorScope::Code);
@@ -2405,6 +2562,12 @@ mod tests {
             );
 
             let Some(_unreadable) = make_dir_unreadable_for_test(&skill_dir) else {
+                // Round-26 minor 9 (review #455): an ineffective fixture (root,
+                // Windows) previously skipped silently — the pin then passed
+                // vacuously. Loud ROOT-SKIP, per the round-11 m12 convention.
+                eprintln!(
+                    "ROOT-SKIP[denyall_default_degraded_upload_scan_biases_to_overdeny]: unreadable-dir fixture not effective (root or non-unix); NOT exercised"
+                );
                 return;
             };
             let degraded = load_disabled_bundles_for(ConnectorScope::Code);
@@ -2450,6 +2613,12 @@ mod tests {
             let bundles_root = paths::bundles_root();
 
             let Some(_unreadable) = make_dir_unreadable_for_test(&bundles_root) else {
+                // Round-26 minor 9 (review #455): an ineffective fixture (root,
+                // Windows) previously skipped silently — the pin then passed
+                // vacuously. Loud ROOT-SKIP, per the round-11 m12 convention.
+                eprintln!(
+                    "ROOT-SKIP[denyall_default_packages_root_failure_biases_to_overdeny]: unreadable-dir fixture not effective (root or non-unix); NOT exercised"
+                );
                 return;
             };
             let degraded = load_disabled_bundles_for(ConnectorScope::Code);
@@ -2659,6 +2828,12 @@ mod tests {
             save_disabled_bundles_for(ConnectorScope::Code, &["weather".to_string()]).unwrap();
             let skill_dir = install_preset_skill_under_claimed_owner();
             let Some(_unreadable) = make_dir_unreadable_for_test(&skill_dir) else {
+                // Round-26 minor 9 (review #455): an ineffective fixture (root,
+                // Windows) previously skipped silently — the pin then passed
+                // vacuously. Loud ROOT-SKIP, per the round-11 m12 convention.
+                eprintln!(
+                    "ROOT-SKIP[initialized_scope_ignores_degraded_skill_scan]: unreadable-dir fixture not effective (root or non-unix); NOT exercised"
+                );
                 return;
             };
             assert_eq!(

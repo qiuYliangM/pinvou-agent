@@ -588,10 +588,12 @@ pub fn restore_plugin(pkg_id: &str) -> Result<RestoreRecycledResult, String> {
     // stays retryable) and let the gate force-materialize uninitialized scopes
     // anyway.
     // Round-17 minor 2: an MCP entry whose bin-side manifest EXISTS but cannot
-    // be read or parsed must fail TOWARD force — the live read below still
-    // skips supply on the same failure, so the entry would land recordless with
-    // its supply state unverifiable; keeping the strictest consent treatment
-    // for exactly this entry is cheap and fail-closed (the zero-consent shape
+    // be read or parsed must fail TOWARD force — on restore the supply step
+    // itself ATTEMPTS install_upload and fails on the unreadable manifest
+    // (`load_manifest(...).unwrap_or(false)` only decides the secrets arm;
+    // it does not skip supply), so the entry rolls back into the bin instead
+    // of landing recordless; keeping the strictest consent treatment for
+    // exactly this entry is cheap and fail-closed (the zero-consent shape
     // that motivated it is itself closed by the disk leg — this direction is
     // retained as redundancy). A skill-only entry has no manifest by design
     // and takes the normal gate: after take_back the pack dir lands in
@@ -2070,16 +2072,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Round-16 MAJOR 1 regression: restoring a secrets-declaring combination
-    /// pack (skills inside the package, supply skipped because credentials were
-    /// wiped) into an **uninitialized** scope must not rely on the DenyAll
-    /// expansion — the pack id is in none of the three expansion inputs (no
-    /// `installed.json` re-entry, no builtin CLI id, no `skills/<pack-id>/` dir
-    /// for `list_skills`), while directory-scan materialization still sees the
-    /// on-disk skills. The gate's force pass materializes the scope so the pack
-    /// is explicitly off with install-default markers.
-    #[cfg(unix)]
-    #[test]
     /// Round-24 MAJOR 1 (review #455): a recycled pack id that a FOREIGN
     /// installed pack claims (companion_skills, or physical `skills/<id>/`
     /// nesting) must not be re-owned by the consent gate. At gate time the
@@ -2089,6 +2081,12 @@ mod tests {
     /// with zero consent in every initialized scope. The gate now lands the
     /// pack id verbatim, and the bin-side pack-row shield keeps the row
     /// stable across reads.
+    // Round-26 MAJOR 2 (review #455): the round-24 insertion had landed
+    // between the secrets pin's `#[cfg(unix)] #[test]` and its fn — this pin
+    // carried a duplicate `#[test]` (running twice) plus a needless
+    // `#[cfg(unix)]`, and the secrets pin ran with NO attributes at all. The
+    // attributes are restored to their owners: one plain `#[test]` here (the
+    // test does no permission-dependent work, so it runs on Windows too).
     #[test]
     fn restore_consent_gate_never_reowns_collided_pack_id() {
         let _g = crate::platform::paths::tests::ENV_LOCK
@@ -2145,12 +2143,30 @@ mod tests {
             "the foreign pack must not receive the recycled pack's deny row: {plain:?}"
         );
 
-        if let Some(prev) = prev {
-            unsafe { std::env::set_var("PINVOU3_HOME", &prev) };
+        // Round-26 minor 9: the module convention removes the var when it was
+        // not previously set — the `if let` form leaked a temp PINVOU3_HOME
+        // into the process for later tests when the env started unset.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PINVOU3_HOME", v) },
+            None => unsafe { std::env::remove_var("PINVOU3_HOME") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Round-16 MAJOR 1 regression: restoring a secrets-declaring combination
+    /// pack (skills inside the package, supply skipped because credentials were
+    /// wiped) into an **uninitialized** scope must not rely on the DenyAll
+    /// expansion — the pack id is in none of the three expansion inputs (no
+    /// `installed.json` re-entry, no builtin CLI id, no `skills/<pack-id>/` dir
+    /// for `list_skills`), while directory-scan materialization still sees the
+    /// on-disk skills. The gate's force pass materializes the scope so the pack
+    /// is explicitly off with install-default markers.
+    // Round-26 MAJOR 2 (review #455): the round-24 collision-pin insertion
+    // had landed between these attributes and the fn — this pin ran with no
+    // attributes at all (never collected, dead-code warning only). The
+    // `#[cfg(unix)]` + `#[test]` pair is back where it belongs.
+    #[cfg(unix)]
+    #[test]
     fn restore_secrets_pack_into_uninitialized_scope_persists_consent() {
         let _g = crate::platform::paths::tests::ENV_LOCK
             .lock()

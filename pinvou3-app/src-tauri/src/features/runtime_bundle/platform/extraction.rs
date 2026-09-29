@@ -503,8 +503,16 @@ impl Pinvou3Bundle {
                 // best-effort (the outer signature is io::Error and the
                 // surroundings are `let _ =`), so a failure is logged loudly
                 // instead of aborting the retirement.
+                // Round-26 MAJOR 1 (review #455): `tool_id` is a pack id, and
+                // on a retry boot its dir may already be gone (the previous
+                // boot uninstalled it but failed this cleanup persist) — the
+                // normalized form's gating fallback could re-own the absent id
+                // onto a foreign pack's claim and erase THAT pack's consent
+                // rows. Exact removal targets only the retired pack's rows.
                 if let Err(e) =
-                    crate::features::marketplace::scope::remove_bundle_from_disabled_scopes(tool_id)
+                    crate::features::marketplace::scope::remove_bundle_from_disabled_scopes_exact(
+                        tool_id,
+                    )
                 {
                     log::warn!(
                         "[runtime-bundle] persisting the post-retirement switch/visibility cleanup for {tool_id} failed (a stale entry would resurrect the retired tool in the scope): {e}"
