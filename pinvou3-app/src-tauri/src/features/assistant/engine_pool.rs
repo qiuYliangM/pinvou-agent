@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use deepseek_tui::AppMode;
@@ -80,6 +80,10 @@ use crate::platform::prefs::{SavedModel, UserPrefs};
 // SyncSession, losslessly. 30 minutes is a deliberately conservative
 // value: better to under-reclaim than to evict a session about to be used.
 use crate::core::reaper::{IDLE_EVICT_AFTER_SECS, IdleReaperGuard};
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Upper bound for side-effect awaits issued while the per-session turn gate
 /// is held: the phase-two subagent-cascade sends in `cancel_turn_with_gates`,
@@ -1521,16 +1525,38 @@ impl EnginePool {
         scheduled_unattended: bool,
         explicit_model_override: Option<SavedModel>,
     ) -> Result<(Pinvou3Bridge, PreparedRuntimeModel, bool)> {
-        let mut bridge = self.bridge.clone();
+        Self::prepare_runtime_model_with(
+            &self.store,
+            self.bridge.clone(),
+            session_id,
+            scheduled_unattended,
+            explicit_model_override,
+        )
+        .await
+    }
+
+    /// The preparation body behind [`Self::prepare_runtime_model`], as an
+    /// associated function so tests can drive the real funnel — including the
+    /// session-affinity latch — without a pool (a real EnginePool needs a
+    /// Tauri AppHandle; see `install_session_affinity_key`).
+    async fn prepare_runtime_model_with(
+        store: &SessionStore,
+        base_bridge: Pinvou3Bridge,
+        session_id: &str,
+        scheduled_unattended: bool,
+        explicit_model_override: Option<SavedModel>,
+    ) -> Result<(Pinvou3Bridge, PreparedRuntimeModel, bool)> {
+        let mut bridge = base_bridge;
         bridge.prefs = UserPrefs::load();
-        let scheduled_profile = self.store.scheduled_profile(session_id);
+        Self::install_session_affinity_key(&mut bridge, session_id);
+        let scheduled_profile = store.scheduled_profile(session_id);
         // Same caliber as the command layer chat.rs's is_scheduled (a
         // scheduled_profile existing is enough): a scheduled session's images
         // always take the image_analyze hard rule, even with an interactive
         // model override, so the always flag must not use the narrower
         // pins_scheduled_model.
         bridge.image_analyze_always = scheduled_profile.is_some();
-        let interactive_model_override = self.store.session_model_override(session_id);
+        let interactive_model_override = store.session_model_override(session_id);
         let pins_scheduled_model = scheduled_profile.is_some()
             && (scheduled_unattended || interactive_model_override.is_none());
         bridge.session_model = resolve_runtime_model_override(explicit_model_override, || {
@@ -1550,6 +1576,17 @@ impl EnginePool {
             .context("No effective model is available for runtime preparation")?;
         let prepared = PreparedRuntimeModel::unchanged(selected);
         Ok((bridge, prepared, pins_scheduled_model))
+    }
+
+    /// One OpenCode gateway session-affinity ID per conversation: key the
+    /// `x-opencode-session` header by session id so engine respawns of the
+    /// same session keep a single stable value
+    /// (`core::model_endpoint::opencode_session_id_for`). Associated function
+    /// (no pool state); the funnel wiring — this latch being reached on every
+    /// spawn — is pinned by driving the real preparation body
+    /// (`prepare_runtime_model_with`) in tests.
+    fn install_session_affinity_key(bridge: &mut Pinvou3Bridge, session_id: &str) {
+        bridge.session_affinity_key = Some(session_id.to_string());
     }
 
     /// No `&self`: this function does not read pool state, it only
@@ -1572,8 +1609,9 @@ impl EnginePool {
         // probe request carries a credential from the same origin as real
         // inference (bridge.api_key()): authenticated vLLM (--api-key) 401s
         // on /v1/models without credentials, and misclassifying it as a
-        // generic endpoint loses default-off thinking and the vLLM tiers
-        // (inference itself still succeeds with the configured key).
+        // generic endpoint loses the local default thinking tier and the
+        // vLLM tiers (inference itself still succeeds with the configured
+        // key).
         if bridge.provider() == "openai" && base_url_uses_local_or_private(&bridge.base_url()) {
             let api_key = bridge.api_key();
             bridge.probed_local_kind = Some(
@@ -1679,16 +1717,21 @@ impl EnginePool {
         scheduled_unattended: bool,
         explicit_model_override: Option<SavedModel>,
     ) -> Result<AppEngine> {
+        let acquisition_started = Instant::now();
+        let runtime_lock_started = Instant::now();
         let runtime_lock = self.runtime_model_locks.for_session(session_id).await;
         let _runtime = runtime_lock.lock().await;
+        let runtime_lock_ms = elapsed_ms(runtime_lock_started);
+        let prepare_model_started = Instant::now();
         let (bridge, prepared, pins_scheduled_model) = self
             .prepare_runtime_model(session_id, scheduled_unattended, explicit_model_override)
             .await?;
+        let prepare_model_ms = elapsed_ms(prepare_model_started);
         let model_update_revision = self.model_update_revisions.current(&prepared.model.id);
         let prepared = PreparedRuntimeState::new(prepared, model_update_revision);
         let mcp_config_revision = self.mcp_config_revision.load(Ordering::Acquire);
 
-        let stale = {
+        let (fresh_engine, stale) = {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get(session_id) {
                 if entry_is_fresh(
@@ -1696,18 +1739,46 @@ impl EnginePool {
                     entry.mcp_config_revision,
                     mcp_config_revision,
                 ) {
-                    return Ok(entry.engine.clone());
+                    (Some(entry.engine.clone()), None)
+                } else {
+                    (None, entries.remove(session_id))
                 }
+            } else {
+                (None, None)
             }
-            entries.remove(session_id)
         };
+        if let Some(engine) = fresh_engine {
+            crate::features::assistant::timing::record_engine_ready(
+                session_id,
+                crate::features::assistant::timing::EngineAcquireTiming {
+                    kind: "reused",
+                    total_ms: elapsed_ms(acquisition_started),
+                    runtime_lock_ms,
+                    prepare_model_ms,
+                    reclaim_ms: 0,
+                    finalize_bridge_ms: 0,
+                    tool_setup_ms: 0,
+                    materialize_skills_ms: 0,
+                    spawn_engine_ms: 0,
+                    load_session_ms: 0,
+                    sync_session_ms: 0,
+                },
+            );
+            return Ok(engine);
+        }
+        let acquire_kind = if stale.is_some() { "rebuilt" } else { "cold" };
+        let reclaim_started = Instant::now();
         if let Some(entry) = stale {
             self.reclaim_engine_entry(session_id, entry).await;
         }
+        let reclaim_ms = elapsed_ms(reclaim_started);
 
         let is_scheduled = self.store.scheduled_profile(session_id).is_some();
+        let finalize_bridge_started = Instant::now();
         let bridge =
             Self::finalize_runtime_bridge(bridge, &prepared.prepared, pins_scheduled_model).await;
+        let finalize_bridge_ms = elapsed_ms(finalize_bridge_started);
+        let tool_setup_started = Instant::now();
         // The shell execution directory and the engine cwd share one source:
         // resolved uniformly via SessionStore::session_roots
         // (scheduled = automation workspace, a native code project-bound
@@ -1727,12 +1798,14 @@ impl EnginePool {
         extra_tools.push(Arc::new(
             crate::features::connectors::ima::ImaOpenApiTool::new(),
         ));
+        let tool_setup_ms = elapsed_ms(tool_setup_started);
         // Skill dual-scope governance: compose the composed directory fully
         // at spawn (materialization opportunity one, V-7). The composed
         // directory is the discovery root of EngineConfig.skills_dir (the
         // path injected by build_engine_config_for_session_roots) and must
         // exist before spawn, otherwise the first turn's prompt has no
         // `## Skills` block.
+        let materialize_skills_started = Instant::now();
         {
             let sid = session_id.to_string();
             let scope = self.bridge.session_policy(&sid).mode();
@@ -1748,6 +1821,7 @@ impl EnginePool {
             .map_err(|e| anyhow::anyhow!("materialize session skills join: {e}"))?
             .map_err(|e| anyhow::anyhow!("materialize session skills: {e}"))?;
         }
+        let materialize_skills_ms = elapsed_ms(materialize_skills_started);
         let turn_lifecycle = self.turn_lifecycles.for_session(session_id);
         // One wall-clock epoch for the entry ledger plus a process-monotonic
         // incarnation for the steer-id generation stamp. The stamp on ids
@@ -1761,6 +1835,7 @@ impl EnginePool {
             .steer_incarnation_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let spawn_engine_started = Instant::now();
         let (engine, forwarder) = AppEngine::spawn_for_session(
             self.app.clone(),
             self.store.clone(),
@@ -1775,6 +1850,7 @@ impl EnginePool {
             steer_incarnation,
         )
         .await?;
+        let spawn_engine_ms = elapsed_ms(spawn_engine_started);
 
         // Sync is mandatory even when messages is empty: SyncSession not only
         // injects history but also aligns the underlying Engine's internal
@@ -1782,7 +1858,11 @@ impl EnginePool {
         // get the first turn's SessionUpdated rejected on an id mismatch,
         // ending with only the user message durable and the assistant reply
         // lost.
-        match self.store.load(session_id) {
+        let load_session_started = Instant::now();
+        let loaded_session = self.store.load(session_id);
+        let load_session_ms = elapsed_ms(load_session_started);
+        let sync_session_started = Instant::now();
+        match loaded_session {
             Ok(saved) => {
                 if let Err(error) = engine
                     .sync_session(session_id.to_string(), saved.messages)
@@ -1814,6 +1894,7 @@ impl EnginePool {
                 });
             }
         }
+        let sync_session_ms = elapsed_ms(sync_session_started);
 
         self.entries.lock().await.insert(
             session_id.to_string(),
@@ -1825,6 +1906,22 @@ impl EnginePool {
                 spawned_at_ms,
                 steer_incarnation,
                 last_active_epoch_ms: AtomicU64::new(Self::now_epoch_ms()),
+            },
+        );
+        crate::features::assistant::timing::record_engine_ready(
+            session_id,
+            crate::features::assistant::timing::EngineAcquireTiming {
+                kind: acquire_kind,
+                total_ms: elapsed_ms(acquisition_started),
+                runtime_lock_ms,
+                prepare_model_ms,
+                reclaim_ms,
+                finalize_bridge_ms,
+                tool_setup_ms,
+                materialize_skills_ms,
+                spawn_engine_ms,
+                load_session_ms,
+                sync_session_ms,
             },
         );
         Ok(engine)
@@ -2769,6 +2866,7 @@ impl EnginePool {
             // The window is ms-scale after create_session; every run owns a
             // fresh session, so nothing propagates to the next run.
             self.evict_locked(session_id).await;
+            crate::features::assistant::timing::start_turn(session_id);
             let engine = match self
                 .get_or_spawn_with_policy(session_id, true, None)
                 .await
@@ -2819,6 +2917,22 @@ impl EnginePool {
 
         drop(_running_slot);
         self.evict_locked(session_id).await;
+        // Reclaim first: if submission succeeded but the scheduler callback or
+        // terminal wait failed, the forwarder owns the authoritative terminal
+        // and consumes this timing turn while eviction cancels it. The calls
+        // below are idempotent fallbacks for failures before submission and
+        // cancellation before send.
+        match &result {
+            Err(error) => crate::features::assistant::timing::finish_turn(
+                session_id,
+                "send_error",
+                Some(&format!("{error:#}")),
+            ),
+            Ok(completion) if completion.turn_id.is_empty() => {
+                crate::features::assistant::timing::finish_turn(session_id, "Interrupted", None);
+            }
+            Ok(_) => {}
+        }
         result
     }
 
@@ -3565,6 +3679,7 @@ mod scheduled_model_tests {
     use crate::features::assistant::runtime_model::PreparedRuntimeModel;
     use crate::features::sessions::{ScheduledRunMode, ScheduledRunProfile, SessionStore};
     use crate::platform::credential_store::{CredentialEditAction, CredentialState};
+    use crate::platform::paths::tests::ENV_LOCK;
     use crate::platform::prefs::{ImageCapabilityOverride, ModelPreset, SavedModel};
     use crate::platform::test_support::EnvRestore;
     use std::path::PathBuf;
@@ -3600,6 +3715,84 @@ mod scheduled_model_tests {
         unsafe { std::env::remove_var("DEEPSEEK_BASE_URL") };
         let bridge = Pinvou3Bridge::boot().expect("boot isolated test bridge");
         (bridge, home, restore)
+    }
+
+    /// The spawn funnel installs the session id as the OpenCode gateway
+    /// affinity key, so every respawn of one session reuses the same
+    /// `x-opencode-session` value instead of silently falling back to the
+    /// shared `engine-default` conversation.
+    #[test]
+    fn install_session_affinity_key_pins_session_id_on_bridge() {
+        let mut bridge = Pinvou3Bridge::test_fixture(None);
+        assert!(
+            bridge.session_affinity_key.is_none(),
+            "fixture bridges start without a session affinity key"
+        );
+        super::EnginePool::install_session_affinity_key(&mut bridge, "session-a");
+        assert_eq!(bridge.session_affinity_key.as_deref(), Some("session-a"));
+        let mut respawned = Pinvou3Bridge::test_fixture(None);
+        super::EnginePool::install_session_affinity_key(&mut respawned, "session-a");
+        assert_eq!(
+            respawned.session_affinity_key, bridge.session_affinity_key,
+            "a respawned bridge for the same session must reuse the same key"
+        );
+    }
+
+    /// Drives the real spawn-funnel preparation body (the same code
+    /// `prepare_runtime_model` runs for every spawn/respawn) and asserts the
+    /// produced bridge carries the session id as the gateway affinity key.
+    /// Without the latch this fails: an unlatched bridge keys every gateway
+    /// request onto the shared default conversation.
+    #[tokio::test]
+    async fn prepare_runtime_model_keys_bridge_by_session_id() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = EnvRestore::capture(&["PINVOU3_HOME"]);
+        let home = std::env::temp_dir().join(format!(
+            "pinvou3-runtime-model-affinity-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        // SAFETY: the caller's test holds platform::paths::tests::ENV_LOCK throughout; env writes are serialized in-process.
+        unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+        let store = SessionStore::boot().expect("session store");
+        let model = SavedModel {
+            id: "affinity-wiring-model".into(),
+            name: "Affinity Wiring".into(),
+            alias: None,
+            preset: ModelPreset::OpenaiCompatible,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            model: "affinity-model".into(),
+            base_url: String::new(),
+            provider_kind: Some("custom".into()),
+            vendor: None,
+            endpoint_mode: None,
+            image_capability_override: ImageCapabilityOverride::default(),
+            vision_model_id: None,
+            api_key: String::new(),
+            credential_ref: None,
+            credential_state: CredentialState::Missing,
+            has_secret: false,
+            credential_action: None,
+        };
+        let bridge = Pinvou3Bridge::test_fixture(Some(model));
+        let (prepared, _prepared_model, _pins) = super::EnginePool::prepare_runtime_model_with(
+            &store,
+            bridge,
+            "session-affinity-under-test",
+            false,
+            None,
+        )
+        .await
+        .expect("runtime model preparation succeeds");
+        assert_eq!(
+            prepared.session_affinity_key.as_deref(),
+            Some("session-affinity-under-test"),
+            "every spawned bridge must be keyed by its session id for the gateway affinity header"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// ADR-0006: an engine reclaim must cancel all sub-agents **first** and
