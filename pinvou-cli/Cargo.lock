@@ -6917,6 +6917,7 @@ dependencies = [
  "cc",
  "chrono",
  "codewhale-config",
+ "codewhale-core",
  "codewhale-execpolicy",
  "codewhale-secrets",
  "codewhale-tui",
