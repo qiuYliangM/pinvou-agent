@@ -3309,39 +3309,16 @@ mod release_env_defaults_guard {
                 "an ancestor with NO recorded provenance still drops without backing: {composed:?}"
             );
 
-            // Symlink widening is still rejected: a provenance spelling
-            // whose CANONICAL form becomes an ancestor of the primary (the
-            // link target contains the workspace) matches neither the
-            // recorded provenance key nor a project backing, and drops.
-            let ancestor_target = base.parent().expect("fixture base parent").to_path_buf();
-            let redirect = home.join("redirect");
+            // Symlink widening is still rejected (Unix leg — the fixture
+            // needs a symlink): see the cfg(unix) helper below.
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&ancestor_target, &redirect).expect("widening symlink");
-            let s_widened = sessions
-                .create_new("s-widened".to_string(), None, nested.clone())
-                .expect("create widened session")
-                .metadata
-                .id;
-            sessions
-                .bind_session_workspace_with_roots(
-                    &s_widened,
-                    nested.clone(),
-                    vec![nested.clone(), redirect.clone()],
-                )
-                .expect("bind widened sidecar");
-            sessions
-                .set_session_workspace_roots_with_explicit_ancestors(
-                    &s_widened,
-                    vec![nested.clone(), redirect.clone()],
-                    vec![redirect.clone()],
-                )
-                .expect("record widened provenance");
-            let composed =
-                compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s_widened);
-            assert_eq!(
-                composed,
-                vec![nested.clone()],
-                "a provenance spelling that canonicalizes to a widening target still drops: {composed:?}"
+            symlink_widened_provenance_still_drops(
+                &sessions,
+                &agents,
+                &projects_after_delete,
+                &base,
+                &nested,
+                &home,
             );
 
             // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
@@ -3354,6 +3331,49 @@ mod release_env_defaults_guard {
             }
             let _ = std::fs::remove_dir_all(&base);
             let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// Round-40 (zhuowp P2) control, Unix leg: a provenance spelling
+        /// whose CANONICAL form becomes an ancestor of the primary (the
+        /// link target contains the workspace) matches neither the
+        /// recorded provenance key nor a project backing, and drops.
+        #[cfg(unix)]
+        fn symlink_widened_provenance_still_drops(
+            sessions: &crate::features::sessions::SessionStore,
+            agents: &crate::features::codex_acp::SessionAgentStore,
+            projects: &crate::features::projects::ProjectStore,
+            base: &std::path::Path,
+            nested: &std::path::Path,
+            home: &std::path::Path,
+        ) {
+            let ancestor_target = base.parent().expect("fixture base parent");
+            let redirect = home.join("redirect");
+            std::os::unix::fs::symlink(ancestor_target, &redirect).expect("widening symlink");
+            let s_widened = sessions
+                .create_new("s-widened".to_string(), None, nested.to_path_buf())
+                .expect("create widened session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_widened,
+                    nested.to_path_buf(),
+                    vec![nested.to_path_buf(), redirect.clone()],
+                )
+                .expect("bind widened sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s_widened,
+                    vec![nested.to_path_buf(), redirect.clone()],
+                    vec![redirect.clone()],
+                )
+                .expect("record widened provenance");
+            let composed = compose_workspace_roots(agents, sessions, projects, &s_widened);
+            assert_eq!(
+                composed,
+                vec![nested.to_path_buf()],
+                "a provenance spelling that canonicalizes to a widening target still drops: {composed:?}"
+            );
         }
     }
 }
