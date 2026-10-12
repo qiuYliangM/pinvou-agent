@@ -119,6 +119,12 @@ struct SessionWorkspaceSidecar {
     /// set = single-root semantics (the `path` directory only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     workspace_roots: Vec<PathBuf>,
+    /// Round-40 (zhuowp P2): the ancestors explicitly aligned into the
+    /// keychain — the grant's recorded provenance; delivery keeps them
+    /// across project mutations (matches the canonicalized recorded
+    /// spelling only, so symlink widening is still rejected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    explicit_ancestor_roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound_at: Option<i64>,
 }
@@ -283,6 +289,7 @@ impl SessionStore {
         let sidecar = SessionWorkspaceSidecar {
             version: SESSION_WORKSPACE_SIDECAR_VERSION,
             workspace_roots: cwd_first_workspace_roots(&path, workspace_roots),
+            explicit_ancestor_roots: Vec::new(),
             path,
             bound_at: Some(now_unix_secs()),
         };
@@ -324,6 +331,23 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
+    /// Round-40 (zhuowp P2): the recorded explicit-ancestor provenance
+    /// (empty = none); same read shape as [`Self::session_workspace_roots`].
+    pub fn session_explicit_ancestor_roots(&self, id: &str) -> Vec<PathBuf> {
+        if validate_session_id(id).is_err()
+            || !self
+                .manager
+                .sessions_dir()
+                .join(format!("{id}.json"))
+                .is_file()
+        {
+            return Vec::new();
+        }
+        read_workspace_sidecar(&self.session_workspace_sidecar_path(id))
+            .map(|sidecar| sidecar.explicit_ancestor_roots)
+            .unwrap_or_default()
+    }
+
     /// Keychain replacement for "align to project" (§9.7): rewrites the
     /// whole sidecar snapshot (binding path and bound_at preserved).
     /// Ok(false) when unbound — temporary sessions are rejected at the
@@ -347,6 +371,9 @@ impl SessionStore {
             version: SESSION_WORKSPACE_SIDECAR_VERSION,
             path: existing.path,
             workspace_roots,
+            // Every non-align keychain rewrite resets the provenance
+            // (round-40 zhuowp P2): align is the only producer.
+            explicit_ancestor_roots: Vec::new(),
             bound_at: existing.bound_at,
         };
         let payload =
@@ -354,6 +381,41 @@ impl SessionStore {
         // Round-20 SF3: every sibling writer of this sidecar uses the
         // private variant (0600) — this plain atomic_write demoted a 0600
         // sidecar to umask-default 0644 on every align/roots update.
+        crate::platform::filesystem::atomic_write_private(&file, &payload)
+            .with_context(|| format!("persist session workspace roots to {}", file.display()))?;
+        Ok(true)
+    }
+
+    /// Round-40 (zhuowp P2): the align lane's writer — records the
+    /// explicitly-granted ancestors so delivery keeps them across backing
+    /// project mutations. Ok(false) when unbound, like the plain setter.
+    pub fn set_session_workspace_roots_with_explicit_ancestors(
+        &self,
+        id: &str,
+        workspace_roots: Vec<PathBuf>,
+        explicit_ancestor_roots: Vec<PathBuf>,
+    ) -> Result<bool> {
+        validate_session_id(id)?;
+        let file = self.session_workspace_sidecar_path(id);
+        let Some(existing) = read_workspace_sidecar(&file) else {
+            return Ok(false);
+        };
+        let workspace_roots = cwd_first_workspace_roots(&existing.path, workspace_roots);
+        // The provenance is bounded by the keychain it describes: entries
+        // outside the persisted set carry no grant.
+        let explicit_ancestor_roots = explicit_ancestor_roots
+            .into_iter()
+            .filter(|root| workspace_roots.contains(root))
+            .collect::<Vec<_>>();
+        let updated = SessionWorkspaceSidecar {
+            version: SESSION_WORKSPACE_SIDECAR_VERSION,
+            path: existing.path,
+            workspace_roots,
+            explicit_ancestor_roots,
+            bound_at: existing.bound_at,
+        };
+        let payload =
+            serde_json::to_vec_pretty(&updated).context("serialize session workspace binding")?;
         crate::platform::filesystem::atomic_write_private(&file, &payload)
             .with_context(|| format!("persist session workspace roots to {}", file.display()))?;
         Ok(true)
@@ -787,6 +849,11 @@ impl SessionStore {
                 .as_ref()
                 .map(|sidecar| sidecar.workspace_roots.clone())
                 .unwrap_or_default(),
+            // A binding-path rebind preserves the keychain snapshot but is
+            // not a project alignment — the provenance does not translate
+            // with a bare prefix move (round-40 zhuowp P2; a re-aligned
+            // ancestor gets fresh provenance from align itself).
+            explicit_ancestor_roots: Vec::new(),
             bound_at: previous.and_then(|sidecar| sidecar.bound_at),
         };
         let payload = match serde_json::to_vec_pretty(&sidecar) {
@@ -1052,6 +1119,10 @@ impl SessionStore {
                     version: SESSION_WORKSPACE_SIDECAR_VERSION,
                     path: next.clone(),
                     workspace_roots: rebound_roots,
+                    // A rebind rebuilds the keychain without project
+                    // alignment — the provenance resets with it
+                    // (round-40 zhuowp P2).
+                    explicit_ancestor_roots: Vec::new(),
                     bound_at,
                 };
                 let payload = serde_json::to_vec_pretty(&updated)

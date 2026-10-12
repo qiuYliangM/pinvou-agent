@@ -128,10 +128,13 @@ pub(crate) fn compose_workspace_roots(
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let roots = agents.session_workspace_roots(session_id);
-    let mut recorded = if !roots.is_empty() {
-        roots
+    let (mut recorded, explicit_provenance) = if !roots.is_empty() {
+        (roots, agents.session_explicit_ancestor_roots(session_id))
     } else {
-        bindings.session_workspace_roots(session_id)
+        (
+            bindings.session_workspace_roots(session_id),
+            bindings.session_explicit_ancestor_roots(session_id),
+        )
     };
     // Round-32 minor 4: a degenerate primary (relative/empty — only a
     // hand-edited artifact) can never prefix-match, so the re-check loop
@@ -164,6 +167,16 @@ pub(crate) fn compose_workspace_roots(
     // registered roots — the ancestor-exemption authority (see the doc
     // comment above). `None` = not yet resolved; an empty vec = resolved
     // with no backing (every subsequent ancestor is dropped).
+    // Round-40 (zhuowp P2): the EXPLICIT provenance keys ride alongside —
+    // an ancestor align itself granted stays delivered after the backing
+    // project mutates (folder removed / project deleted / session moved
+    // out); the grant's authority is its recorded provenance, not mutable
+    // project state. Symlink widening is still rejected: a provenance key
+    // matches the canonicalized recorded spelling only.
+    let provenance_keys: Vec<String> = explicit_provenance
+        .iter()
+        .map(|root| identity_key(root))
+        .collect();
     let mut backing_keys: Option<Vec<String>> = None;
     let mut delivered = Vec::with_capacity(recorded.len());
     delivered.push(recorded[0].clone());
@@ -207,7 +220,10 @@ pub(crate) fn compose_workspace_roots(
                 keys.iter()
                     .any(|key| *key == identity_key(&canonical_lexical))
             };
-            if !backed_by_project {
+            let explicitly_granted = provenance_keys
+                .iter()
+                .any(|key| *key == identity_key(&canonical_lexical));
+            if !backed_by_project && !explicitly_granted {
                 // Same log-hygiene convention as the fs-root drop above.
                 eprintln!(
                     "[sessions] a soft-kept workspace root resolved to a widening target at delivery; dropped"
@@ -217,6 +233,9 @@ pub(crate) fn compose_workspace_roots(
             // Round-21 M1: an ancestor root that matches the owning
             // project's registered root is delivered — align persisted it
             // deliberately (§9.7) and the chip/copy already promised it.
+            // Round-40 (zhuowp P2): an ancestor align itself granted is
+            // delivered on its recorded provenance for the same reason —
+            // the UI promised the snapshot keeps it.
         }
         delivered.push(root.clone());
     }
@@ -3161,6 +3180,168 @@ mod release_env_defaults_guard {
                 composed,
                 vec![nested.clone()],
                 "an unbacked ancestor root is still dropped at delivery: {composed:?}"
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn compose_keeps_an_explicitly_granted_ancestor_across_project_mutations() {
+            // Round-40 (zhuowp P2): align persists [cwd A/sub, ancestor A]
+            // with the ancestor's provenance recorded. Removing A from the
+            // project, deleting the project, or moving the session out
+            // makes resolve_session_project return no backing root — the
+            // delivery used to drop A although the snapshot and the
+            // directories were unchanged, contradicting blueprint §6/§9.5
+            // and the remove-folder UI promise. The grant's authority is
+            // its recorded provenance, not mutable project state.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-prov-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base =
+                std::env::temp_dir().join(format!("pinvou3-compose-prov-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let nested = base.join("sub");
+            std::fs::create_dir_all(&nested).unwrap();
+
+            let project = projects
+                .create_project("granted".to_string(), vec![base.clone()])
+                .expect("create backing project");
+
+            // The align shape: keychain [nested, base] with the ancestor's
+            // provenance recorded (what
+            // set_session_workspace_roots_with_explicit_ancestors persists).
+            let s = sessions
+                .create_new("s-granted".to_string(), None, nested.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s,
+                    vec![nested.clone(), base.clone()],
+                    vec![base.clone()],
+                )
+                .expect("record provenance");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "the granted ancestor delivers while the project backs it: {composed:?}"
+            );
+
+            // Mutation 1: the project no longer registers the root.
+            projects
+                .update_project(&project.id, Some("granted".to_string()), Some(vec![]))
+                .expect("remove the root from the project");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "removing the folder from the project keeps the granted ancestor delivered                  (the snapshot promised it; the directories are unchanged): {composed:?}"
+            );
+
+            // Mutation 2: the project is gone entirely.
+            let projects_after_delete = crate::features::projects::ProjectStore::from_paths(
+                home.join("projects-after-delete.json"),
+            );
+            let composed = compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "deleting the project keeps the granted ancestor delivered: {composed:?}"
+            );
+
+            // Mutation 3 (the control): WITHOUT provenance the same
+            // mutation still drops — the exemption is the recorded grant,
+            // not the spelling's shape.
+            let s_plain = sessions
+                .create_new("s-plain".to_string(), None, nested.clone())
+                .expect("create control session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_plain,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind control sidecar");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s_plain);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "an ancestor with NO recorded provenance still drops without backing: {composed:?}"
+            );
+
+            // Symlink widening is still rejected: a provenance spelling
+            // whose CANONICAL form becomes an ancestor of the primary (the
+            // link target contains the workspace) matches neither the
+            // recorded provenance key nor a project backing, and drops.
+            let ancestor_target = base.parent().expect("fixture base parent").to_path_buf();
+            let redirect = home.join("redirect");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&ancestor_target, &redirect).expect("widening symlink");
+            let s_widened = sessions
+                .create_new("s-widened".to_string(), None, nested.clone())
+                .expect("create widened session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_widened,
+                    nested.clone(),
+                    vec![nested.clone(), redirect.clone()],
+                )
+                .expect("bind widened sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s_widened,
+                    vec![nested.clone(), redirect.clone()],
+                    vec![redirect.clone()],
+                )
+                .expect("record widened provenance");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s_widened);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "a provenance spelling that canonicalizes to a widening target still drops: {composed:?}"
             );
 
             // SAFETY: ENV_LOCK held for the whole test; restoring the caller's

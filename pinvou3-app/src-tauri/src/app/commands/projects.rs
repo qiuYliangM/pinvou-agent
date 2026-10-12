@@ -1042,10 +1042,26 @@ pub(crate) fn align_session_keychain(
     // swallowed (review #484 round-10 M2): the index is committed while the sidecar lingers
     // on the old root set, and an index-loss recovery would resurrect it in the over-grant
     // direction — surfaced via outcome.sidecar_stale.
+    // Round-40 (zhuowp P2): the ancestors align is granting — the entries
+    // of the new keychain that contain the cwd. Recorded as the grant's
+    // provenance so delivery keeps them after the backing project mutates.
+    let explicit_ancestors: Vec<std::path::PathBuf> = next
+        .iter()
+        .skip(1)
+        .filter(|root| {
+            let root_lexical = crate::features::sessions::lexical_normalize(root);
+            root_lexical != cwd && cwd.starts_with(&root_lexical)
+        })
+        .cloned()
+        .collect();
     let (written, sidecar_stale) = if agent_bound {
         let write = stores
             .agents
-            .set_session_workspace_roots(session_id, next.clone())
+            .set_session_workspace_roots_with_explicit_ancestors(
+                session_id,
+                next.clone(),
+                explicit_ancestors.clone(),
+            )
             .map_err(|e| format!("align_session_to_project: {e:#}"))?;
         (
             write.applied,
@@ -1058,7 +1074,11 @@ pub(crate) fn align_session_keychain(
     } else {
         let written = stores
             .sessions
-            .set_session_workspace_roots(session_id, next.clone())
+            .set_session_workspace_roots_with_explicit_ancestors(
+                session_id,
+                next.clone(),
+                explicit_ancestors.clone(),
+            )
             .map_err(|e| format!("align_session_to_project: {e:#}"))?;
         (written, false)
     };

@@ -731,6 +731,7 @@ fn acp_recovery_record(
         workspace_kind,
         workspace_path: (workspace_kind == CodexWorkspaceKind::Project).then_some(workspace_path),
         workspace_roots,
+        explicit_ancestor_roots: Vec::new(),
         mode: SessionMode::Plain,
     })
 }

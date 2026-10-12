@@ -142,6 +142,16 @@ pub struct SessionAgentRecord {
     /// single-root semantics (the caller normalizes by cwd).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_roots: Vec<PathBuf>,
+    /// Round-40 (zhuowp P2): the ancestors EXPLICITLY aligned into the
+    /// keychain — the grant's recorded provenance. Delivery exempts exactly
+    /// these spellings from the ancestor re-check, so removing the backing
+    /// project folder / deleting the project / moving the session out does
+    /// not revoke a granted ancestor while its directory is unchanged; the
+    /// grant's authority is what align recorded, not mutable project state.
+    /// Symlink widening is still rejected: the exemption matches the
+    /// canonicalized recorded spelling only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_ancestor_roots: Vec<PathBuf>,
     /// 产品模式（plain/code）。旧记录没有该字段时按 plain 兼容；
     /// 序列化保持原布尔格式（true=code），旧版本应用读新文件不误判。
     #[serde(
@@ -775,12 +785,34 @@ impl SessionAgentStore {
         session_id: &str,
         workspace_roots: Vec<PathBuf>,
     ) -> Result<WorkspaceRootsWrite> {
-        // Snapshot the current keychain so a persist failure can roll memory
-        // back to the on-disk state — the same convention as
-        // rebind_workspace_prefix: without the rollback the process believes
-        // the align happened while disk says otherwise, and the next read
-        // would report roots that were never persisted (review #484 M2).
-        let original_roots = {
+        // Every non-align keychain rewrite RESETS the explicit-ancestor
+        // provenance: align is the only producer of project-backed
+        // ancestors, and a rebind/heal replacement keychain has not been
+        // granted any (round-40 zhuowp P2).
+        self.set_session_workspace_roots_with_explicit_ancestors(
+            session_id,
+            workspace_roots,
+            Vec::new(),
+        )
+    }
+
+    /// Round-40 (zhuowp P2): the align lane's writer — records which
+    /// entries of the new keychain are explicitly-granted ancestors, so
+    /// delivery keeps them after the backing project mutates. The
+    /// provenance rolls back with the keychain on a persist failure.
+    pub fn set_session_workspace_roots_with_explicit_ancestors(
+        &self,
+        session_id: &str,
+        workspace_roots: Vec<PathBuf>,
+        explicit_ancestor_roots: Vec<PathBuf>,
+    ) -> Result<WorkspaceRootsWrite> {
+        // Snapshot the current keychain (and provenance) so a persist
+        // failure can roll memory back to the on-disk state — the same
+        // convention as rebind_workspace_prefix: without the rollback the
+        // process believes the align happened while disk says otherwise,
+        // and the next read would report roots that were never persisted
+        // (review #484 M2).
+        let (original_roots, original_explicit) = {
             let mut records = self.records.write();
             let Some(record) = records.get_mut(session_id) else {
                 return Ok(WorkspaceRootsWrite::skipped());
@@ -791,12 +823,15 @@ impl SessionAgentStore {
                 return Ok(WorkspaceRootsWrite::skipped());
             }
             let original_roots = record.workspace_roots.clone();
+            let original_explicit = record.explicit_ancestor_roots.clone();
             record.workspace_roots = workspace_roots.clone();
-            original_roots
+            record.explicit_ancestor_roots = explicit_ancestor_roots;
+            (original_roots, original_explicit)
         };
         if let Err(error) = self.persist() {
             if let Some(record) = self.records.write().get_mut(session_id) {
                 record.workspace_roots = original_roots;
+                record.explicit_ancestor_roots = original_explicit;
             }
             return Err(error);
         }
@@ -903,6 +938,17 @@ impl SessionAgentStore {
             .read()
             .get(session_id)
             .map(|record| record.workspace_roots.clone())
+            .unwrap_or_default()
+    }
+
+    /// Round-40 (zhuowp P2): the recorded explicit-ancestor provenance for
+    /// this keychain (empty = none). Same read shape as
+    /// [`Self::session_workspace_roots`].
+    pub fn session_explicit_ancestor_roots(&self, session_id: &str) -> Vec<PathBuf> {
+        self.records
+            .read()
+            .get(session_id)
+            .map(|record| record.explicit_ancestor_roots.clone())
             .unwrap_or_default()
     }
 
@@ -4281,6 +4327,7 @@ mod tests {
                     workspace_kind: CodexWorkspaceKind::Project,
                     workspace_path: Some(root.clone()),
                     workspace_roots: Vec::new(),
+                    explicit_ancestor_roots: Vec::new(),
                     mode: SessionMode::Plain,
                 },
                 || true,
