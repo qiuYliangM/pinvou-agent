@@ -960,6 +960,18 @@ pub(crate) fn align_session_keychain(
         });
     };
     let next = ProjectStore::keychain_for_workspace(&cwd, &project.roots);
+    // Round-40 (zhuowp P2 + Jensen follow-up): the ancestors align is
+    // granting — computed BEFORE the no_change gate so the gate can also
+    // require the recorded provenance to be converged.
+    let explicit_ancestors: Vec<std::path::PathBuf> = next
+        .iter()
+        .skip(1)
+        .filter(|root| {
+            let root_lexical = crate::features::sessions::lexical_normalize(root);
+            root_lexical != cwd && cwd.starts_with(&root_lexical)
+        })
+        .cloned()
+        .collect();
     // Round-10 m3: a legacy empty snapshot is semantically [cwd] — the base
     // normalizes empty to the cwd — so aligning it must report no_change
     // instead of rewriting the sidecar, pushing the live engine, and firing
@@ -969,18 +981,20 @@ pub(crate) fn align_session_keychain(
         || (current.is_empty()
             && next.len() == 1
             && next[0] == ProjectStore::keychain_for_workspace(&cwd, &[])[0]);
-    // Round-26 MAJOR 2: for a native code session the INDEX is the read
-    // authority above, so a retry after a failed sidecar rewrite
-    // (sidecar_stale) reads current == next and used to return no_change
-    // BEFORE any store write — the advertised "retry converges" promise was
-    // dead code and the stale sidecar survived until an unrelated rebind
-    // (an index loss would then resurrect the wider pre-align root set from
-    // it). When the readable sidecar's roots differ from the target, fall
-    // through to the write path instead: it rewrites both stores and reports
-    // the honest sidecar outcome, and the NEXT retry is a genuine no_change.
-    // A MISSING sidecar stays on the backfill lane (it heals missing, not
-    // mismatched), and the round-10 m3 legacy-empty shape keeps its no_change
-    // semantics.
+    // Round-40 (Jensen follow-up on the provenance fix): a snapshot aligned
+    // BEFORE the provenance field existed reads current == next and used to
+    // take the no_change exit without ever writing the provenance — the
+    // granted ancestor then dropped at delivery after the backing project
+    // mutated, the exact regression the fix exists to close. Convergence
+    // before no_change, the same discipline as the round-26 MAJOR-2 stale
+    // sidecar below: when the recorded provenance differs from the computed
+    // grants, fall through to the write path.
+    let recorded_provenance = if agent_bound {
+        stores.agents.session_explicit_ancestor_roots(session_id)
+    } else {
+        stores.sessions.session_explicit_ancestor_roots(session_id)
+    };
+    let provenance_converged = recorded_provenance == explicit_ancestors;
     let stale_native_sidecar = if agent_bound && same {
         match stores.agents.code_sidecar_workspace_roots(session_id) {
             Some(sidecar_roots) if !sidecar_roots.is_empty() => {
@@ -1018,7 +1032,7 @@ pub(crate) fn align_session_keychain(
     } else {
         false
     };
-    if same && !stale_native_sidecar {
+    if same && provenance_converged && !stale_native_sidecar {
         return Ok(AlignOutcome {
             session_id: session_id.to_string(),
             roots: next,
@@ -1042,18 +1056,6 @@ pub(crate) fn align_session_keychain(
     // swallowed (review #484 round-10 M2): the index is committed while the sidecar lingers
     // on the old root set, and an index-loss recovery would resurrect it in the over-grant
     // direction — surfaced via outcome.sidecar_stale.
-    // Round-40 (zhuowp P2): the ancestors align is granting — the entries
-    // of the new keychain that contain the cwd. Recorded as the grant's
-    // provenance so delivery keeps them after the backing project mutates.
-    let explicit_ancestors: Vec<std::path::PathBuf> = next
-        .iter()
-        .skip(1)
-        .filter(|root| {
-            let root_lexical = crate::features::sessions::lexical_normalize(root);
-            root_lexical != cwd && cwd.starts_with(&root_lexical)
-        })
-        .cloned()
-        .collect();
     let (written, sidecar_stale) = if agent_bound {
         let write = stores
             .agents
@@ -3225,6 +3227,86 @@ mod tests {
             vec![nested_cwd.clone(), base.clone()],
             "the project root lands in the additional slot even though it is an ancestor of the primary"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Round-40 (Jensen follow-up on the provenance fix): a snapshot aligned
+    /// BEFORE the provenance field existed reads keychain-equal on re-align —
+    /// the no_change exit used to skip the provenance write, so the granted
+    /// ancestor still dropped at delivery after the backing project mutated.
+    /// The gate now requires provenance convergence, and the re-align writes
+    /// it through the real command path.
+    #[test]
+    fn align_backfills_missing_provenance_on_a_keychain_equal_snapshot() {
+        let (sessions, _g) = isolated_home_session_store();
+        let base = unique_dir("prov-backfill");
+        std::fs::create_dir_all(&base).unwrap();
+        let base = canonical_form(&base);
+        let nested_cwd = base.join("nested");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        let store = project_store_in(&unique_dir("prov-backfill-store"));
+        let project = store
+            .create_project("p".to_string(), vec![base.clone()])
+            .expect("create project");
+        // The PRE-FIX shape: the keychain already carries the aligned
+        // ancestor, the provenance snapshot is empty (a legacy record).
+        let session_id = create_plain_bound_session(
+            &sessions,
+            &nested_cwd,
+            vec![nested_cwd.clone(), base.clone()],
+        );
+        let agents = SessionAgentStore::for_test(unique_dir("prov-backfill-ag").join("a.json"));
+
+        let outcome = align_session_keychain(
+            &session_id,
+            AlignStores {
+                projects: &store,
+                sessions: &sessions,
+                agents: &agents,
+            },
+            false,
+        )
+        .expect("re-align");
+        assert!(
+            outcome.applied,
+            "a keychain-equal snapshot with missing provenance must WRITE, not no_change: {outcome:?}"
+        );
+        assert_eq!(
+            sessions.session_explicit_ancestor_roots(&session_id),
+            vec![base.clone()],
+            "the re-align backfilled the grant's provenance"
+        );
+
+        // The NEXT re-align (project still intact) is a genuine no_change —
+        // provenance converged, nothing left to write.
+        let outcome = align_session_keychain(
+            &session_id,
+            AlignStores {
+                projects: &store,
+                sessions: &sessions,
+                agents: &agents,
+            },
+            false,
+        )
+        .expect("converged re-align");
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("no_change"),
+            "with provenance converged the no_change exit returns: {outcome:?}"
+        );
+
+        // The delivery consequence through the real compose: remove the root
+        // from the project, the granted ancestor stays delivered.
+        store
+            .update_project(&project.id, Some("p".to_string()), Some(vec![]))
+            .expect("remove the backing root");
+        let composed = crate::compose_workspace_roots(&agents, &sessions, &store, &session_id);
+        assert_eq!(
+            composed,
+            vec![nested_cwd.clone(), base.clone()],
+            "the backfilled provenance keeps the granted ancestor delivered after the mutation: {composed:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
