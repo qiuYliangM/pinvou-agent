@@ -24,11 +24,14 @@ import { formatSessionDate, localDateKey, formatDateGroupLabel } from '../shared
 import { groupSessionsWithProjects, resolveSessionProjectId, needsAddFolderConfirm, unavailableProjectRootPaths, WORKSPACE_KIND_BOUND } from '../features/projects/projectGrouping.js';
 import { interpretFolderEnsureOutcomes } from '../features/projects/folderEnsure.js';
 import { ProjectGroupHeader } from '../features/projects/ProjectGroupHeader.jsx';
-import { WorkspacePickerDialog } from '../features/projects/WorkspacePickerDialog.jsx';
+const WorkspacePickerDialog = lazy(() =>
+  import('../features/projects/WorkspacePickerDialog.jsx').then(m => ({ default: m.WorkspacePickerDialog })));
 import { computePickerRows, pickerPrimaryRoot, pickerProjectRoots, workspaceNoticeTone } from '../features/projects/workspacePickerState.js';
 import { removeRootPlan, rootAlreadyPresent, rootConflictsWithExisting, rootPathOf } from '../features/projects/manageFoldersState.js';
-import { ManageProjectFoldersDialog } from '../features/projects/ManageProjectFoldersDialog.jsx';
-import { SessionWorkspaceDialog } from '../features/projects/SessionWorkspaceDialog.jsx';
+const ManageProjectFoldersDialog = lazy(() =>
+  import('../features/projects/ManageProjectFoldersDialog.jsx').then(m => ({ default: m.ManageProjectFoldersDialog })));
+const SessionWorkspaceDialog = lazy(() =>
+  import('../features/projects/SessionWorkspaceDialog.jsx').then(m => ({ default: m.SessionWorkspaceDialog })));
 import { classifyRebindError, mergeRebindCarryoverIds } from '../features/projects/rebindErrors.js';
 import { runSessionBatch } from '../shared/session-management.js';
 import { filterSessionsByTab, groupSessionsByLocalDate, sessionListComparator } from '../shared/session-list-pipeline.js';
@@ -3685,6 +3688,7 @@ const App = () => {
           )}
 
           {manageFoldersProject && (
+            <Suspense fallback={null}>
             <ManageProjectFoldersDialog
               open
               project={manageFoldersProject}
@@ -3705,11 +3709,13 @@ const App = () => {
               onExcludeRoot={(root) => handleSetNeverMaterialize(root, true)}
               onRevokeExclusion={(root) => handleSetNeverMaterialize(root, false)}
             />
+            </Suspense>
           )}
 
           {viewWorkspaceChat && (
             // Conditional mount (the ManageProjectFoldersDialog idiom): the
             // snapshot shown belongs to the chat captured at open time.
+            <Suspense fallback={null}>
             <SessionWorkspaceDialog
               open
               sessionTitle={viewWorkspaceChat.title}
@@ -3719,12 +3725,14 @@ const App = () => {
               t={t}
               onClose={() => setViewWorkspaceChat(null)}
             />
+            </Suspense>
           )}
 
           {workspacePicker && (
           // Conditional mount (the ManageProjectFoldersDialog idiom): the query
           // and the expanded row must not leak across opens — remounting resets
           // them, so a leftover filter can never render a false empty state.
+          <Suspense fallback={null}>
           <WorkspacePickerDialog
             open
             rows={workspacePickerRows}
@@ -3747,6 +3755,7 @@ const App = () => {
             onBrowseExcluded={(folder) => applyWorkspaceTarget({ lane: pickerLane(), path: folder, projectId: null, roots: [folder] }).catch(reportPickerApplyFailure)}
             onDismissExcluded={() => setPickerExcluded(null)}
           />
+          </Suspense>
           )}
 
           {rebindDraft && browserOverlayPublicationReady && (
