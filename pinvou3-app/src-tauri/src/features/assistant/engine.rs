@@ -4204,6 +4204,49 @@ mod expert_turn_invariant_tests {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_session_op_carries_the_keychain_backfill() {
+        // Round-13 M4: the SyncSession payload is the keychain backfill's only
+        // channel into the foundation — the builder pins the field's presence
+        // and serde shape (deleting the field fails to compile here, renaming
+        // it reds this assert). The call site passes the bridge-resolved
+        // snapshot through unchanged.
+        let op = AppEngine::sync_session_op(
+            "s-backfill",
+            Vec::new(),
+            "test-model".to_string(),
+            std::path::PathBuf::from("/w"),
+            vec![
+                std::path::PathBuf::from("/w"),
+                std::path::PathBuf::from("/x"),
+            ],
+        );
+        match op {
+            Op::SyncSession {
+                session_id,
+                messages,
+                workspace_roots,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("s-backfill"));
+                assert!(messages.is_empty());
+                assert_eq!(
+                    workspace_roots,
+                    vec![
+                        std::path::PathBuf::from("/w"),
+                        std::path::PathBuf::from("/x")
+                    ]
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod submit_gate_bound_tests {
     use super::Op;
     use super::bounded_join_detached_on_timeout;
@@ -4383,47 +4426,3 @@ mod submit_gate_bound_wiring_tests {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sync_session_op_carries_the_keychain_backfill() {
-        // Round-13 M4: the SyncSession payload is the keychain backfill's only
-        // channel into the foundation — the builder pins the field's presence
-        // and serde shape (deleting the field fails to compile here, renaming
-        // it reds this assert). The call site passes the bridge-resolved
-        // snapshot through unchanged.
-        let op = AppEngine::sync_session_op(
-            "s-backfill",
-            Vec::new(),
-            "test-model".to_string(),
-            std::path::PathBuf::from("/w"),
-            vec![
-                std::path::PathBuf::from("/w"),
-                std::path::PathBuf::from("/x"),
-            ],
-        );
-        match op {
-            Op::SyncSession {
-                session_id,
-                messages,
-                workspace_roots,
-                ..
-            } => {
-                assert_eq!(session_id.as_deref(), Some("s-backfill"));
-                assert!(messages.is_empty());
-                assert_eq!(
-                    workspace_roots,
-                    vec![
-                        std::path::PathBuf::from("/w"),
-                        std::path::PathBuf::from("/x")
-                    ]
-                );
-            }
-            other => panic!("unexpected op: {other:?}"),
-        }
-    }
-}
-    }
-}

@@ -55,7 +55,7 @@ fi
 # both anchors would otherwise green), and the lead must be exactly the
 # workspace_roots topic commits (a maintenance advance silently absorbed
 # into the pin would also green).
-MAINTENANCE_HEAD="0bc868ff010d2ef1b8cea103c8fad3c9cc53481d"
+MAINTENANCE_HEAD="3118c36b8a73a91e97378a13bc6c623c1123efce"
 # The maintenance head is reachable via the public remote's clean branch
 # (the submodule's default remote may be the author fork); fetch through a
 # URL refspec so no remote-name assumption enters the guard.
