@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# CodeWhale v0.9.12 clean re-fork guard: 85 commits, nine maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
+# CodeWhale v0.9.12 clean re-fork guard: 86 commits, nine maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEWHALE="$REPO/CodeWhale"
 APP="$REPO/pinvou3-app/src-tauri"
 EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
-EXPECTED_HEAD="fe213b05326a65581a45738283cf607500a4c93a"
-EXPECTED_COMMITS=85
+EXPECTED_HEAD="ac80c4d95ef0eb3e863fa6f6d68972c9ad232b3d"
+EXPECTED_COMMITS=86
 # r1 收口锚点：不可变 r1 tag 的收口 commit。层 0 断言它是当前 head 的祖先，
 # 即维护分支自 r1 收口线性前进而非另起分叉（2026-10-02 起处于过渡期：gitlink =
 # 维护分支头，领先钉在 r3 收口 commit 的不可变 tag；tag 钉点与领先关系由
@@ -67,10 +67,10 @@ else
   fail=1
 fi
 topic_lead="$(git -C "$CODEWHALE" rev-list --count "$MAINTENANCE_HEAD..HEAD" 2>/dev/null || true)"
-if [[ "$topic_lead" == "23" ]]; then
-  green "  ✓ 过渡期领先量：公共维护头之上恰为 23 个主题提交"
+if [[ "$topic_lead" == "24" ]]; then
+  green "  ✓ 过渡期领先量：公共维护头之上恰为 24 个主题提交"
 else
-  red "  ✗ 公共维护头之上有 ${topic_lead:-<unreadable>} 个提交，登记主题提交为 23"
+  red "  ✗ 公共维护头之上有 ${topic_lead:-<unreadable>} 个提交，登记主题提交为 24"
   fail=1
 fi
 
