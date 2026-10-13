@@ -122,8 +122,8 @@ pub(crate) use self::validators::is_sched_session_id;
 /// pinvou-cli `projects` family's orphan probe.
 pub use self::validators::validate_session_id;
 pub(crate) use self::validators::{
-    aux_side_effect_exclusion, is_filesystem_root, lexical_normalize,
-    validate_scheduled_task_id, validate_user_workspace_path, validate_workspace_roots,
+    aux_side_effect_exclusion, is_filesystem_root, lexical_normalize, validate_scheduled_task_id,
+    validate_user_workspace_path, validate_workspace_roots,
 };
 /// Re-export the rebind outcome (public rebind docs link into it; the module
 /// itself stays private).

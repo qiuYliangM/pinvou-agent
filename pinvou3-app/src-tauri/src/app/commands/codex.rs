@@ -977,7 +977,13 @@ pub(crate) async fn create_codex_acp_session_with_workspace_binding(
     let bind_workspace = project_workspace.clone();
     let bind_keychain = keychain.clone();
     if let Err(error) = on_blocking_labeled("session store task join failed", move || {
-        agents.set_acp_workspace(&bind_session_id, backend, kind, bind_workspace, bind_keychain)
+        agents.set_acp_workspace(
+            &bind_session_id,
+            backend,
+            kind,
+            bind_workspace,
+            bind_keychain,
+        )
     })
     .await
     {

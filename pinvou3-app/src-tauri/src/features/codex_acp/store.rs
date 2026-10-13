@@ -2616,8 +2616,13 @@ mod tests {
         // Same discipline for remove: a stale-table persist must not
         // resurrect the CLI-side removed record.
         cli.remove_for_second_process("cli-session").unwrap();
-        gui.bind_code_native_session("gui-session", CodexWorkspaceKind::Temporary, None, Vec::new())
-            .unwrap();
+        gui.bind_code_native_session(
+            "gui-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let on_disk: AgentStoreFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
             !on_disk.sessions.contains_key("cli-session"),
@@ -2636,8 +2641,13 @@ mod tests {
     fn restore_missing_code_session_record_observes_the_section_truth() {
         let (root, gui) = store_fixture("pinvou3-restore-code-record-lock-test-");
         let path = gui.path.clone();
-        gui.bind_code_native_session("booted-session", CodexWorkspaceKind::Temporary, None, Vec::new())
-            .unwrap();
+        gui.bind_code_native_session(
+            "booted-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         // The sidecar this boot pass will restore from (index record
         // missing — the recovery lane's premise).
         assert!(write_code_session_sidecar(
@@ -2649,8 +2659,13 @@ mod tests {
         ));
         // A peer process commits a fresh bind after the GUI booted.
         let peer = store_at(&path);
-        peer.bind_code_native_session("peer-session", CodexWorkspaceKind::Temporary, None, Vec::new())
-            .unwrap();
+        peer.bind_code_native_session(
+            "peer-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
 
         gui.restore_missing_code_session_record("recovered-session")
             .unwrap();
@@ -2665,8 +2680,13 @@ mod tests {
 
         // A sidecar removed together with its session after the boot pass
         // enumerated it must not be restored from the stale copy.
-        peer.bind_code_native_session("deleted-session", CodexWorkspaceKind::Temporary, None, Vec::new())
-            .unwrap();
+        peer.bind_code_native_session(
+            "deleted-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         peer.remove_for_second_process("deleted-session").unwrap();
         assert_eq!(
             gui.restore_missing_code_session_record("deleted-session")
@@ -2744,8 +2764,13 @@ mod tests {
     fn sidecar_backfill_does_not_resurrect_a_peer_deleted_session() {
         let (root, gui) = store_fixture("pinvou3-backfill-lock-test-");
         let path = gui.path.clone();
-        gui.bind_code_native_session("legacy-session", CodexWorkspaceKind::Temporary, None, Vec::new())
-            .unwrap();
+        gui.bind_code_native_session(
+            "legacy-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         // A pre-sidecar-persist build's legacy record: index in, sidecar
         // out — exactly what the backfill exists to heal.
         remove_code_session_sidecar(&path, "legacy-session");
