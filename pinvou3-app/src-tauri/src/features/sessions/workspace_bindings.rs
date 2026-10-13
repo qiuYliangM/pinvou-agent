@@ -552,7 +552,7 @@ impl SessionStore {
     /// 64-root project delete paid 64 full directory walks with a sidecar
     /// read apiece. One walk, matching against any of `roots`; same
     /// error/reporting semantics as the single-root form.
-    pub(crate) fn try_workspace_bindings_under_any(
+    pub fn try_workspace_bindings_under_any(
         &self,
         roots: &[PathBuf],
     ) -> std::io::Result<Vec<(String, PathBuf)>> {

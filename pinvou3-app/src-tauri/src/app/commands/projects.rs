@@ -1334,26 +1334,24 @@ pub async fn rebind_workspace_root(
     // one failure mode §9.9 leaves (cross-project overlap is legal) — must be
     // rejected here, before any session binding has been translated. Hence
     // the typed marker so the copy is localized (round-8 M4).
-    store.plan_rebind_roots(&from, &to_display).map_err(|e| {
-        // Same partition as the commit path (review #463 round-19 SF-6):
-        // only the overlap family wears the conflict copy — a corrupt
-        // store holding a relative root would otherwise surface the
-        // re-pick dialog for an unrelated failure. Anything else falls
-        // through as a raw diagnostic (shown verbatim by the dialog).
-        let cause = e.root_cause().to_string();
-        // Round-24 minor 7: the prefixes are single-sourced with the
-        // validator's bail! texts and pinned against real production errors
-        // (features/projects tests) — a wording change now fails the pin
-        // instead of silently degrading this conflict copy.
-        if crate::features::projects::REBIND_ROOTS_CONFLICT_PREFIXES
-            .iter()
-            .any(|prefix| cause.starts_with(prefix))
-        {
-            format!("REBIND_ROOTS_CONFLICT: {e:#}")
-        } else {
-            format!("rebind_workspace_root: {e:#}")
-        }
-    })?;
+    store
+        .plan_rebind_roots(&from, &to_display)
+        .map_err(|error| match error {
+            // Same partition as the commit path (review #463 round-19 SF-6):
+            // only the overlap family wears the conflict copy — the typed arm
+            // owns the classification (the store classifies by the
+            // single-sourced REBIND_ROOTS_CONFLICT_PREFIXES), so a wording
+            // change fails the store-side pin instead of silently degrading
+            // this conflict copy. Anything else falls through as a raw
+            // diagnostic (shown verbatim by the dialog).
+            RebindRootsError::Overlap(context) => format!("REBIND_ROOTS_CONFLICT: {context:#}"),
+            // The pre-flight validates only and never persists, so `Persist`
+            // is unreachable here today — the arm keeps the match exhaustive
+            // (the commit path owns the REBIND_ROOTS_PERSIST marker).
+            RebindRootsError::Persist(context) | RebindRootsError::Other(context) => {
+                format!("rebind_workspace_root: {context:#}")
+            }
+        })?;
 
     // Affected-set snapshot (shared by the active-turn fence and the
     // metadata replay), taken BEFORE any rewrite (review #463 M1): the

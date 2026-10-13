@@ -1036,19 +1036,16 @@ fn rebind_non_conflict_validation_stays_out_of_the_conflict_class() {
     let from = abs("m1-other-from");
     let _project = create(&store, "moved", std::slice::from_ref(&from));
     let relative_to = std::path::Path::new("m1-relative-destination");
-    // Adapted to the §9.9 rebase: plan_rebind_roots returns a plain anyhow
-    // error and the command layer partitions by the single-sourced
-    // REBIND_ROOTS_CONFLICT_PREFIXES, so "stays out of the conflict class"
-    // means the root cause matches NO partition prefix (the re-pick dialog
-    // would claim re-choosing a destination can fix an infrastructure error).
-    use crate::features::projects::REBIND_ROOTS_CONFLICT_PREFIXES;
+    // The relative-destination rejection is an infrastructure shape, not a
+    // conflict: it must classify as Other on the plan path too, or the
+    // re-pick dialog would claim re-choosing a destination can fix an
+    // infrastructure error (round-14 MINOR 2 pins the copy side).
+    use crate::features::projects::RebindRootsError;
     let error = store
         .plan_rebind_roots(&from, relative_to)
         .expect_err("relative destination must be rejected");
     assert!(
-        !REBIND_ROOTS_CONFLICT_PREFIXES
-            .iter()
-            .any(|prefix| error.root_cause().to_string().starts_with(prefix)),
+        !matches!(error, RebindRootsError::Overlap(_)),
         "absolute-path bail stays out of the conflict partition, got: {error:#}"
     );
     assert!(

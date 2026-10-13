@@ -1388,7 +1388,11 @@ impl ProjectStore {
     /// been enforced by every writer since before #464, so stored roots
     /// cannot carry legacy intra-set nesting the way the (once-legal)
     /// cross-project overlaps of #463's round-18 could.
-    pub fn plan_rebind_roots(&self, from: &Path, to: &Path) -> Result<Vec<String>> {
+    pub fn plan_rebind_roots(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> Result<Vec<String>, RebindRootsError> {
         // Store-level defense in depth (the #464-ledger absolute class,
         // restored on the §9.9 rebase): the command entry rejects a relative
         // destination outright, but the store API must not silently cwd-
@@ -1397,7 +1401,10 @@ impl ProjectStore {
         // absolute spelling under the process CWD. Not a partition prefix,
         // so the command layer surfaces it as an ordinary error.
         if !to.is_absolute() {
-            bail!("rebind destination must be absolute: {}", to.display());
+            return Err(RebindRootsError::Other(anyhow::anyhow!(
+                "rebind destination must be absolute: {}",
+                to.display()
+            )));
         }
         if paths_are_alias_equal(from, to) {
             return Ok(Vec::new());
@@ -1428,7 +1435,9 @@ impl ProjectStore {
             if !affected_projects.contains(&project.id) {
                 continue;
             }
-            validate_roots(&project.roots).context("rebind produced nesting project roots")?;
+            validate_roots(&project.roots).map_err(|error| {
+                RebindRootsError::Overlap(error.context("rebind produced nesting project roots"))
+            })?;
         }
         Ok(affected_projects)
     }

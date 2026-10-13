@@ -518,14 +518,54 @@ fn update(
     )))
 }
 
-/// Mirror of `delete_project`: `--yes` is checked before any store access;
-/// affected sessions are only unassigned (they fall back to implicit
-/// grouping), never deleted.
+/// Mirror of the GUI `delete_project` command: `--yes` is checked before any
+/// store access; affected sessions are unassigned and their auto-membership
+/// tombstoned, never deleted.
 fn delete(id: &str, yes: bool, output: OutputMode) -> Result<CliOutcome, CliError> {
     require_yes(yes)?;
     let store = open_store()?;
+    // Same rebind fence as the GUI command: the tombstone writes are
+    // translation-domain state, and committing them mid-rebind lets
+    // pre-translation spellings escape (review #484 round-13 minor 2).
+    let _fence = store
+        .rebind_fence()
+        .map_err(|error| project_error("delete", error))?;
+    // Enumerate the auto-grouped members the GUI command tombstones — the
+    // agents index plus the plain workspace bindings under the project's
+    // roots. Without the tombstone, tier-② grouping could silently
+    // re-adopt a member into a surviving project sharing the root
+    // (review #484 round-19 minor 5's global-tombstone ruling).
+    let roots = store
+        .get(id)
+        .map(|project| project.roots)
+        .unwrap_or_default();
+    let agents = match SessionAgentStore::load() {
+        Ok(agents) => agents,
+        Err(_) => return Err(delete_index_unreadable()),
+    };
+    let mut expel_session_ids: Vec<String> = Vec::new();
+    for root in &roots {
+        for (session_id, _) in agents.sessions_under_workspace(root) {
+            expel_session_ids.push(session_id);
+        }
+    }
+    let sessions = open_session_store()?;
+    for (session_id, _) in sessions
+        .try_workspace_bindings_under_any(&roots)
+        .map_err(|error| {
+            project_error(
+                "delete",
+                format!(
+                    "the sessions directory became unreadable ({}); nothing was deleted — retry",
+                    error.kind()
+                ),
+            )
+        })?
+    {
+        expel_session_ids.push(session_id);
+    }
     let report = store
-        .delete_project(id)
+        .delete_project(id, &expel_session_ids)
         .map_err(|error| project_error("delete", error))?;
     let value = serde_json::json!({
         "id": id,
@@ -947,6 +987,12 @@ fn push_unique(out: &mut Vec<String>, id: String) {
 /// the copy names the file and the repair instead. Nothing has been moved
 /// whenever this fires (the pre-lane load runs first; the lane's own
 /// persist rolls its memory back on failure).
+fn delete_index_unreadable() -> CliError {
+    CliError::failed(
+        "delete: the code-session agent index is unreadable; nothing was deleted — repair or          remove session-agents.json, then retry",
+    )
+}
+
 fn rebind_index_unreadable() -> CliError {
     CliError::failed(
         "rebind_workspace_root: the code-session agent index is unreadable; nothing was \
@@ -1622,6 +1668,7 @@ mod tests {
                 AgentBackend::CodexAcp,
                 CodexWorkspaceKind::Project,
                 Some(from.clone()),
+                Vec::new(),
             )
             .expect("bind the session under from");
 
@@ -1646,6 +1693,8 @@ mod tests {
             position: 0,
             created_at: now,
             updated_at: now,
+            origin: None,
+            last_primary_root: None,
         }
     }
 
@@ -1809,6 +1858,7 @@ mod tests {
                 AgentBackend::CodexAcp,
                 CodexWorkspaceKind::Project,
                 Some(from.clone()),
+                Vec::new(),
             )
             .expect("bind the session to the backslash directory");
         let to = root.join("proj");
