@@ -757,15 +757,33 @@ pub async fn align_session_to_project(
         engines.is_scheduled_turn_running(&session_id),
         engines.is_compaction_in_flight(&session_id),
     );
-    let mut outcome = align_session_keychain(
-        &session_id,
-        AlignStores {
-            projects: &store,
-            sessions: &sessions,
-            agents: acp_pool.agents(),
-        },
-        busy,
-    )?;
+    // Round-11 R1 (review #484 round-11): the keychain writer now takes the
+    // cross-process section lock (it polls up to SECTION_LOCK_TIMEOUT), so
+    // the whole decide-and-persist kernel must join on a blocking worker —
+    // running it inline on the async executor stalls every task on the
+    // runtime for the duration of the lock wait (the round-49
+    // `on_blocking_labeled` convention every other index mutator follows).
+    // The store handles are Arc clones, so the kernel sees the same state.
+    let mut outcome = {
+        let projects = store.inner().clone();
+        let sessions_store = sessions.inner().clone();
+        let agents = acp_pool.agents().clone();
+        let align_session_id = session_id.clone();
+        crate::features::codex_acp::on_blocking_labeled("align_session_to_project", move || {
+            align_session_keychain(
+                &align_session_id,
+                AlignStores {
+                    projects: &projects,
+                    sessions: &sessions_store,
+                    agents: &agents,
+                },
+                busy,
+            )
+            .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .map_err(|e| format!("align_session_to_project: {e:#}"))?
+    };
     // Released after the read+write pair, before the engine-push awaits: a
     // concurrent rebind must not wait on live-engine I/O (sibling pattern).
     drop(_fence);
@@ -2276,11 +2294,28 @@ pub async fn rebind_workspace_root(
     // lanes are sequential within one run, so this is population
     // partitioning, not a race. Every crash window restores the badge-retry
     // contract the rest of the command honors.
-    let (detached_index, detached_index_failed) = acp_pool
-        .agents()
-        .rebind_detached_workspace_roots(&from, &to_display);
-    let (detached_plain, detached_plain_failed) =
-        sessions.rebind_detached_sidecar_roots(&from, &to_display);
+    // Round-11 R1 (review #484 round-11): the detached sweep's per-target
+    // writer now takes the cross-process section lock (polling up to
+    // SECTION_LOCK_TIMEOUT), so both sweeps join on ONE blocking worker —
+    // inline on the async executor they would stall every task for the
+    // duration of the lock waits (the round-49 `on_blocking_labeled`
+    // convention).
+    let (detached_index, detached_index_failed, detached_plain, detached_plain_failed) = {
+        // Shadow the outer names so the sweeps' call text (pinned by
+        // `detached_sweeps_precede_the_roots_commit`) stays verbatim.
+        let agents = acp_pool.agents().clone();
+        let sessions_store = sessions.inner().clone();
+        let from = from.clone();
+        let to_display = to_display.clone();
+        crate::features::codex_acp::on_blocking_labeled("rebind_workspace_root", move || {
+            let (index, index_failed) = agents.rebind_detached_workspace_roots(&from, &to_display);
+            let (plain, plain_failed) =
+                sessions_store.rebind_detached_sidecar_roots(&from, &to_display);
+            anyhow::Ok((index, index_failed, plain, plain_failed))
+        })
+        .await
+        .map_err(|e| format!("rebind_workspace_root: {e:#}"))?
+    };
     for session_id in detached_index.into_iter().chain(detached_plain) {
         if !rebound_session_ids.contains(&session_id) {
             rebound_session_ids.push(session_id);

@@ -184,6 +184,15 @@ pub struct CodeSessionSidecar {
     /// = single-root semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_roots: Vec<PathBuf>,
+    /// Round-11 SF2: the align-granted ancestor provenance for the roots
+    /// above. An old sidecar missing the key = no recorded grant (same
+    /// fail-safe direction as an empty set); without this field an
+    /// index-loss restore rebuilt the record with empty provenance and the
+    /// round-40 explicit-ancestor grants silently evaporated in exactly the
+    /// recovery window they exist for (the plain lane already persisted its
+    /// provenance in its own sidecar).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_ancestor_roots: Vec<PathBuf>,
     /// 首次绑定时间（Unix 秒）。仅作元信息，不参与恢复语义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_at: Option<i64>,
@@ -338,6 +347,7 @@ fn write_code_session_sidecar(
     kind: CodexWorkspaceKind,
     workspace_path: Option<PathBuf>,
     workspace_roots: Vec<PathBuf>,
+    explicit_ancestor_roots: Vec<PathBuf>,
 ) -> bool {
     let path = code_session_sidecar_path(store_path, session_id);
     let sidecar = CodeSessionSidecar {
@@ -345,6 +355,7 @@ fn write_code_session_sidecar(
         workspace_kind: kind,
         workspace_path,
         workspace_roots,
+        explicit_ancestor_roots,
         bound_at: Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -381,6 +392,10 @@ fn rewrite_code_session_sidecar_preserving_bound_at(
         workspace_kind: CodexWorkspaceKind::Project,
         workspace_path: Some(workspace_path),
         workspace_roots,
+        // Round-11 SF6: every non-align keychain rewrite RESETS the
+        // provenance (the invariant the index lanes already carry) — a
+        // rebind replacement keychain has not been granted any ancestor.
+        explicit_ancestor_roots: Vec::new(),
         bound_at: read_code_session_sidecar(store_path, session_id)
             .and_then(|sidecar| sidecar.bound_at),
     };
@@ -694,6 +709,9 @@ impl SessionAgentStore {
             // A repeated set (calling again on the same session) keeps the
             // latest value, at the same write point as workspace_path.
             record.workspace_roots = workspace_roots;
+            // Round-11 SF7: same-shape repeat = non-align rewrite: reset the
+            // provenance with the keychain (see the sibling write above).
+            record.explicit_ancestor_roots = Vec::new();
             // ACP 会话不是代码模式会话：绑定 ACP 时重置为 plain 模式，
             // 避免 is_code_session() 误判、且 restore 时不会拒绝 ACP 覆盖。
             record.mode = SessionMode::Plain;
@@ -751,18 +769,40 @@ impl SessionAgentStore {
             record.workspace_kind = kind;
             record.workspace_path = workspace_path.clone();
             record.workspace_roots = workspace_roots;
+            // Round-11 SF7: a same-shape repeat (calling again on the same
+            // session) is a non-align keychain rewrite — it RESETS the
+            // provenance in the same write, honoring the "every non-align
+            // keychain rewrite resets the explicit-ancestor provenance"
+            // invariant instead of leaving the previous align's grants on a
+            // replaced keychain.
+            record.explicit_ancestor_roots = Vec::new();
             record.mode = SessionMode::Code;
         }
         self.persist()?;
         // 权威 sidecar：辅助索引损坏/丢失后据此恢复原生代码会话类型与项目绑定。
         // 写失败已逐条记日志；缺失的 sidecar 由启动时回填自愈补写。
-        let record_roots = self
-            .records
-            .read()
-            .get(session_id)
-            .map(|record| record.workspace_roots.clone())
-            .unwrap_or_default();
-        write_code_session_sidecar(&self.path, session_id, kind, workspace_path, record_roots);
+        let (record_roots, record_explicit) = {
+            let records = self.records.read();
+            let record = records.get(session_id);
+            (
+                record
+                    .map(|record| record.workspace_roots.clone())
+                    .unwrap_or_default(),
+                // Round-11 SF7: a same-shape set_acp_workspace replacement
+                // resets the provenance with the keychain — the index lane
+                // already asserts every non-align rewrite resets it, and the
+                // sidecar must not resurrect what the index just dropped.
+                Vec::new(),
+            )
+        };
+        write_code_session_sidecar(
+            &self.path,
+            session_id,
+            kind,
+            workspace_path,
+            record_roots,
+            record_explicit,
+        );
         Ok(())
     }
 
@@ -800,12 +840,23 @@ impl SessionAgentStore {
     /// entries of the new keychain are explicitly-granted ancestors, so
     /// delivery keeps them after the backing project mutates. The
     /// provenance rolls back with the keychain on a persist failure.
+    ///
+    /// Round-11 R1 (review #484 round-11): this and the detached sweep are
+    /// the last two mutators to join the cross-process section-lock
+    /// discipline every sibling runs — the whole-table persist below could
+    /// revert a CLI `projects rebind` / `sessions delete` committed from a
+    /// second process between this store's boot load and the align's
+    /// persist, and a sibling's reload could wipe the align from memory
+    /// while it still reports `applied`. Section lock → fresh reload →
+    /// mutate → persist, and a corrupt index is REFUSED instead of being
+    /// replaced by the stale-table persist.
     pub fn set_session_workspace_roots_with_explicit_ancestors(
         &self,
         session_id: &str,
         workspace_roots: Vec<PathBuf>,
         explicit_ancestor_roots: Vec<PathBuf>,
     ) -> Result<WorkspaceRootsWrite> {
+        let _section = self.lock_and_reload()?;
         // Snapshot the current keychain (and provenance) so a persist
         // failure can roll memory back to the on-disk state — the same
         // convention as rebind_workspace_prefix: without the rollback the
@@ -825,7 +876,7 @@ impl SessionAgentStore {
             let original_roots = record.workspace_roots.clone();
             let original_explicit = record.explicit_ancestor_roots.clone();
             record.workspace_roots = workspace_roots.clone();
-            record.explicit_ancestor_roots = explicit_ancestor_roots;
+            record.explicit_ancestor_roots = explicit_ancestor_roots.clone();
             (original_roots, original_explicit)
         };
         if let Err(error) = self.persist() {
@@ -848,6 +899,11 @@ impl SessionAgentStore {
                 record.workspace_kind,
                 record.workspace_path,
                 workspace_roots.clone(),
+                // Round-11 SF2: the sidecar is the durable truth an index
+                // loss rebuilds from — persisting the roots without the
+                // grant provenance empties every recorded ancestor in
+                // exactly that recovery window.
+                explicit_ancestor_roots.clone(),
             ))
         } else {
             None
@@ -1338,6 +1394,13 @@ impl SessionAgentStore {
                 // are untouched. Stale `/from/...` entries would otherwise be
                 // normalized into additional writable roots outside `to` on
                 // the next resume (review #484 M3).
+                //
+                // Round-11 SF6: the rebind replacement keychain RESETS the
+                // explicit-ancestor provenance — align is the only producer
+                // of grants and a rebind has not been granted any, so leaving
+                // the `from`-spelled entries is a trap for the next reader
+                // (the plain lane and the detached wrapper already reset).
+                record.explicit_ancestor_roots = Vec::new();
                 for root in record.workspace_roots.iter_mut() {
                     if let Some(root_suffix) = Self::rebind_relative_suffix(root, from) {
                         *root = if root_suffix.as_os_str().is_empty() {
@@ -1418,6 +1481,8 @@ impl SessionAgentStore {
                     workspace_kind: CodexWorkspaceKind::Project,
                     workspace_path: Some(next.clone()),
                     workspace_roots: rebound_roots,
+                    // Round-11 SF6: non-align rewrite — reset the provenance.
+                    explicit_ancestor_roots: Vec::new(),
                     bound_at: sidecar.bound_at,
                 },
             ) {
@@ -1878,6 +1943,7 @@ impl SessionAgentStore {
                 record.workspace_kind,
                 record.workspace_path,
                 record.workspace_roots,
+                record.explicit_ancestor_roots,
             ) {
                 backfilled += 1;
                 eprintln!("[pinvou3-app] 回填原生代码会话 sidecar: {session_id}");
@@ -1930,6 +1996,10 @@ impl SessionAgentStore {
             // dropping it here turns a lost index into a silent keychain
             // loss — the session would resume single-root after a crash.
             workspace_roots: recovered.workspace_roots,
+            // Round-11 SF2: the align-granted ancestor provenance rides in
+            // the sidecar too — rebuilding without it silently empties every
+            // recorded grant in the exact recovery window it exists for.
+            explicit_ancestor_roots: recovered.explicit_ancestor_roots,
             ..Default::default()
         };
         if record.workspace_kind == CodexWorkspaceKind::Project && record.workspace_path.is_none() {
@@ -2286,6 +2356,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Project,
                 workspace_path: Some(PathBuf::from("/old/root")),
                 workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: Some(42),
             },
         )
@@ -2655,7 +2726,8 @@ mod tests {
             "recovered-session",
             CodexWorkspaceKind::Temporary,
             None,
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
         // A peer process commits a fresh bind after the GUI booted.
         let peer = store_at(&path);
@@ -2708,6 +2780,217 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Round-11 R1 (review #484 round-11): the align lane's keychain writer
+    /// is one of the last two mutators to join the section-lock discipline.
+    /// Without it, a whole-table persist reverted any second-process commit
+    /// that landed after this store's boot load — the exact shape the
+    /// reviewer demonstrated with `pinvou projects rebind` / `sessions
+    /// delete` in a CLI process. Pin: a peer commit between the GUI boot
+    /// and the align persist must survive, and a corrupt index must be
+    /// refused instead of replaced by the stale table.
+    #[test]
+    fn set_session_workspace_roots_observes_the_section_truth() {
+        let (root, gui) = store_fixture("pinvou3-align-roots-section-truth-");
+        let path = gui.path.clone();
+        let project = root.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        gui.bind_code_native_session(
+            "aligned-session",
+            CodexWorkspaceKind::Project,
+            Some(project.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+        // A peer process commits a fresh bind after the GUI booted.
+        let peer = store_at(&path);
+        peer.bind_code_native_session(
+            "peer-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let write = gui
+            .set_session_workspace_roots_with_explicit_ancestors(
+                "aligned-session",
+                vec![project.clone()],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(write.applied);
+
+        let on_disk: AgentStoreFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.sessions.contains_key("peer-session"),
+            "the align persist must not revert the peer's committed bind: {:?}",
+            on_disk.sessions.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            on_disk.sessions["aligned-session"].workspace_roots,
+            vec![project.clone()],
+            "the align itself must persist"
+        );
+
+        // Fail-closed on a corrupt index, same as the other lock-and-reload
+        // mutators: the align must refuse, not replace the file with the
+        // stale in-memory table.
+        fs::write(&path, "{not json").unwrap();
+        assert!(
+            gui.set_session_workspace_roots("aligned-session", vec![project])
+                .is_err(),
+            "a corrupt index must be refused, not replaced by a stale-table persist"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Round-11 R1, second writer: the detached-root sweep mutates through
+    /// [`Self::set_session_workspace_roots`] per target, so the sweep as a
+    /// whole must not revert peer commits either — each per-target persist
+    /// reloads under the section lock.
+    #[test]
+    fn rebind_detached_workspace_roots_observes_the_section_truth() {
+        let (root, gui) = store_fixture("pinvou3-detached-sweep-section-truth-");
+        let path = gui.path.clone();
+        let from = root.join("from-root");
+        let to = root.join("to-root");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        gui.bind_code_native_session(
+            "swept-session",
+            CodexWorkspaceKind::Project,
+            Some(root.join("stationary")),
+            vec![from.join("extra")],
+        )
+        .unwrap();
+        // The sweep's owner gate requires the SavedSession record
+        // (`sessions/<id>.json` beside the index) to exist.
+        fs::write(
+            code_session_sidecar_root(&path).join("swept-session.json"),
+            "{}",
+        )
+        .unwrap();
+        // A peer process commits a fresh bind after the GUI booted.
+        let peer = store_at(&path);
+        peer.bind_code_native_session(
+            "peer-session",
+            CodexWorkspaceKind::Temporary,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let (touched, failed) = gui.rebind_detached_workspace_roots(&from, &to);
+        assert_eq!(touched, vec!["swept-session".to_string()]);
+        assert!(failed.is_empty());
+
+        let on_disk: AgentStoreFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.sessions.contains_key("peer-session"),
+            "the sweep's per-target persist must not revert the peer's committed bind: {:?}",
+            on_disk.sessions.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            on_disk.sessions["swept-session"].workspace_roots,
+            vec![root.join("stationary"), to.join("extra")],
+            "the swept keychain must land on the `to` spelling (cwd-first)"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Round-11 SF2/SF6/SF7: the align-granted ancestor provenance must
+    /// survive an index loss (it now rides the authoritative sidecar), and
+    /// every NON-align keychain rewrite — a same-shape rebind, a repeated
+    /// set_acp_workspace, and the prefix rebind — must RESET it in the same
+    /// write, honoring the invariant the store's own docs assert.
+    #[test]
+    fn explicit_ancestor_provenance_survives_index_loss_and_resets_on_rewrites() {
+        let (root, gui) = store_fixture("pinvou3-provenance-lifecycle-");
+        let path = gui.path.clone();
+        let project = root.join("proj");
+        let granted = root.join("granted-ancestor");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&granted).unwrap();
+        gui.bind_code_native_session(
+            "provenance-session",
+            CodexWorkspaceKind::Project,
+            Some(project.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+        // The owner record the recovery/restore paths require.
+        fs::write(
+            code_session_sidecar_root(&path).join("provenance-session.json"),
+            "{}",
+        )
+        .unwrap();
+
+        // The align grant: the keychain plus its explicit ancestors.
+        let write = gui
+            .set_session_workspace_roots_with_explicit_ancestors(
+                "provenance-session",
+                vec![project.clone(), granted.clone()],
+                vec![granted.clone()],
+            )
+            .unwrap();
+        assert!(write.applied);
+
+        // SF2: a lost index rebuilds THROUGH the sidecar — the grant must
+        // ride it, not evaporate in the recovery window. The reboot is a
+        // fresh store handle over the same path (the old in-memory table
+        // would short-circuit the recovery as "already code").
+        fs::remove_file(&path).unwrap();
+        let rebooted = store_at(&path);
+        assert!(
+            rebooted
+                .restore_missing_code_session_record("provenance-session")
+                .unwrap(),
+            "the sidecar-backed recovery must rebuild the record"
+        );
+        let record = rebooted.get("provenance-session");
+        assert_eq!(
+            record.explicit_ancestor_roots,
+            vec![granted.clone()],
+            "SF2: the rebuild must carry the sidecar's recorded grant"
+        );
+
+        // SF6: a prefix rebind is a non-align rewrite — the translated
+        // keychain carries no grant; the stale spellings must not linger.
+        let to = root.join("moved");
+        fs::create_dir_all(&to).unwrap();
+        rebooted.rebind_workspace_prefix(&project, &to).unwrap();
+        assert_eq!(
+            rebooted.get("provenance-session").explicit_ancestor_roots,
+            Vec::<PathBuf>::new(),
+            "SF6: the rebind replacement keychain resets the provenance"
+        );
+
+        // SF7: re-align, then a same-shape set_acp_workspace repeat — the
+        // replacement keychain resets the previous align's grants.
+        let write = rebooted
+            .set_session_workspace_roots_with_explicit_ancestors(
+                "provenance-session",
+                vec![to.clone(), granted.clone()],
+                vec![granted.clone()],
+            )
+            .unwrap();
+        assert!(write.applied);
+        rebooted
+            .bind_code_native_session(
+                "provenance-session",
+                CodexWorkspaceKind::Project,
+                Some(to.clone()),
+                vec![to.clone(), granted.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            rebooted.get("provenance-session").explicit_ancestor_roots,
+            Vec::<PathBuf>::new(),
+            "SF7: a same-shape repeat set_acp_workspace resets the provenance"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Round-44 review: the under-lock re-check guards the DELETE direction
     /// of the stale enumeration, but a concurrent `projects rebind` REWRITES
     /// the sidecar onto the new root. Restoring from the passed-in copy
@@ -2725,7 +3008,8 @@ mod tests {
             "rebound-session",
             CodexWorkspaceKind::Temporary,
             None,
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
         // A peer `projects rebind` commits between the enumeration and the
         // restore: the sidecar is rewritten onto the new project root.
@@ -2736,7 +3020,8 @@ mod tests {
             "rebound-session",
             CodexWorkspaceKind::Project,
             Some(rebound_root.clone()),
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
 
         assert!(
@@ -3056,6 +3341,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Project,
                 workspace_path: Some(from.join("deep")),
                 workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             },
         )
@@ -3250,6 +3536,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Project,
                 workspace_path: Some(from.join("deep")),
                 workspace_roots: vec![from.join("deep"), elsewhere.clone()],
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             },
         )
@@ -3396,6 +3683,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Project,
                 workspace_path: Some(to2.clone()),
                 workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             },
         )
@@ -3601,6 +3889,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Project,
                 workspace_path: Some(from.clone()),
                 workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             },
         )
@@ -4573,7 +4862,8 @@ mod tests {
             "session-1",
             CodexWorkspaceKind::Project,
             Some(root.clone()),
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
         assert!(
             store
@@ -4629,7 +4919,8 @@ mod tests {
             "session-1",
             CodexWorkspaceKind::Project,
             None,
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
         assert!(
             store
@@ -4642,7 +4933,8 @@ mod tests {
             "session-2",
             CodexWorkspaceKind::Temporary,
             Some(root.clone()),
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         ));
         assert!(
             store
@@ -4930,6 +5222,7 @@ mod tests {
             workspace_kind: CodexWorkspaceKind::Project,
             workspace_path: Some(root.join("future-workspace")),
             workspace_roots: Vec::new(),
+            explicit_ancestor_roots: Vec::new(),
             bound_at: None,
         };
         fs::write(

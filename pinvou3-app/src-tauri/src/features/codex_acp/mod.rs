@@ -6324,6 +6324,7 @@ mod tests {
                 workspace_kind: CodexWorkspaceKind::Temporary,
                 workspace_path: None,
                 workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             })
             .unwrap(),
