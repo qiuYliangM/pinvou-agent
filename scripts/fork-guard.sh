@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# CodeWhale v0.9.12 clean re-fork guard: 87 commits, nine maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
+# CodeWhale v0.9.12 clean re-fork guard: 94 commits, nine maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEWHALE="$REPO/CodeWhale"
 APP="$REPO/pinvou3-app/src-tauri"
 EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
-EXPECTED_HEAD="d94bdb5d7ca1d1e15a4e4f88babb14ffae95b1a1"
-EXPECTED_COMMITS=87
+EXPECTED_HEAD="4755bac884f3443c1d5aa2cc8397fbe86fec89f1"
+EXPECTED_COMMITS=94
+MAINTENANCE_HEAD="480bebf616212e790ff722c92fb165c8d4a2511d"
 # r1 收口锚点：不可变 r1 tag 的收口 commit。层 0 断言它是当前 head 的祖先，
 # 即维护分支自 r1 收口线性前进而非另起分叉（2026-10-02 起处于过渡期：gitlink =
 # 维护分支头，领先钉在 r3 收口 commit 的不可变 tag；tag 钉点与领先关系由
@@ -27,10 +28,10 @@ bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
 fail=0
 
-bold "── 第 0 层：v0.9.12 clean re-fork 拓扑（r1 tag 之后 55 个登记提交，r3 收口后过渡期）──"
+bold "── 第 0 层：v0.9.12 clean re-fork 拓扑（r1 tag 之后 ${EXPECTED_COMMITS} 个登记提交，r3 收口后过渡期）──"
 actual_head="$(git -C "$CODEWHALE" rev-parse HEAD 2>/dev/null || true)"
 if [[ "$actual_head" == "$EXPECTED_HEAD" ]]; then
-  green "  ✓ CodeWhale gitlink 指向登记 head ${EXPECTED_HEAD}（过渡期：gitlink 领先公共维护头 0bc868ff0，领先量恰为 workspace_roots 主题提交；见 fork-policy 第 0 节豁免）"
+  green "  ✓ CodeWhale gitlink 指向登记 head ${EXPECTED_HEAD}（过渡期：gitlink 领先公共维护头 ${MAINTENANCE_HEAD:0:9}，领先量恰为 workspace_roots 主题提交；见 fork-policy 第 0 节豁免）"
 else
   red "  ✗ CodeWhale HEAD 为 ${actual_head:-<unreadable>}，登记 head 为 $EXPECTED_HEAD"
   fail=1
@@ -55,7 +56,6 @@ fi
 # both anchors would otherwise green), and the lead must be exactly the
 # workspace_roots topic commits (a maintenance advance silently absorbed
 # into the pin would also green).
-MAINTENANCE_HEAD="3118c36b8a73a91e97378a13bc6c623c1123efce"
 # The maintenance head is reachable via the public remote's clean branch
 # (the submodule's default remote may be the author fork); fetch through a
 # URL refspec so no remote-name assumption enters the guard.
@@ -67,10 +67,11 @@ else
   fail=1
 fi
 topic_lead="$(git -C "$CODEWHALE" rev-list --count "$MAINTENANCE_HEAD..HEAD" 2>/dev/null || true)"
-if [[ "$topic_lead" == "25" ]]; then
-  green "  ✓ 过渡期领先量：公共维护头之上恰为 25 个主题提交"
+EXPECTED_TOPIC_LEAD=26
+if [[ "$topic_lead" == "$EXPECTED_TOPIC_LEAD" ]]; then
+  green "  ✓ 过渡期领先量：公共维护头之上恰为 ${EXPECTED_TOPIC_LEAD} 个主题提交"
 else
-  red "  ✗ 公共维护头之上有 ${topic_lead:-<unreadable>} 个提交，登记主题提交为 25"
+  red "  ✗ 公共维护头之上有 ${topic_lead:-<unreadable>} 个提交，登记主题提交为 ${EXPECTED_TOPIC_LEAD}"
   fail=1
 fi
 
@@ -340,6 +341,9 @@ fingerprints=(
   "T9|Custom Responses exact-model replay             |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_responses_replays_only_exact_model_opaque_reasoning_state"
   "T9|Chat wire never captures encrypted reasoning    |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_chat_stream_does_not_capture_encrypted_reasoning"
   "T9|Empty encrypted content skips without breaking the stream |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_responses_capture_tolerates_missing_or_empty_encrypted_content"
+
+  "APP|unified 2000-step budget default           |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|const HOST_STEP_BUDGET: u32 = 2_000;"
+  "APP|2000-step budget behavior regression       |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn engine_config_defaults_to_unified_step_budget_and_respects_override"
 )
 
 for fp in "${fingerprints[@]}"; do
